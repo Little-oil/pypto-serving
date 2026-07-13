@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -79,6 +80,8 @@ DEEPSEEK_V4_HC_EPS = 1e-6
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
+_DEEPSEEK_V4_L3_INIT_TIMING_ENV = "PYPTO_DSV4_L3_INIT_TIMING"
+_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX = "DSV4_L3_INIT_TIMING"
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
@@ -1496,11 +1499,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _ensure_l3_shared_buffers(self, model: RuntimeModel) -> None:
         """Allocate every CPU tensor visible to the L3 worker before it forks.
 
-        ``DistributedWorker`` creates per-chip children on first use. Any CPU
-        tensor argument those children access must already live in shared memory
-        at that point, so this method stages all packed prefill/decode input and
-        output buffers before the first ``_run_l3`` call.
+        Immutable stacked weights stay in ordinary CPU memory and are inherited
+        read-only by the chip children through fork. Mutable inputs, outputs and
+        caches use shared memory so child writes remain visible to the parent.
         """
+        timing_enabled = os.getenv(_DEEPSEEK_V4_L3_INIT_TIMING_ENV) == "1" and self._l3_worker is None
+        total_start = time.perf_counter() if timing_enabled else 0.0
+        weight_seconds = 0.0
         self.load_packed_global_weights()
         self._static_freqs_cos_tensor()
         self._static_freqs_sin_tensor()
@@ -1509,16 +1514,49 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._require_prefill_output_buffer(model.config.hidden_size)
         self._static_final_norm_weight_tensor()
         if self._stacked_weight_buffers is None:
-            self._stage_stacked_weights(self.load_stacked_layer_weights())
+            weight_start = time.perf_counter() if timing_enabled else 0.0
+            weights = self.load_stacked_layer_weights()
+            buffers = dict(weights.tensors)
+            invalid = [
+                name
+                for name, tensor in buffers.items()
+                if tensor.device.type != "cpu" or not tensor.is_contiguous()
+            ]
+            if invalid:
+                raise TypeError(
+                    "DeepSeekV4 fork-inherited stacked weights must be contiguous CPU tensors: "
+                    + ", ".join(invalid)
+                )
+            self._stacked_weight_buffers = buffers
+            if timing_enabled:
+                weight_seconds = time.perf_counter() - weight_start
         self._hc_head_tensors()
         self._ensure_prefill_fwd_buffers(model.config.hidden_size)
         self._assert_l3_shared_buffers_preallocated()
+        if timing_enabled:
+            total_seconds = time.perf_counter() - total_start
+            total_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (self._stacked_weight_buffers or {}).values()
+            )
+            print(
+                f"[{_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX}] fork_inherited_stacked_weights "
+                f"load_and_stack={weight_seconds * 1000.0:.1f} ms "
+                f"size={total_bytes / (1024.0**3):.3f} GiB",
+                flush=True,
+            )
+            print(
+                f"[{_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX}] l3_host_buffer_init "
+                f"total={total_seconds * 1000.0:.1f} ms",
+                flush=True,
+            )
 
     def _assert_l3_shared_buffers_preallocated(self) -> None:
         missing = self._missing_l3_shared_buffers()
         if missing:
             raise RuntimeError(
-                "DeepSeekV4 L3 worker cannot start before all shared host buffers are preallocated; "
+                "DeepSeekV4 L3 worker cannot start before all shared host buffers are preallocated "
+                "and inherited host tensors are retained; "
                 "missing: " + ", ".join(missing)
             )
 
@@ -2196,25 +2234,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         slot_slice = DeepSeekV4ModelRunner._slot_block_slice(int(slot), int(blocks_per_slot))
         return layer[:, slot_slice].detach().cpu().contiguous().clone()
 
-    def _stage_stacked_weights(self, weights: DeepSeekV4StackedLayerWeights) -> DeepSeekV4StackedLayerWeights:
-        """Copy the layer-stacked decode_fwd weights into shared buffers once."""
-        buffers = self._stacked_weight_buffers
-        if buffers is None:
-            self._ensure_shared_host_allocation_before_worker("stacked layer weights")
-            buffers = {
-                name: self._new_shared_like(tensor, name=f"stacked_weight[{name}]")
-                for name, tensor in weights.tensors.items()
-            }
-            self._stacked_weight_buffers = buffers
-
-        missing = sorted(set(weights.tensors) - set(buffers))
-        if missing:
-            raise KeyError(f"DeepSeekV4 shared stacked-weight buffers are missing: {', '.join(missing)}")
-
-        for name, tensor in weights.tensors.items():
-            self._copy_shared(buffers[name], tensor, name=f"stacked_weight[{name}]")
-        return DeepSeekV4StackedLayerWeights(tensors=buffers)
-
     def _hc_head_tensors(self) -> dict[str, torch.Tensor]:
         """Return rank-replicated hc_head weights for the decode_fwd output collapse."""
         buffers = self._hc_head_buffers
@@ -2634,12 +2653,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype).share_memory_()
 
     @staticmethod
-    def _new_shared_like(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
-        if tensor.device.type != "cpu":
-            raise ValueError(f"{name} must be a CPU tensor")
-        return torch.empty_like(tensor.contiguous(), memory_format=torch.contiguous_format).share_memory_()
-
-    @staticmethod
     def _copy_shared(dst: torch.Tensor, src: torch.Tensor, *, name: str) -> None:
         if src.device.type != "cpu":
             src = src.cpu()
@@ -2676,6 +2689,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._assert_l3_arg_shared(arg.tensor, name=f"{name}.tensor")
             return
         if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
+            if self._is_fork_inherited_weight(arg):
+                return
             raise TypeError(
                 "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
                 f"the L3 worker starts; got {name} shape={tuple(arg.shape)} dtype={arg.dtype}"
@@ -2699,11 +2714,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             uploaded.append(dev)
             return dev
         if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
+            if self._is_fork_inherited_weight(arg):
+                return arg
             raise TypeError(
                 "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
                 f"the worker starts; got non-shared tensor shape={tuple(arg.shape)} dtype={arg.dtype}"
             )
         return arg
+
+    def _is_fork_inherited_weight(self, tensor: torch.Tensor) -> bool:
+        buffers = self._stacked_weight_buffers
+        return buffers is not None and any(tensor is weight for weight in buffers.values())
 
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
@@ -2714,7 +2735,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([callable_spec.compiled for callable_spec in compiled_callables])
+            inherited_weights = tuple((self._stacked_weight_buffers or {}).values())
+            worker = DistributedWorker(
+                [callable_spec.compiled for callable_spec in compiled_callables],
+                inherited_host_tensors=inherited_weights,
+            )
             self._l3_worker = worker
         return worker
 

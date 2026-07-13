@@ -720,6 +720,84 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
     assert packed.tensors["routed_w1"][1, 0].tolist() == raw["layers.0.ffn.experts.2.w1.weight"].tolist()
     assert torch.equal(packed.tensors["csa_hadamard_idx"][0], deepseek_v4_hadamard_idx())
 
+    destination_storage = {
+        name: torch.empty(
+            (int(tensor.shape[0]), int(tensor.shape[1]) * 2, *tensor.shape[2:]),
+            dtype=tensor.dtype,
+        )
+        for name, tensor in packed.tensors.items()
+    }
+    destinations = {
+        name: storage[:, int(packed.tensors[name].shape[1]) :]
+        for name, storage in destination_storage.items()
+    }
+    assert not all(destination.is_contiguous() for destination in destinations.values())
+    direct = pack_deepseek_v4_layer_weights(
+        0,
+        raw,
+        ranks=2,
+        n_routed_experts=4,
+        compress_ratio=4,
+        include_tid2eid=False,
+        include_gate_bias=True,
+        destinations=destinations,
+    )
+
+    assert direct.tensors.keys() == packed.tensors.keys()
+    for name, expected in packed.tensors.items():
+        assert direct.tensors[name] is destinations[name]
+        assert torch.equal(direct.tensors[name], expected), name
+
+
+def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slices(monkeypatch):
+    def packed_layer(layer_id: int) -> weight_loader.DeepSeekV4PackedLayerWeights:
+        tensors = {"fwd": torch.full((2, 2), layer_id, dtype=torch.int8)}
+        tensors.update(
+            {
+                name: torch.full((2, 1), layer_id * 20 + index, dtype=torch.float32)
+                for index, name in enumerate(weight_loader.DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES)
+            }
+        )
+        tensors.update(
+            {
+                name: torch.full((2, 1), layer_id * 20 + 12 + index, dtype=torch.float32)
+                for index, name in enumerate(weight_loader.DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES)
+            }
+        )
+        return weight_loader.DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
+
+    layers = [packed_layer(layer_id) for layer_id in range(3)]
+    direct_flags: list[bool] = []
+    store = DeepSeekV4WeightStore(model_dir=".", weight_map={})
+
+    def fake_load(layer_id: int, **kwargs):
+        destinations = kwargs.get("destinations")
+        direct_flags.append(destinations is not None)
+        packed = layers[layer_id]
+        if destinations is None:
+            return packed
+        for name, destination in destinations.items():
+            destination.copy_(packed.tensors[name])
+        return weight_loader.DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=destinations)
+
+    monkeypatch.setattr(store, "load_packed_layer_weights", fake_load)
+    monkeypatch.setattr(torch, "cat", lambda *args, **kwargs: pytest.fail("torch.cat must not be used"))
+
+    stacked = store.load_stacked_layer_weights(
+        ranks=2,
+        n_routed_experts=4,
+        compress_ratios=(0, 4, 128),
+        num_hash_layers=1,
+    )
+
+    assert direct_flags == [False, True, True]
+    assert stacked.tensors["fwd"].tolist() == [[0, 0, 1, 1, 2, 2], [0, 0, 1, 1, 2, 2]]
+    for name in weight_loader.DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES:
+        assert torch.equal(stacked.tensors[name], layers[1].tensors[name])
+    for name in weight_loader.DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES:
+        assert torch.equal(stacked.tensors[name], layers[2].tensors[name])
+    assert all(tensor.is_contiguous() for tensor in stacked.tensors.values())
+
 
 def test_deepseek_cache_slots_tables_and_mappings():
     manager = DeepSeekV4CacheManager(layout=DeepSeekV4CacheLayout())
@@ -981,6 +1059,56 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
         "csa_inner_state_slot_mapping",
     ):
         assert getattr(staged, name).is_shared()
+
+
+def test_deepseek_keeps_stacked_weights_in_prefork_cpu_memory():
+    runner, model = _runner_for_prepared_inputs()
+    weight = torch.arange(16, dtype=torch.int8).reshape(2, 8)
+    stacked = weight_loader.DeepSeekV4StackedLayerWeights(tensors={"small_weight": weight})
+    runner.load_packed_global_weights = lambda: None
+    runner._static_freqs_cos_tensor = lambda: None
+    runner._static_freqs_sin_tensor = lambda: None
+    runner._ensure_decode_buffers = lambda _hidden_size: None
+    runner._ensure_decode_work_cache = lambda: None
+    runner._require_prefill_output_buffer = lambda _hidden_size: None
+    runner._static_final_norm_weight_tensor = lambda: None
+    runner.load_stacked_layer_weights = lambda: stacked
+    runner._hc_head_tensors = lambda: None
+    runner._ensure_prefill_fwd_buffers = lambda _hidden_size: None
+    runner._assert_l3_shared_buffers_preallocated = lambda: None
+
+    runner._ensure_l3_shared_buffers(model)
+
+    assert runner._stacked_weight_buffers == {"small_weight": weight}
+    assert not weight.is_shared()
+    runner._assert_l3_arg_shared(weight, name="weight")
+    assert runner._coerce_l3_arg(object(), weight, []) is weight
+    with pytest.raises(TypeError, match="shared-memory"):
+        runner._assert_l3_arg_shared(torch.zeros(2, 8), name="dynamic")
+
+
+def test_deepseek_registers_stacked_weights_before_distributed_worker_fork(monkeypatch):
+    import pypto.runtime
+
+    runner, _model = _runner_for_prepared_inputs()
+    weight = torch.arange(16, dtype=torch.int8).reshape(2, 8)
+    runner._stacked_weight_buffers = {"small_weight": weight}
+    runner._compiled.prefill = DeepSeekV4L3Callable(compiled=object(), name="prefill")
+    runner._assert_l3_shared_buffers_preallocated = lambda: None
+    captured: dict[str, object] = {}
+
+    class _DistributedWorker:
+        def __init__(self, compiled, *, inherited_host_tensors):
+            captured["compiled"] = compiled
+            captured["inherited"] = inherited_host_tensors
+
+    monkeypatch.setattr(pypto.runtime, "DistributedWorker", _DistributedWorker)
+
+    worker = runner._shared_l3_worker()
+
+    assert worker is runner._l3_worker
+    assert captured["compiled"] == [runner._compiled.prefill.compiled]
+    assert captured["inherited"] == (weight,)
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
