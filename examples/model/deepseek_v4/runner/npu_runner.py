@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 import os
-import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -80,8 +79,6 @@ DEEPSEEK_V4_HC_EPS = 1e-6
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
-_DEEPSEEK_V4_L3_INIT_TIMING_ENV = "PYPTO_DSV4_L3_INIT_TIMING"
-_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX = "DSV4_L3_INIT_TIMING"
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
@@ -1503,9 +1500,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         read-only by the chip children through fork. Mutable inputs, outputs and
         caches use shared memory so child writes remain visible to the parent.
         """
-        timing_enabled = os.getenv(_DEEPSEEK_V4_L3_INIT_TIMING_ENV) == "1" and self._l3_worker is None
-        total_start = time.perf_counter() if timing_enabled else 0.0
-        weight_seconds = 0.0
         self.load_packed_global_weights()
         self._static_freqs_cos_tensor()
         self._static_freqs_sin_tensor()
@@ -1514,7 +1508,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._require_prefill_output_buffer(model.config.hidden_size)
         self._static_final_norm_weight_tensor()
         if self._stacked_weight_buffers is None:
-            weight_start = time.perf_counter() if timing_enabled else 0.0
             weights = self.load_stacked_layer_weights()
             buffers = dict(weights.tensors)
             invalid = [
@@ -1528,28 +1521,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     + ", ".join(invalid)
                 )
             self._stacked_weight_buffers = buffers
-            if timing_enabled:
-                weight_seconds = time.perf_counter() - weight_start
         self._hc_head_tensors()
         self._ensure_prefill_fwd_buffers(model.config.hidden_size)
         self._assert_l3_shared_buffers_preallocated()
-        if timing_enabled:
-            total_seconds = time.perf_counter() - total_start
-            total_bytes = sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in (self._stacked_weight_buffers or {}).values()
-            )
-            print(
-                f"[{_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX}] fork_inherited_stacked_weights "
-                f"load_and_stack={weight_seconds * 1000.0:.1f} ms "
-                f"size={total_bytes / (1024.0**3):.3f} GiB",
-                flush=True,
-            )
-            print(
-                f"[{_DEEPSEEK_V4_L3_INIT_TIMING_PREFIX}] l3_host_buffer_init "
-                f"total={total_seconds * 1000.0:.1f} ms",
-                flush=True,
-            )
 
     def _assert_l3_shared_buffers_preallocated(self) -> None:
         missing = self._missing_l3_shared_buffers()
