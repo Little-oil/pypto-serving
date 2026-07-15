@@ -13,7 +13,7 @@ import warnings
 
 import torch
 
-from pypto_serving.config.types import GenerateConfig, SamplingParams
+from pypto_serving.config.types import GenerateConfig, SamplingCandidates, SamplingParams
 
 
 class Sampler:
@@ -53,6 +53,56 @@ class Sampler:
 
         token = torch.multinomial(probs, num_samples=1)
         return int(token.item())
+
+    def sample_from_candidates(
+        self, candidates: SamplingCandidates, row_idx: int, params: SamplingParams
+    ) -> int:
+        """Sample from an executor-provided top-k candidate row."""
+        value_rows = candidates.values.shape[0]
+        token_id_rows = candidates.token_ids.shape[0]
+        if value_rows != token_id_rows:
+            raise ValueError(f"candidate values/ids row mismatch: {value_rows} != {token_id_rows}")
+        if row_idx < 0 or row_idx >= value_rows:
+            raise ValueError(f"row_idx {row_idx} is out of bounds for candidates with {value_rows} rows")
+
+        values = candidates.values[row_idx].float()
+        token_ids = candidates.token_ids[row_idx].long()
+        if values.numel() == 0 or token_ids.numel() == 0:
+            raise ValueError("sampling candidates must not be empty")
+        if values.numel() != token_ids.numel():
+            raise ValueError(
+                f"candidate values/ids width mismatch: {values.numel()} != {token_ids.numel()}"
+            )
+
+        width = values.numel()
+        if params.top_k is not None and params.top_k > 0:
+            width = min(width, params.top_k)
+        values = self._sanitize_logits(values[:width])
+        token_ids = token_ids[:width]
+        if params.temperature <= 0.0:
+            return int(token_ids[self._greedy_token(values)].item())
+
+        scaled = values / max(params.temperature, 1e-5)
+        probs = torch.softmax(scaled, dim=-1)
+        if not self._is_valid_distribution(probs):
+            return int(token_ids[self._greedy_token(values)].item())
+
+        if 0.0 < params.top_p < 1.0:
+            sorted_probs, sorted_positions = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            keep = cumulative <= params.top_p
+            keep[0] = True
+            filtered_probs = torch.zeros_like(probs)
+            filtered_probs[sorted_positions[keep]] = probs[sorted_positions[keep]]
+            total = filtered_probs.sum()
+            if not torch.isfinite(total) or total.item() <= 0.0:
+                return int(token_ids[self._greedy_token(values)].item())
+            probs = filtered_probs / total
+            if not self._is_valid_distribution(probs):
+                return int(token_ids[self._greedy_token(values)].item())
+
+        sampled_pos = torch.multinomial(probs, num_samples=1)
+        return int(token_ids[int(sampled_pos.item())].item())
 
     @staticmethod
     def from_generate_config(config: GenerateConfig) -> SamplingParams:
