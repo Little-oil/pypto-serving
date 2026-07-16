@@ -852,20 +852,6 @@ class DeepSeekV4L3Callable:
 
 
 @dataclass
-class _StaticDeviceTensor:
-    """CPU tensor marker uploaded to the shared worker once."""
-
-    tensor: torch.Tensor
-
-
-@dataclass
-class _TransientDeviceTensor:
-    """CPU tensor marker uploaded for one layer dispatch and then freed."""
-
-    tensor: torch.Tensor
-
-
-@dataclass
 class DeepSeekV4LayerCache:
     """Shared decode work-cache tensors for one DeepSeekV4 layer dispatch."""
 
@@ -1106,7 +1092,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self.cache_manager = DeepSeekV4CacheManager(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._l3_worker: Any | None = None
-        self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], DeviceTensor] = {}
         self._decode_work_cache: DeepSeekV4LayerCache | None = None
         self._initialized_cache_requests: set[str] = set()
         self._global_weights: DeepSeekV4GlobalWeights | None = None
@@ -2908,15 +2893,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
         worker = self._shared_l3_worker()
         run_config = self._scope_stats_run_config()
-        uploaded: list[DeviceTensor] = []
-        try:
-            l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
-            if run_config is not None:
-                return worker.run(callable_spec.compiled, *l3_args, config=run_config)
-            return worker.run(callable_spec.compiled, *l3_args)
-        finally:
-            for tensor in uploaded:
-                worker.free_tensor(tensor)
+        if run_config is not None:
+            return worker.run(callable_spec.compiled, *args, config=run_config)
+        return worker.run(callable_spec.compiled, *args)
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -2954,16 +2933,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError(
                 f"DeepSeekV4 shared host buffer '{name}' must be allocated before the L3 worker starts"
             )
-
-    def _coerce_l3_arg(self, worker: Any, arg: Any, uploaded: list[DeviceTensor]) -> Any:
-        if isinstance(arg, _StaticDeviceTensor):
-            return arg.tensor
-        if isinstance(arg, _TransientDeviceTensor):
-            tensor = arg.tensor
-            dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
-            uploaded.append(dev)
-            return dev
-        return arg
 
     def _fork_inherited_weights(self) -> tuple[torch.Tensor, ...]:
         weights = list((self._stacked_weight_buffers or {}).values())
@@ -3093,25 +3062,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if worker is None:
             return
         try:
-            for tensor in self._l3_static_tensors.values():
-                worker.free_tensor(tensor)
             worker.close()
         finally:
             self._l3_worker = None
-            self._l3_static_tensors.clear()
 
     def close(self) -> None:
         worker = self._l3_worker
         try:
             if worker is not None:
-                for tensor in self._l3_static_tensors.values():
-                    worker.free_tensor(tensor)
                 worker.close()
         finally:
             self._l3_worker = None
             self._decode_work_cache = None
             self._initialized_cache_requests.clear()
-            self._l3_static_tensors.clear()
 
     def _require_input_builder(self) -> DeepSeekV4InputBuilder:
         if self.input_builder is None:

@@ -908,6 +908,10 @@ def test_deepseek_registers_inherited_weights_before_distributed_worker_fork(mon
             captured["compiled"] = compiled
             captured["inherited"] = inherited_host_tensors
 
+        def run(self, compiled, *args, **kwargs):
+            captured["dispatch"] = (compiled, args, kwargs)
+            return "ok"
+
     monkeypatch.setattr(pypto.runtime, "DistributedWorker", _DistributedWorker)
 
     worker = runner._shared_l3_worker()
@@ -918,6 +922,11 @@ def test_deepseek_registers_inherited_weights_before_distributed_worker_fork(mon
         runner._compiled.mtp_prefill.compiled,
     ]
     assert captured["inherited"] == (weight, mtp_weight)
+    assert runner._run_l3(runner._compiled.prefill, weight) == "ok"
+    dispatched_compiled, dispatched_args, dispatched_kwargs = captured["dispatch"]
+    assert dispatched_compiled is runner._compiled.prefill.compiled
+    assert dispatched_args[0] is weight
+    assert dispatched_kwargs == {}
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
