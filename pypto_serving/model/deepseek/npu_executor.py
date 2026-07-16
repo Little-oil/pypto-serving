@@ -34,6 +34,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_HCA_STATE_DIM,
     DEEPSEEK_V4_HC_MULT,
     DEEPSEEK_V4_IDX_HEAD_DIM,
+    DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
@@ -109,6 +110,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "gate",
     "hc_post",
     "hc_pre",
+    "lm_head",
     "prefill_attention_csa",
     "prefill_attention_hca",
     "prefill_attention_swa",
@@ -218,6 +220,7 @@ def _deepseek_v4_import_context(
     *,
     pypto_root: Path,
     ep: int,
+    tp: int | None = None,
     moe_shape: str | None = None,
     num_layers: int | None = None,
 ):
@@ -235,6 +238,8 @@ def _deepseek_v4_import_context(
         if module_file is not None and _is_deepseek_v4_module_file(Path(module_file), kernel_dir):
             sys.modules.pop(module_name, None)
     sys.argv = ["pypto-serving-deepseek-v4", "--ep", str(int(ep))]
+    if tp is not None:
+        sys.argv.extend(["--tp", str(int(tp))])
     if moe_shape is not None:
         sys.argv.extend(["--moe-shape", moe_shape])
     if num_layers is not None:
@@ -456,13 +461,20 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             self._kernel_dir,
             pypto_root=pypto_root,
             ep=ranks,
+            tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="prefill",
             num_layers=fwd_layers,
         ):
             prefill_layer = importlib.import_module("prefill_layer")
             prefill_fwd = importlib.import_module("prefill_fwd")
             prefill_mtp = importlib.import_module("prefill_mtp")
-        with _deepseek_v4_import_context(self._kernel_dir, pypto_root=pypto_root, ep=ranks, moe_shape="decode"):
+        with _deepseek_v4_import_context(
+            self._kernel_dir,
+            pypto_root=pypto_root,
+            ep=ranks,
+            tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            moe_shape="decode",
+        ):
             config = importlib.import_module("config")
             # pypto-lib freezes B/S into module-level shapes at import. Override
             # the deployment preset before importing any decode program while
@@ -477,7 +489,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             modules.update(
                 {
                     name: importlib.import_module(name)
-                    for name in ("decode_layer", "decode_fwd", "decode_mtp", "rope_tables")
+                    for name in ("decode_layer", "decode_fwd", "decode_mtp", "lm_head", "rope_tables")
                 }
             )
         modules["prefill_layer"] = prefill_layer
@@ -557,8 +569,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         position ids, input ids), the RoPE tables and the compressor-state
         block tables are shared single per-rank copies, matching decode -- the kernel
         slices them per layer internally. Prefill runs final RMSNorm and emits
-        normalized ``x_out`` hidden rows, so host-side LM-head can project only the
-        rows selected for sampling. It takes a trailing ``num_tokens`` scalar.
+        normalized hidden rows, then runs the device-side LM-head. It takes a
+        trailing ``num_tokens`` scalar.
         """
         cfg = config_module.FLASH
         single = self._layer_common_dummy_tensors(
@@ -679,17 +691,25 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hc_head_fn": torch.empty((ranks, DEEPSEEK_V4_HC_MULT, hc_dim), dtype=torch.float32),
                 "hc_head_scale": torch.empty((ranks, 1), dtype=torch.float32),
                 "hc_head_base": torch.empty((ranks, DEEPSEEK_V4_HC_MULT), dtype=torch.float32),
-                # Final RMSNorm in-kernel; host-side LM-head consumes selected
-                # normalized rows from x_out.
+                # Final RMSNorm and the device LM-head inputs/outputs.
                 "final_norm_w": torch.empty((ranks, hidden), dtype=torch.bfloat16),
                 "pre_hc_hidden_out": torch.empty(
                     (ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
                 ),
-                "x_out": torch.empty((ranks, seq, hidden), dtype=torch.bfloat16),
+                "lm_head_weight": torch.empty(
+                    (
+                        DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        model.config.vocab_size // DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        hidden,
+                    ),
+                    dtype=torch.bfloat16,
+                ),
+                "hidden_out": torch.empty((ranks, seq, hidden), dtype=torch.bfloat16),
+                "logits": torch.empty((ranks, 1, model.config.vocab_size), dtype=torch.float32),
             }
         )
-        # The packed prefill kernel emits normalized hidden rows and takes a
-        # trailing INT32 ``num_tokens`` scalar.
+        # The packed prefill kernel emits last-token device LM-head logits and
+        # takes a trailing INT32 ``num_tokens`` scalar.
         return (*self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER), self._int32_arg(seq))
 
     def _decode_dummy_args(
@@ -850,13 +870,21 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hc_head_fn": torch.empty((ranks, DEEPSEEK_V4_HC_MULT, hc_dim), dtype=torch.float32),
                 "hc_head_scale": torch.empty((ranks, 1), dtype=torch.float32),
                 "hc_head_base": torch.empty((ranks, DEEPSEEK_V4_HC_MULT), dtype=torch.float32),
-                # Decode writes final-normalized hidden rows; host-side LM-head
-                # turns the selected rows into logits.
+                # Decode writes final-normalized hidden rows and device LM-head logits.
                 "final_norm_w": torch.empty((ranks, hidden), dtype=torch.bfloat16),
                 "pre_hc_hidden_out": torch.empty(
                     (ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
                 ),
-                "x_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
+                "lm_head_weight": torch.empty(
+                    (
+                        DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        model.config.vocab_size // DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        hidden,
+                    ),
+                    dtype=torch.bfloat16,
+                ),
+                "hidden_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
+                "logits": torch.empty((ranks, tokens, model.config.vocab_size), dtype=torch.float32),
             }
         )
         # The packed decode kernel takes a trailing INT32 ``num_tokens`` scalar
@@ -985,6 +1013,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             "prefill_layer.py",
             "prefill_fwd.py",
             "prefill_mtp.py",
+            "lm_head.py",
             "decode_layer.py",
             "decode_fwd.py",
             "decode_mtp.py",
@@ -1022,6 +1051,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             actual = _int_constant_from_file(config_path, name)
             if actual is not None and actual != expected:
                 mismatched.append(f"{name}={actual} expected {expected}")
+        lm_head_tp_size = _int_constant_from_file(config_path, "LM_HEAD_TP_SIZE")
+        if lm_head_tp_size is None:
+            mismatched.append(f"LM_HEAD_TP_SIZE missing expected at least {DEEPSEEK_V4_LM_HEAD_TP_SIZE}")
+        elif lm_head_tp_size < DEEPSEEK_V4_LM_HEAD_TP_SIZE:
+            mismatched.append(
+                f"LM_HEAD_TP_SIZE={lm_head_tp_size} expected at least {DEEPSEEK_V4_LM_HEAD_TP_SIZE}"
+            )
         expected_module_constants = {
             "prefill_attention_hca.py": {
                 "HCA_STATE_BLOCK_NUM": layout.hca_state_max_blocks,
