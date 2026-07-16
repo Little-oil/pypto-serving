@@ -754,39 +754,6 @@ class DeepSeekV4WeightStore:
         return DeepSeekV4MtpWeights(tensors=tensors)
 
 
-def stack_deepseek_v4_layer_weights(
-    per_layer: Sequence[DeepSeekV4PackedLayerWeights],
-    *,
-    compress_ratios: Sequence[int],
-) -> DeepSeekV4StackedLayerWeights:
-    """Concatenate per-layer packed weights into the layer-stacked decode_fwd groups."""
-    num_hidden_layers = len(per_layer)
-    if num_hidden_layers != len(compress_ratios):
-        raise ValueError("per_layer count must match compress_ratios length")
-    if num_hidden_layers <= 0:
-        raise ValueError("per_layer must include at least one layer")
-
-    first = per_layer[0]
-    stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
-    csa_order = 0
-    hca_order = 0
-    for layer_id, packed in enumerate(per_layer):
-        compress_ratio = int(compress_ratios[layer_id])
-        destinations = _stacked_layer_destinations(
-            stacked,
-            first,
-            fwd_names=fwd_names,
-            layer_id=layer_id,
-            compress_ratio=compress_ratio,
-            csa_order=csa_order,
-            hca_order=hca_order,
-        )
-        _copy_packed_layer(packed, destinations)
-        csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE)
-        hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE)
-    return DeepSeekV4StackedLayerWeights(tensors=stacked)
-
-
 def _allocate_stacked_layer_weights(
     template: DeepSeekV4PackedLayerWeights,
     *,
