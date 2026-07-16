@@ -887,10 +887,6 @@ def test_deepseek_keeps_stacked_weights_in_prefork_cpu_memory():
 
     assert runner._stacked_weight_buffers == {"small_weight": weight}
     assert not weight.is_shared()
-    runner._assert_l3_arg_shared(weight, name="weight")
-    assert runner._coerce_l3_arg(object(), weight, []) is weight
-    with pytest.raises(TypeError, match="shared-memory"):
-        runner._assert_l3_arg_shared(torch.zeros(2, 8), name="dynamic")
 
 
 def test_deepseek_registers_inherited_weights_before_distributed_worker_fork(monkeypatch):
@@ -1078,8 +1074,6 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers is not None
     assert buffers.weights["small_weight"] is weight
     assert not weight.is_shared()
-    runner._assert_l3_arg_shared(weight, name="mtp_weight")
-    assert runner._coerce_l3_arg(object(), weight, []) is weight
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
     assert buffers.prefill_kv_cache.is_shared()
 

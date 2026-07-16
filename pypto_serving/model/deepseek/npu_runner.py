@@ -2906,8 +2906,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
 
     def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
-        if self._l3_worker is None:
-            self._assert_l3_args_shared_before_worker(callable_spec, args)
         worker = self._shared_l3_worker()
         run_config = self._scope_stats_run_config()
         uploaded: list[DeviceTensor] = []
@@ -2957,54 +2955,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 f"DeepSeekV4 shared host buffer '{name}' must be allocated before the L3 worker starts"
             )
 
-    def _assert_l3_args_shared_before_worker(
-        self,
-        callable_spec: DeepSeekV4L3Callable,
-        args: Sequence[Any],
-    ) -> None:
-        for index, arg in enumerate(args):
-            self._assert_l3_arg_shared(arg, name=f"{callable_spec.name}[{index}]")
-
-    def _assert_l3_arg_shared(self, arg: Any, *, name: str) -> None:
-        if isinstance(arg, (_StaticDeviceTensor, _TransientDeviceTensor)):
-            self._assert_l3_arg_shared(arg.tensor, name=f"{name}.tensor")
-            return
-        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
-            if self._is_fork_inherited_weight(arg):
-                return
-            raise TypeError(
-                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
-                f"the L3 worker starts; got {name} shape={tuple(arg.shape)} dtype={arg.dtype}"
-            )
-        if isinstance(arg, Sequence) and not isinstance(arg, (str, bytes, bytearray)):
-            for index, item in enumerate(arg):
-                self._assert_l3_arg_shared(item, name=f"{name}[{index}]")
-            return
-        if isinstance(arg, dict):
-            for key, item in arg.items():
-                self._assert_l3_arg_shared(item, name=f"{name}[{key!r}]")
-
     def _coerce_l3_arg(self, worker: Any, arg: Any, uploaded: list[DeviceTensor]) -> Any:
         if isinstance(arg, _StaticDeviceTensor):
-            self._assert_l3_arg_shared(arg, name="static")
             return arg.tensor
         if isinstance(arg, _TransientDeviceTensor):
             tensor = arg.tensor
-            self._assert_l3_arg_shared(arg, name="transient")
             dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
             uploaded.append(dev)
             return dev
-        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
-            if self._is_fork_inherited_weight(arg):
-                return arg
-            raise TypeError(
-                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
-                f"the worker starts; got non-shared tensor shape={tuple(arg.shape)} dtype={arg.dtype}"
-            )
         return arg
-
-    def _is_fork_inherited_weight(self, tensor: torch.Tensor) -> bool:
-        return any(tensor is weight for weight in self._fork_inherited_weights())
 
     def _fork_inherited_weights(self) -> tuple[torch.Tensor, ...]:
         weights = list((self._stacked_weight_buffers or {}).values())
