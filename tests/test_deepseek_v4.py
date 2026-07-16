@@ -893,13 +893,17 @@ def test_deepseek_keeps_stacked_weights_in_prefork_cpu_memory():
         runner._assert_l3_arg_shared(torch.zeros(2, 8), name="dynamic")
 
 
-def test_deepseek_registers_stacked_weights_before_distributed_worker_fork(monkeypatch):
+def test_deepseek_registers_inherited_weights_before_distributed_worker_fork(monkeypatch):
     import pypto.runtime
+    from types import SimpleNamespace
 
     runner, _model = _runner_for_prepared_inputs()
     weight = torch.arange(16, dtype=torch.int8).reshape(2, 8)
+    mtp_weight = torch.arange(8, dtype=torch.int8).reshape(2, 4)
     runner._stacked_weight_buffers = {"small_weight": weight}
+    runner._mtp_buffers = SimpleNamespace(weights={"small_mtp_weight": mtp_weight})
     runner._compiled.prefill = DeepSeekV4L3Callable(compiled=object(), name="prefill")
+    runner._compiled.mtp_prefill = DeepSeekV4L3Callable(compiled=object(), name="mtp_prefill")
     runner._assert_l3_shared_buffers_preallocated = lambda: None
     captured: dict[str, object] = {}
 
@@ -913,8 +917,11 @@ def test_deepseek_registers_stacked_weights_before_distributed_worker_fork(monke
     worker = runner._shared_l3_worker()
 
     assert worker is runner._l3_worker
-    assert captured["compiled"] == [runner._compiled.prefill.compiled]
-    assert captured["inherited"] == (weight,)
+    assert captured["compiled"] == [
+        runner._compiled.prefill.compiled,
+        runner._compiled.mtp_prefill.compiled,
+    ]
+    assert captured["inherited"] == (weight, mtp_weight)
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
@@ -1063,12 +1070,18 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
             mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
         )
     )
-    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={})
+    weight = torch.arange(4, dtype=torch.int8).reshape(1, 4)
+    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={"small_weight": weight})
 
     buffers = runner._ensure_mtp_buffers(hidden_size=1)
 
     assert buffers is not None
+    assert buffers.weights["small_weight"] is weight
+    assert not weight.is_shared()
+    runner._assert_l3_arg_shared(weight, name="mtp_weight")
+    assert runner._coerce_l3_arg(object(), weight, []) is weight
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
+    assert buffers.prefill_kv_cache.is_shared()
 
 
 def test_deepseek_unified_cache_zeroing_is_isolated_by_slot():

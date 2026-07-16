@@ -1006,7 +1006,7 @@ class _DeepSeekV4PrefillFwdSharedBuffers:
 
 @dataclass
 class _DeepSeekV4MtpSharedBuffers:
-    """MTP weights, unified SWA cache, recurrent state, and outputs."""
+    """Inherited MTP weights plus shared unified cache, state, and outputs."""
 
     weights: dict[str, torch.Tensor]
     prefill_hidden_in: torch.Tensor
@@ -1709,9 +1709,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _ensure_l3_shared_buffers(self, model: RuntimeModel) -> None:
         """Allocate every CPU tensor visible to the L3 worker before it forks.
 
-        Immutable stacked weights stay in ordinary CPU memory and are inherited
-        read-only by the chip children through fork. Mutable inputs, outputs and
-        caches use shared memory so child writes remain visible to the parent.
+        Immutable main-model and MTP weights stay in ordinary CPU memory and are
+        inherited read-only by the chip children through fork. Mutable inputs,
+        outputs and caches use shared memory so child writes remain visible to
+        the parent.
         """
         self.load_packed_global_weights()
         self._static_freqs_cos_tensor()
@@ -2408,7 +2409,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return buffers
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
-        """Allocate and stage all MTP-owned shared tensors before worker fork."""
+        """Retain MTP weights and allocate mutable shared tensors before worker fork."""
         if self._compiled.mtp_prefill is None or self._compiled.mtp_decode is None:
             return None
         if self._mtp_buffers is not None:
@@ -2419,12 +2420,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
         tokens = layout.decode_tokens
         hidden = int(hidden_size)
         loaded = self.load_mtp_weights()
-        weights = {
-            name: self._new_shared_like(tensor, name=f"mtp_weight[{name}]")
-            for name, tensor in loaded.tensors.items()
-        }
-        for name, tensor in loaded.tensors.items():
-            self._copy_shared(weights[name], tensor, name=f"mtp_weight[{name}]")
+        weights = dict(loaded.tensors)
+        invalid = [
+            name
+            for name, tensor in weights.items()
+            if tensor.device.type != "cpu" or not tensor.is_contiguous()
+        ]
+        if invalid:
+            raise TypeError(
+                "DeepSeekV4 fork-inherited MTP weights must be contiguous CPU tensors: "
+                + ", ".join(invalid)
+            )
         mtp_kv_cache = self._shared_empty(
             (ranks, layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
             torch.bfloat16,
@@ -2998,8 +3004,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return arg
 
     def _is_fork_inherited_weight(self, tensor: torch.Tensor) -> bool:
-        buffers = self._stacked_weight_buffers
-        return buffers is not None and any(tensor is weight for weight in buffers.values())
+        return any(tensor is weight for weight in self._fork_inherited_weights())
+
+    def _fork_inherited_weights(self) -> tuple[torch.Tensor, ...]:
+        weights = list((self._stacked_weight_buffers or {}).values())
+        if self._mtp_buffers is not None:
+            weights.extend(self._mtp_buffers.weights.values())
+        return tuple(weights)
 
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
@@ -3010,10 +3021,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            inherited_weights = tuple((self._stacked_weight_buffers or {}).values())
             worker = DistributedWorker(
                 [callable_spec.compiled for callable_spec in compiled_callables],
-                inherited_host_tensors=inherited_weights,
+                inherited_host_tensors=self._fork_inherited_weights(),
             )
             self._l3_worker = worker
         return worker
