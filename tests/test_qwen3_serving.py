@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,12 +37,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from python.core.async_engine import AsyncLLMEngine
-
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
 
 
 MODEL_DIR_ENV = os.environ.get("PYPTO_QWEN3_MODEL_DIR")
@@ -53,7 +47,7 @@ PLATFORM = os.environ.get("PYPTO_QWEN3_PLATFORM", "a2a3")
 DEVICE_ID_ENV = os.environ.get("DEVICE_ID")
 DEVICE_ID = int(DEVICE_ID_ENV) if DEVICE_ID_ENV is not None else None
 
-# Kernel requires page_size == 128 (examples/.../npu_executor.py), so a full
+# Kernel requires page_size == 128 (pypto_serving/model/qwen/npu_executor.py), so a full
 # prefix-cache block is 128 tokens. Short prompts therefore never populate the
 # prefix cache, keeping the multi-batch / chunked-prefill tests isolated from it.
 PAGE_SIZE = 128
@@ -96,7 +90,7 @@ class _Harness:
 
 async def _collect(engine, prompt: str, max_new_tokens: int) -> list[int]:
     """Drive one request to completion and return its generated token ids."""
-    from python.core.types import GenerateConfig
+    from pypto_serving.config.types import GenerateConfig
 
     request_id = engine.generate_request_id()
     config = GenerateConfig(
@@ -119,9 +113,9 @@ def harness():
     if DEVICE_ID is None:
         pytest.fail("DEVICE_ID is required")
 
-    from python.core.async_engine import AsyncLLMEngine, EngineConfig
-    from python.core.tokenizer import TransformersTokenizerAdapter
-    from python.core.types import RuntimeConfig
+    from pypto_serving.config.types import RuntimeConfig
+    from pypto_serving.model.tokenizer import TransformersTokenizerAdapter
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
 
     tokenizer = TransformersTokenizerAdapter.from_pretrained(str(MODEL_DIR))
     # Default to no chunking; the chunked-prefill test lowers this per-request.

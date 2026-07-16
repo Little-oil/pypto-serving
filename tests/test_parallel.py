@@ -10,20 +10,13 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
 
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import python.cli.main as cli
-from python.core.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
-from python.core.parallel import ParallelConfig, parse_device_ids
-from python.core.types import GenerateConfig
+import pypto_serving.cli.main as cli
+from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
+from pypto_serving.config.types import GenerateConfig
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
 
 
 def _parse_cli_args(argv: list[str]):

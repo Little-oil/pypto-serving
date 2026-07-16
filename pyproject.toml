@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypto-serving"
+version = "0.1.0"
+description = "Local inference serving with PyPTO kernels on Ascend NPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LicenseRef-CANN-2.0"
+authors = [
+  { name = "PyPTO Contributors" },
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/hw-native-sys/pypto-serving"
+Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
+
+[project.scripts]
+pypto-serving = "pypto_serving.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pypto_serving*"]
+namespaces = false

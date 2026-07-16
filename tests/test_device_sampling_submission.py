@@ -15,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 QWEN = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+QWEN_SERVING = ROOT / "pypto_serving" / "model" / "qwen"
 REAL_VOCAB = 151936
 PADDED_VOCAB = 152064
 
@@ -29,9 +30,9 @@ def _source(path: Path) -> str:
 
 
 def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
-    dispatch = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py")
-    executor = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_executor.py")
-    runner = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py")
+    dispatch = _source(QWEN_SERVING / "qwen3_l3_dispatch.py")
+    executor = _source(QWEN_SERVING / "npu_executor.py")
+    runner = _source(QWEN_SERVING / "npu_runner.py")
     config = _source(QWEN / "config.py")
     greedy = _source(QWEN / "greedy_sample.py")
 
@@ -48,7 +49,10 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
 
 def test_device_greedy_tie_break_matches_host_argmax() -> None:
     greedy = _source(QWEN / "greedy_sample.py")
-    decode = _source(QWEN / "decode_layer.py")
+    decode_path = QWEN / "decode_layer.py"
+    if not decode_path.is_file():
+        decode_path = QWEN / "decode_fwd.py"
+    decode = _source(decode_path)
 
     for source in (greedy, decode):
         assert "local_token = pl.cast(0, pl.INT32)" in source
@@ -60,7 +64,7 @@ def test_device_greedy_tie_break_matches_host_argmax() -> None:
 
 def test_prefill_keeps_sampling_in_standalone_device_kernel() -> None:
     prefill = _source(QWEN / "prefill_fwd.py")
-    runner = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py")
+    runner = _source(QWEN_SERVING / "npu_runner.py")
 
     assert "_greedy_sample_inline" not in prefill
     assert "_token_embed_inline" not in prefill

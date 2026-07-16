@@ -1,25 +1,24 @@
 # pypto-serving
 
-PyPTO Serving is a small local inference stack for running Qwen3-14B generation
-with PyPTO kernels on Ascend NPUs. It includes a reusable Python runtime,
-Qwen3-14B executor glue, CLI entry points, and tests for batching and config
-handling.
+PyPTO Serving is a small local inference stack for running Qwen3-14B and
+DeepSeek V4 generation with PyPTO kernels on Ascend NPUs. It includes an
+installable Python package, model executor integrations and CLI entry points.
 
 ## Layout
 
 ```text
-python/
+pypto_serving/
   cli/                         pypto-serving CLI implementation
-  core/                        engine, scheduler, KV cache, model loading, async serving
-  runtime/                     Simpler worker wrapper for NPU dispatch
-pypto-lib/                     submodule providing Qwen3-14B PyPTO kernels
+  config/                      runtime, generation, and parallel configuration
+  serving/                     engine, scheduler, KV cache, HTTP server, workers
+  model/                       loading, common runtime, Qwen, and DeepSeek integrations
+  worker/                      Simpler worker wrapper for NPU dispatch
+  tools/profile/               Chrome-trace profiling support
+pypto-lib/                     submodule providing model-specific PyPTO kernels
 platform/                      C++ platform-management layer (engine lifecycle, channels, modules)
 examples/
-  pypto-serving                executable CLI wrapper
   model/qwen3_14b/
     npu_generate.py            NPU generation/profiling example
-    npu_serving.json           sample serving config
-    runner/                    Qwen3 executors and runner glue
 tests/                         CLI, batching, E2E serving, and benchmark tests
 ```
 
@@ -45,19 +44,13 @@ Initialize the kernel submodule after cloning:
 
 ```bash
 git submodule update --init --recursive
-```
-
-Run the unit tests:
-
-```bash
-python -m pytest tests/test_batching.py tests/test_parallel.py
+python -m pip install --no-deps -e .
 ```
 
 Show CLI help:
 
 ```bash
-./examples/pypto-serving --help
-python -m python.cli --help
+pypto-serving --help
 ```
 
 ## NPU Generation
@@ -74,36 +67,17 @@ python examples/model/qwen3_14b/npu_generate.py \
   --max-new-tokens 5
 ```
 
-Offline generation does not require the larger PTO2 ring settings used for
-concurrent HTTP serving.
-
-Add `--profile` to print timing and write a Chrome trace when `SA_PROFILE_OUTPUT`
-or `SA_PROFILE_LEVEL` is set:
-
-```bash
-SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /path/to/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --device-id 0 \
-  --max-seq-len 512 \
-  --max-new-tokens 5 \
-  --profile
-```
-
 ## HTTP Serving (OpenAI-compatible API)
 
 Start the serving server with a multiprocess worker:
 
 ```bash
-python -m python.cli.main \
+pypto-serving \
   --model /path/to/Qwen3-14B \
   --backend npu \
   --platform a2a3 \
   --device 0 \
   --max-model-len 512 \
-  --max-new-tokens 16 \
   --port 8899
 ```
 
@@ -138,12 +112,10 @@ python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run
-  `python python/cli/main.py --help` for the full list.
-- Parallel serving development notes live in `docs/dev/parallel.md`.
-- Generated kernel artifacts are written under `build_output/` and are ignored
-  by git.
+  `pypto-serving --help` for the full list.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
   local Ascend runtime environment to be available in the active Python
   environment.
-- HTTP serving mode additionally requires `fastapi`, `uvicorn`, and `pydantic`.
-  The benchmark script requires `aiohttp`.
+- `pypto-lib/` is not included in the wheel. An editable checkout discovers its
+  kernel submodule automatically; for any other installation, set `PYPTO_ROOT`
+  to the root of a `pypto-lib` checkout before loading a model.

@@ -50,7 +50,7 @@ body:
       description: How should this feature work?
       placeholder: |
         ```bash
-        ./examples/pypto-serving --config ... --new-option ...
+        pypto-serving --model /path/to/model --new-option ...
         ```
     validations:
       required: false

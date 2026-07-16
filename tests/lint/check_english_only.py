@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_INCLUDED_PREFIXES = ["examples/"]
+DEFAULT_INCLUDED_PREFIXES = ["examples/", "pypto_serving/"]
 DEFAULT_EXCLUDED_PATTERNS = []
 SOURCE_EXTENSIONS = {".py", ".pyi", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx", ".md"}
 

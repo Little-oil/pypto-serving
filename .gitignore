@@ -7,6 +7,11 @@ __pycache__/
 .ruff_cache/
 .pyright/
 
+# Python packaging artifacts
+/build/
+/dist/
+/*.egg-info/
+
 # Virtual environments
 .venv/
 venv/

@@ -15,11 +15,7 @@ import pytest
 import torch
 from simpler.task_interface import DataType
 
-from python.core.async_engine import ReplicaEngineCore, TokenOutput
-from python.core.engine import LLMEngine
-from python.core.executor import ModelExecutor
-from python.core.kv_cache import KvCacheManager
-from python.core.types import (
+from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
     GenerateConfig,
@@ -31,20 +27,33 @@ from python.core.types import (
     RuntimeConfig,
     RuntimeModel,
 )
-from python.core.scheduler import Request, ScheduledRequest
-from python.core.serving_worker import WorkerProcess
-from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
-from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
-from examples.model.qwen3_14b.runner.npu_runner import _L3Callable
-from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
-from examples.model.qwen3_14b.runner.npu_runner import _kernel_trace_name
-from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
-from python.runtime.worker import WorkerTensor
+from pypto_serving.model.common.executor.executor import ModelExecutor
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.npu_runner import (
+    _CompiledKernels,
+    _L3Callable,
+    Qwen314BModelRunner as ModelRunner,
+    _add_run_timing_args,
+    _kernel_trace_name,
+    _run_timing_us,
+)
+from pypto_serving.serving.engine.async_engine import ReplicaEngineCore, TokenOutput
+from pypto_serving.serving.engine.engine import LLMEngine
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.sched.scheduler import (
+    Request,
+    RequestStatus,
+    ScheduledRequest,
+    Scheduler,
+    SchedulerConfig,
+    SchedulerOutput,
+)
+from pypto_serving.serving.server.serving_worker import WorkerProcess
+from pypto_serving.worker.worker import WorkerTensor
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QWEN3_DISPATCH = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py"
+QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 
@@ -54,6 +63,33 @@ class _Tokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return " ".join(str(token_id) for token_id in token_ids)
+
+
+def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
+    manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    request = Request(
+        request_id="speculative",
+        prompt_token_ids=[1],
+        max_new_tokens=4,
+        eos_token_id=7,
+        num_computed_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+    scheduled = SchedulerOutput(
+        scheduled_requests=[
+            ScheduledRequest(request=request, num_new_tokens=1, is_prefill=False)
+        ]
+    )
+
+    outputs = scheduler.update_from_output(scheduled, {request.request_id: [7, 8]})
+
+    assert request.output_token_ids == [7]
+    assert request.num_computed_tokens == 2
+    assert request.status is RequestStatus.FINISHED_EOS
+    assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
 def test_worker_step_error_queues_finished_ids_for_executor_release():
@@ -161,7 +197,6 @@ def _compiled_kernels(
         prefill=callable_,
         decode=callable_,
         greedy_sample=callable_,
-        token_embed=callable_,
         final_norm_weight=torch.ones(1, hidden_size),
         rope_cos=torch.zeros(max_seq, head_dim),
         rope_sin=torch.zeros(max_seq, head_dim),
@@ -169,7 +204,7 @@ def _compiled_kernels(
         padded_lm_head_weight=torch.zeros(model.config.vocab_size, hidden_size),
         padded_embed_weight=torch.zeros(model.config.vocab_size, hidden_size),
         decode_weights=decode_weights,
-        prefill_hidden_buffer=torch.empty(kernel_batch * max_seq, hidden_size, dtype=torch.bfloat16),
+        prefill_token_ids_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_seq_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
         prefill_chunk_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
         prefill_chunk_offsets_buffer=torch.empty(kernel_batch, dtype=torch.int32),
@@ -212,29 +247,20 @@ def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
         [idx + 1 for idx in range(len(allocations))],
         dtype=torch.int32,
     )
-    embeddings = torch.ones(
-        len(allocations),
-        int(seq_lens.max().item()),
-        model.config.hidden_size,
-    )
-
     prepared = runner._prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=[alloc.request_id for alloc in allocations],
-            token_ids=torch.zeros(
-                len(allocations),
-                int(seq_lens.max().item()),
-                dtype=torch.long,
-            ),
-            input_embeddings=embeddings,
+            token_ids=torch.tensor([[1, 0], [2, 3]], dtype=torch.long),
+            input_embeddings=None,
             seq_lens=seq_lens,
             kv_allocations=allocations,
         ),
     )
 
     assert prepared.actual_batch == 2
-    assert prepared.hidden.shape == (3, model.config.hidden_size)
+    assert prepared.token_ids.shape == (3,)
+    assert prepared.token_ids.tolist() == [1, 2, 3]
     assert prepared.seq_lens.shape == (model.runtime.max_batch_size,)
     assert prepared.seq_lens[:2].tolist() == [1, 2]
     assert prepared.seq_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
@@ -262,15 +288,15 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
         model,
         PrefillBatch(
             request_ids=[alloc.request_id],
-            token_ids=torch.zeros(1, 2, dtype=torch.long),
-            input_embeddings=torch.ones(1, 2, model.config.hidden_size),
+            token_ids=torch.tensor([[5, 6]], dtype=torch.long),
+            input_embeddings=None,
             seq_lens=torch.tensor([4], dtype=torch.int32),
             kv_allocations=[alloc],
             positions=torch.tensor([[2, 3]], dtype=torch.long),
         ),
     )
 
-    assert prepared.hidden.shape == (2, model.config.hidden_size)
+    assert prepared.token_ids.tolist() == [5, 6]
     assert prepared.seq_lens.tolist() == [4]
     assert prepared.chunk_lens.tolist() == [2]
     assert prepared.chunk_offsets.tolist() == [0]
@@ -295,7 +321,7 @@ def test_prefill_inputs_reject_non_contiguous_chunk_positions():
             PrefillBatch(
                 request_ids=[alloc.request_id],
                 token_ids=torch.zeros(1, 3, dtype=torch.long),
-                input_embeddings=torch.ones(1, 3, model.config.hidden_size),
+                input_embeddings=None,
                 seq_lens=torch.tensor([4], dtype=torch.int32),
                 kv_allocations=[alloc],
                 positions=torch.tensor([[1, 3, 4]], dtype=torch.long),
@@ -436,7 +462,7 @@ def test_engine_uses_zero_decode_placeholder_when_executor_embeds_on_device():
     )[0]
 
     assert result.token_ids == [3, 0]
-    assert executor.lookup_calls == 1
+    assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
     assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
     assert sampler.sample_calls == 0
@@ -473,7 +499,7 @@ def test_engine_skips_decode_host_embedding_when_executor_embeds_on_device():
     )[0]
 
     assert result.token_ids == [3, 0]
-    assert executor.lookup_calls == 1
+    assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
     assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
     assert sampler.sample_calls == 0
@@ -571,6 +597,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         decode_weights=executor._stack_decode_weights([cached_layer]),
     )
     executor._compiled[model.config.model_id] = compiled
+    monkeypatch.setattr(ModelRunner, "_static_device_tensor", staticmethod(lambda tensor: tensor))
     runner = ModelRunner(
         compiled=compiled,
     )
@@ -578,7 +605,6 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
-    monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
     monkeypatch.setattr(
         runner,
         "_run_distributed_program",
@@ -597,7 +623,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         PrefillBatch(
             request_ids=["prefill"],
             token_ids=torch.zeros(1, 1, dtype=torch.long),
-            input_embeddings=torch.ones(1, 1, model.config.hidden_size),
+            input_embeddings=None,
             seq_lens=torch.tensor([1], dtype=torch.int32),
             kv_allocations=[prefill_alloc],
         ),
@@ -662,7 +688,7 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     assert 'name_hint="greedy_sample"' in decode_source
 
 
-def test_prefill_host_keeps_sampling_as_standalone_kernel():
+def test_prefill_host_inlines_embedding_and_keeps_sampling_standalone():
     module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_prefill_host")
     end = module_source.index("def qwen3_decode_host")
@@ -671,12 +697,14 @@ def test_prefill_host_keeps_sampling_as_standalone_kernel():
     assert source.count("prefill_fwd(") == 1
     assert "greedy_sample_fwd(" not in source
     assert "token_embed_fwd(" not in source
+    assert "embed_weight:" in source
+    assert "input_ids:" in source
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
-    assert 'name_hint="token_embed"' not in prefill_source
+    assert 'name_hint="token_embed"' in prefill_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -697,12 +725,16 @@ def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeig
 
 
 class _CopyKernel:
-    def __call__(self, hidden, *args, config=None):
-        out = args[-1]
-        if out.shape == hidden.shape:
-            out.copy_(hidden)
+    def __call__(self, *args, config=None):
+        tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if len(tensors) < 2:
+            return None
+        src, out = tensors[0], tensors[-1]
+        if out.shape == src.shape:
+            out.copy_(src)
         else:
             out.zero_()
+        return None
 
 
 class _ImmediateEosExecutor(ModelExecutor):
@@ -780,12 +812,11 @@ class _DeviceSamplingExecutor(ModelExecutor):
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         self.lookup_calls += 1
-        if self.lookup_calls > 1:
-            raise AssertionError("device-embedding decode should use a placeholder instead of host lookup")
-        return super().lookup_embeddings(model, token_ids)
+        raise AssertionError("device-embedding prefill/decode should not use host lookup")
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         self.prefill_calls += 1
+        assert batch.input_embeddings is None
         token = torch.tensor([self.first_token], dtype=torch.int64)
         return PrefillResult(
             last_hidden=None,

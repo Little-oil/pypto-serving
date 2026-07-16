@@ -2,13 +2,14 @@
 
 ## Project Layout
 
-PyPTO Serving is a local inference stack for Qwen3-14B generation on Ascend
-NPUs. Runtime code lives under `python/`, with CLI entry points in
-`python/cli/` and engine, scheduler, KV cache, model loading, sampling, and
-streaming logic in `python/core/`. Qwen3-14B examples and executor glue live
-under `examples/model/qwen3_14b/`. The `pypto-lib/` submodule provides the
-kernel sources used by the NPU executor. Unit and lint tests live under
-`tests/`.
+PyPTO Serving is a local inference stack for Qwen3-14B and DeepSeek V4
+generation on Ascend NPUs. Installable runtime code lives under
+`pypto_serving/`, with CLI entry
+points in `pypto_serving/cli/`, serving orchestration in
+`pypto_serving/serving/`, and model integrations in `pypto_serving/model/`.
+Runnable scripts and configuration stay under `examples/`. The `pypto-lib/`
+submodule provides kernel sources used by the NPU executors. Unit and lint tests
+live under `tests/`.
 
 ## Skills
 
@@ -24,6 +25,7 @@ Initialize submodules after cloning:
 
 ```bash
 git submodule update --init --recursive
+python -m pip install --no-deps -e .
 ```
 
 Run the main unit tests:

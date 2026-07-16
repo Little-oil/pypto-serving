@@ -12,15 +12,9 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
-
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 
 MODEL_DIR_ENV = os.environ.get("PYPTO_QWEN3_MODEL_DIR")
@@ -41,10 +35,10 @@ def test_qwen3_output_matches_expected_tokens():
     if DEVICE_ID is None:
         pytest.fail("DEVICE_ID is required")
 
-    from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor
-    from python.core.engine import LLMEngine
-    from python.core.kv_cache import KvCacheManager
-    from python.core.types import GenerateConfig, RuntimeConfig
+    from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+    from pypto_serving.serving.engine.engine import LLMEngine
+    from pypto_serving.serving.memory.kv_cache import KvCacheManager
 
     kv_cache_manager = KvCacheManager()
     executor = Qwen314BPyptoExecutor(

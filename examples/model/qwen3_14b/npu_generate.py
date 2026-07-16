@@ -10,34 +10,19 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import statistics
-import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-
-def _bootstrap_package_root() -> None:
-    this_file = Path(__file__).resolve()
-    for candidate in (this_file, *this_file.parents):
-        if (candidate / "python" / "core").is_dir() and (candidate / "examples" / "model" / "qwen3_14b" / "runner").is_dir():
-            repo_root = str(candidate)
-            if repo_root not in sys.path:
-                sys.path.insert(0, repo_root)
-            return
-    raise RuntimeError(f"Unable to locate the pypto-serving repo root from {this_file}")
-
-
-_bootstrap_package_root()
-
-from python.core import GenerateConfig, LLMEngine, RuntimeConfig
-from python.core.kv_cache import KvCacheManager
-from python.core.parallel import ParallelConfig, parse_device_ids
-from python.profile import get_profiler, merge_profile, profile_span
-from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from python.core.types import LoadedModel
-import dataclasses
+from pypto_serving import GenerateConfig, LLMEngine, RuntimeConfig
+from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
+from pypto_serving.config.types import LoadedModel
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.tools.profile import get_profiler, merge_profile, profile_span
 
 
 # -----------------------------------------------------------------------------
@@ -444,7 +429,6 @@ def main() -> None:
         platform=args.platform,
         device_ids=device_ids,
         save_kernels_dir=args.save_kernels_dir,
-        l3_trace=args.profile_verbose,
     )
     engine = LLMEngine(
         kv_cache_manager=kv_cache_manager,

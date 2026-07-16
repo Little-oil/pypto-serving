@@ -24,7 +24,7 @@ body:
       label: Description
       description: Clear description of the bug and how to reproduce it
       placeholder: |
-        1. Start the server with `./examples/pypto-serving --config ...`
+        1. Start the server with `pypto-serving --model ...`
         2. Send a request or run generation with ...
         3. Observe the error ...
     validations:
@@ -37,7 +37,7 @@ body:
       description: The exact command, config, or request payload that triggers the bug
       placeholder: |
         ```bash
-        ./examples/pypto-serving --config examples/model/qwen3_14b/qwen3_14b_npu_serving.json --interactive
+        pypto-serving --model /path/to/Qwen3-14B --backend npu --platform a2a3 --device 0
         ```
     validations:
       required: false

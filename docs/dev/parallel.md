@@ -6,12 +6,18 @@ group to the PyPTO L3 distributed worker for that replica. Single-device serving
 remains the default. Pipeline parallelism and expert parallelism are not
 supported yet.
 
+Install the checkout before running the commands below:
+
+```bash
+python -m pip install --no-deps -e .
+```
+
 ## DP=2 Serving
 
 For example, run two data-parallel replicas on devices 0 and 1:
 
 ```bash
-python -m python.cli.main \
+pypto-serving \
   --model /path/to/Qwen3-14B \
   --backend npu \
   --platform a2a3 \
