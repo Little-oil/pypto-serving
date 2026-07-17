@@ -22,7 +22,6 @@ from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConf
 def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
-
 def test_parallel_config_groups_dp_replicas_into_tp_groups():
     config = ParallelConfig(
         data_parallel_size=2,
@@ -33,25 +32,6 @@ def test_parallel_config_groups_dp_replicas_into_tp_groups():
     assert config.replica_device_groups == ((0, 1), (2, 3))
     assert config.for_replica((2, 3)).data_parallel_size == 1
     assert config.for_replica((2, 3)).devices == (2, 3)
-
-
-def test_parallel_config_overlaps_model_local_dp_and_ep_on_one_worker_group():
-    config = ParallelConfig(
-        data_parallel_size=8,
-        tensor_parallel_size=1,
-        expert_parallel_size=8,
-        enable_expert_parallel=True,
-        devices=tuple(range(8)),
-        placement_mode="overlapped",
-    )
-
-    assert config.num_replicas == 1
-    assert config.worker_group_size == 8
-    assert config.replica_device_groups == (tuple(range(8)),)
-    worker_config = config.for_replica(tuple(range(8)))
-    assert worker_config.data_parallel_size == 8
-    assert worker_config.expert_parallel_size == 8
-    assert worker_config.placement_mode == "overlapped"
 
 
 def test_parallel_config_rejects_unsupported_modes():

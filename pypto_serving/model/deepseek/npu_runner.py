@@ -836,29 +836,52 @@ class DeepSeekV4InputBuilder:
         *,
         ranks: Sequence[int],
         local_rows: Sequence[int],
-        prev_embeddings: torch.Tensor | None = None,
-        use_decode_pair: bool = False,
     ) -> torch.Tensor:
-        """Pack global serving rows into each rank's local decode micro-batch."""
+        """Pack one autoregressive token per request into rank-local rows."""
+        token_rows = embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1)
+        return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
+
+    def mtp_decode_x_hc(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        prev_embeddings: torch.Tensor,
+        ranks: Sequence[int],
+        local_rows: Sequence[int],
+    ) -> torch.Tensor:
+        """Pack the committed-token and draft-token pair used by MTP verification."""
+        if self.layout.decode_seq != 2:
+            raise ValueError("DeepSeekV4 MTP verification requires decode_seq=2")
+        if prev_embeddings.shape != embeddings.shape:
+            raise ValueError("MTP previous embeddings must align with draft embeddings")
+        token_rows = prev_embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1).clone()
+        token_rows[:, -1].copy_(embeddings)
+        return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
+
+    def _pack_decode_x_hc(
+        self,
+        token_rows: torch.Tensor,
+        *,
+        ranks: Sequence[int],
+        local_rows: Sequence[int],
+    ) -> torch.Tensor:
+        """Pack explicit per-request token rows into the fixed decode tile."""
         if (
-            embeddings.ndim != 2
-            or embeddings.shape[0] <= 0
-            or int(embeddings.shape[1]) != self.hidden_size
+            token_rows.ndim != 3
+            or token_rows.shape[0] <= 0
+            or int(token_rows.shape[1]) != self.layout.decode_seq
+            or int(token_rows.shape[2]) != self.hidden_size
         ):
-            raise ValueError("rank-local decode embeddings must have shape [requests, hidden]")
-        if len(ranks) != embeddings.shape[0] or len(local_rows) != embeddings.shape[0]:
-            raise ValueError("decode embeddings, ranks, and local rows must align")
-        if prev_embeddings is not None and prev_embeddings.shape != embeddings.shape:
-            raise ValueError("decode previous embeddings must align with active requests")
-        embeddings = embeddings.to(torch.float32)
-        if prev_embeddings is not None:
-            prev_embeddings = prev_embeddings.to(torch.float32)
+            raise ValueError("decode token rows must have shape [requests, decode_seq, hidden]")
+        if len(ranks) != token_rows.shape[0] or len(local_rows) != token_rows.shape[0]:
+            raise ValueError("decode token rows, ranks, and local rows must align")
+        token_rows = token_rows.to(torch.float32)
         rows = torch.zeros(
             (self.layout.ranks, self.layout.decode_tokens, self.hidden_size),
-            dtype=embeddings.dtype,
-            device=embeddings.device,
+            dtype=token_rows.dtype,
+            device=token_rows.device,
         )
-        fallback = embeddings[0]
+        fallback = token_rows[0, -1]
         for rank in range(self.layout.ranks):
             rows[rank].copy_(fallback.reshape(1, -1).expand(self.layout.decode_tokens, -1))
         for index, (rank, local_row) in enumerate(zip(ranks, local_rows, strict=True)):
@@ -869,16 +892,7 @@ class DeepSeekV4InputBuilder:
             if not 0 <= local_row < self.layout.decode_batch:
                 raise ValueError(f"decode local row {local_row} is out of range")
             start = local_row * self.layout.decode_seq
-            if use_decode_pair and prev_embeddings is not None:
-                rows[rank, start : start + self.layout.decode_seq].copy_(
-                    prev_embeddings[index : index + 1].expand(self.layout.decode_seq, -1)
-                )
-            else:
-                rows[rank, start : start + self.layout.decode_seq].copy_(
-                    embeddings[index : index + 1].expand(self.layout.decode_seq, -1)
-                )
-            if use_decode_pair:
-                rows[rank, start + self.layout.decode_seq - 1].copy_(embeddings[index])
+            rows[rank, start : start + self.layout.decode_seq].copy_(token_rows[index])
         return self._expand_hc(rows)
 
     def _expand_hc(self, rank_rows: torch.Tensor) -> torch.Tensor:
@@ -969,6 +983,7 @@ class DeepSeekV4CompiledKernels:
     n_routed_experts: int = 256
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
+    enable_mtp: bool = False
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -1041,6 +1056,25 @@ class DeepSeekV4PreparedDecodeInputs:
     csa_state_slot_mapping: torch.Tensor
     csa_inner_state_slot_mapping: torch.Tensor
     block_ids_by_group: tuple[dict[str, tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4DecodeAssignment:
+    """Mapping from scheduler order to rank-local kernel rows."""
+
+    ranks: tuple[int, ...]
+    local_rows: tuple[int, ...]
+    per_rank_counts: tuple[int, ...]
+    indices_by_rank: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4MainDecodeOutput:
+    """Main-model tensors produced by one packed decode dispatch."""
+
+    inputs: DeepSeekV4PreparedDecodeInputs
+    hidden: torch.Tensor
+    pre_hc_hidden: torch.Tensor
 
 
 @dataclass
@@ -1228,6 +1262,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_proposed_tokens = 0
         self._mtp_accepted_tokens = 0
+        if compiled.enable_mtp:
+            self._decode_flow = self._run_mtp_decode
+            self._prefill_completion = self._capture_mtp_prefill_context
+        else:
+            self._decode_flow = self._run_autoregressive_decode
+            self._prefill_completion = self._ignore_prefill_context
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
         """Initialize runner state and return scheduler-only KV block capacity.
@@ -1511,71 +1551,89 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         model: RuntimeModel,
         batch: DecodeBatch,
-        *,
-        use_decode_pair: bool = False,
     ) -> DeepSeekV4PreparedDecodeInputs:
-        """Pack global requests into eight rank-local decode micro-batches."""
+        """Build inputs for the single-token autoregressive decode flow."""
         hidden_states = self._require_decode_hidden_states(batch)
-        builder = self._require_input_builder()
-        layout = self._compiled.layout
-        actual_batch = len(batch.request_ids)
-        if actual_batch <= 0:
-            raise ValueError("DeepSeekV4 decode batch must not be empty")
-        if len(batch.cache_partitions) != actual_batch:
-            raise ValueError("DeepSeekV4 decode requires one cache partition per request")
-        ranks = tuple(int(rank) for rank in batch.cache_partitions)
-        if min(ranks) < 0 or max(ranks) >= layout.ranks:
-            raise ValueError(f"DeepSeekV4 decode cache partitions must be in [0, {layout.ranks - 1}]")
-        active_group_ids = self._normalize_group_block_ids(
-            batch.block_ids_by_group,
-            actual_batch,
-        )
-
-        indices_by_rank: list[list[int]] = [[] for _ in range(layout.ranks)]
-        local_rows = [0] * actual_batch
-        for request_index, rank in enumerate(ranks):
-            local_row = len(indices_by_rank[rank])
-            if local_row >= layout.decode_batch:
-                raise ValueError(
-                    f"DeepSeekV4 rank {rank} decode batch exceeds local capacity {layout.decode_batch}"
-                )
-            local_rows[request_index] = local_row
-            indices_by_rank[rank].append(request_index)
-        per_rank_counts = tuple(len(indices) for indices in indices_by_rank)
-        if not use_decode_pair and layout.decode_seq != 1 and max(per_rank_counts) > 1:
+        assignment = self._decode_assignment(batch)
+        if self._compiled.layout.decode_seq != 1 and max(assignment.per_rank_counts) > 1:
             raise ValueError(
                 "DeepSeekV4 non-MTP decode supports at most one request per DP rank; "
                 "the fixed S=2 kernel can expose only one cache-safe active token per rank"
             )
-
-        positions = self._decode_positions(
+        builder = self._require_input_builder()
+        actual_batch = len(batch.request_ids)
+        positions = self._autoregressive_decode_positions(batch, actual_batch)
+        embeddings = hidden_states.to(torch.float32).cpu()
+        return self._prepare_decode_inputs(
+            model,
             batch,
+            assignment=assignment,
+            positions=positions,
+            token_rows=self._autoregressive_decode_token_rows(batch.token_ids, actual_batch),
+            x_hc=builder.decode_x_hc(
+                embeddings,
+                ranks=assignment.ranks,
+                local_rows=assignment.local_rows,
+            ),
+        )
+
+    def prepare_mtp_decode_inputs(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+    ) -> DeepSeekV4PreparedDecodeInputs:
+        """Build paired main-model verification inputs for the MTP flow."""
+        hidden_states = self._require_decode_hidden_states(batch)
+        if batch.prev_token_ids is None or batch.prev_hidden_states is None:
+            raise ValueError("DeepSeekV4 MTP decode requires previous token IDs and embeddings")
+        assignment = self._decode_assignment(batch)
+        builder = self._require_input_builder()
+        actual_batch = len(batch.request_ids)
+        positions = self._mtp_decode_positions(batch, actual_batch)
+        embeddings = hidden_states.to(torch.float32).cpu()
+        previous_embeddings = batch.prev_hidden_states.to(torch.float32).cpu()
+        return self._prepare_decode_inputs(
+            model,
+            batch,
+            assignment=assignment,
+            positions=positions,
+            token_rows=self._mtp_decode_token_rows(
+                batch.token_ids,
+                batch.prev_token_ids,
+                actual_batch,
+            ),
+            x_hc=builder.mtp_decode_x_hc(
+                embeddings,
+                prev_embeddings=previous_embeddings,
+                ranks=assignment.ranks,
+                local_rows=assignment.local_rows,
+            ),
+        )
+
+    def _prepare_decode_inputs(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        assignment: _DeepSeekV4DecodeAssignment,
+        positions: tuple[tuple[int, ...], ...],
+        token_rows: torch.Tensor,
+        x_hc: torch.Tensor,
+    ) -> DeepSeekV4PreparedDecodeInputs:
+        """Build mode-independent cache metadata around explicit token rows."""
+        layout = self._compiled.layout
+        actual_batch = len(batch.request_ids)
+        ranks = assignment.ranks
+        local_rows = assignment.local_rows
+        per_rank_counts = assignment.per_rank_counts
+        indices_by_rank = assignment.indices_by_rank
+        active_group_ids = self._normalize_group_block_ids(
+            batch.block_ids_by_group,
             actual_batch,
-            use_decode_pair=use_decode_pair,
         )
         max_position = max(max(row) for row in positions)
         if max_position >= model.runtime.max_seq_len:
             raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
-
-        token_ids = batch.token_ids.detach().cpu().to(torch.long)
-        prev_token_ids = (
-            batch.prev_token_ids.detach().cpu().to(torch.long)
-            if batch.prev_token_ids is not None
-            else None
-        )
-        decode_embeds = hidden_states.to(torch.float32).cpu()
-        prev_embeds = (
-            batch.prev_hidden_states.to(torch.float32).cpu()
-            if batch.prev_hidden_states is not None
-            else None
-        )
-        x_hc = builder.decode_x_hc(
-            decode_embeds,
-            ranks=ranks,
-            local_rows=local_rows,
-            prev_embeddings=prev_embeds,
-            use_decode_pair=use_decode_pair,
-        )
 
         field_rows: dict[str, list[torch.Tensor]] = {
             name: []
@@ -1616,13 +1674,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if request_indices:
                 local_positions = [positions[index] for index in request_indices]
                 local_groups = [active_group_ids[index] for index in request_indices]
-                local_tokens = token_ids[request_indices]
-                local_prev_tokens = (
-                    prev_token_ids[request_indices]
-                    if prev_token_ids is not None
-                    else None
-                )
-                local_seq_lens = batch.seq_lens[request_indices]
+                local_token_rows = token_rows[list(request_indices)]
+                local_seq_lens = batch.seq_lens[list(request_indices)]
                 local_count = len(request_indices)
             else:
                 # All ranks must enter the distributed program with the common
@@ -1630,8 +1683,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 # cache mappings cover otherwise-unowned scratch blocks.
                 local_positions = [positions[0]]
                 local_groups = []
-                local_tokens = token_ids[0:1]
-                local_prev_tokens = prev_token_ids[0:1] if prev_token_ids is not None else None
+                local_token_rows = token_rows[0:1]
                 local_seq_lens = batch.seq_lens[0:1]
                 local_count = 1
 
@@ -1654,12 +1706,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     )
 
             field_rows["input_ids"].append(
-                self._decode_token_rows(
-                    local_tokens,
+                self._pad_decode_token_rows(
+                    local_token_rows,
                     local_count,
                     vocab_size=model.config.vocab_size,
-                    prev_token_ids=local_prev_tokens,
-                    use_decode_pair=use_decode_pair,
                 )
             )
             field_rows["position_ids"].append(
@@ -1913,28 +1963,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 packed prefill dispatch failed "
                 f"(tokens={inputs.actual_tokens}, ranks={inputs.ranks})"
             ) from exc
-        if self._mtp_buffers is not None:
-            # MTP prefill is shifted by one token and therefore needs the first
-            # sampled token. Keep request-local copies because the shared main
-            # prefill buffers are reused by later requests before decode runs.
-            for request_id, rank, actual_tokens in zip(
-                inputs.request_ids,
-                inputs.ranks,
-                inputs.actual_tokens,
-                strict=True,
-            ):
-                self._mtp_request_states[request_id] = _DeepSeekV4MtpRequestState(
-                    prefill_context=_DeepSeekV4MtpPrefillContext(
-                        rank=rank,
-                        actual_tokens=actual_tokens,
-                        hidden_states=inputs.x_hc[rank, :, 0].detach().cpu().clone(),
-                        prev_hidden_states=pre_hc_hidden_buffer[rank].detach().cpu().clone(),
-                        input_ids=inputs.input_ids[rank].detach().cpu().clone(),
-                        position_ids=inputs.position_ids[rank].detach().cpu().clone(),
-                        block_table=inputs.ori_block_table[rank].detach().cpu().clone(),
-                        slot_mapping=inputs.ori_slot_mapping[rank].detach().cpu().clone(),
-                    )
-                )
+        self._prefill_completion(inputs, pre_hc_hidden_buffer)
 
         active_hidden = hidden_buffer[:, : max(inputs.actual_tokens), :]
         self._debug_tensor_stats("prefill.output.hidden.active", active_hidden, per_rank=True)
@@ -1955,25 +1984,98 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return PrefillResult(last_hidden=None, logits=logits)
 
     def run_decode(self, model, batch: DecodeBatch) -> DecodeResult:
-        """Run all DeepSeekV4 hidden layers for one decode batch in a single packed call."""
+        """Dispatch to the decode flow selected when the model was compiled."""
         if self._compiled.decode is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
         self._ensure_l3_shared_buffers(model)
-        mtp_active = self._mtp_buffers is not None and batch.allow_device_greedy_sampling
-        draft_token_ids = None
-        if mtp_active:
-            self._initialize_mtp_drafts(batch)
-            draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
-        speculative_step = draft_token_ids is not None
-        if speculative_step:
-            batch = self._main_speculative_batch(model, batch, draft_token_ids)
-        inputs = self._stage_decode_inputs(
-            self.prepare_decode_inputs(
-                model,
-                batch,
-                use_decode_pair=speculative_step,
-            )
+        return self._decode_flow(model, batch)
+
+    def _run_autoregressive_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        """Run the single-token autoregressive decode flow."""
+        output = self._execute_main_decode(
+            model,
+            self.prepare_decode_inputs(model, batch),
+            active_seq=1,
         )
+        decode_seq = self._compiled.layout.decode_seq
+        owner_rows = tuple(
+            (rank, local_row * decode_seq)
+            for rank, local_row in zip(output.inputs.ranks, output.inputs.local_rows, strict=True)
+        )
+        logits = self._logits_for_hidden(
+            output.hidden,
+            owner_rows=owner_rows,
+            label="decode",
+        ).float()
+        return DecodeResult(hidden_states=None, logits=logits)
+
+    def _run_mtp_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        """Verify request-local MTP drafts and advance the accepted windows."""
+        if not batch.allow_device_greedy_sampling:
+            raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+        self._initialize_mtp_drafts(batch)
+        draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
+        speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
+        output = self._execute_main_decode(
+            model,
+            self.prepare_mtp_decode_inputs(model, speculative_batch),
+            active_seq=self._compiled.layout.decode_seq,
+        )
+        inputs = output.inputs
+        decode_seq = self._compiled.layout.decode_seq
+        pair_owner_rows = tuple(
+            (rank, local_row * decode_seq + offset)
+            for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
+            for offset in range(decode_seq)
+        )
+        pair_logits = self._logits_for_hidden(
+            output.hidden,
+            owner_rows=pair_owner_rows,
+            label="decode.mtp_main",
+        ).float()
+        main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
+        accepted = accept_mtp_tokens(main_ids, draft_token_ids)
+        self._mtp_proposed_tokens += inputs.actual_batch
+        self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
+        for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
+            state = self._require_mtp_request_state(request_id)
+            state.proposed_tokens += 1
+            state.accepted_tokens += int(len(tokens) == decode_seq)
+        logger.info(
+            "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
+            self._mtp_accepted_tokens,
+            self._mtp_proposed_tokens,
+            100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "DeepSeekV4 MTP step: draft=%s main=%s",
+                draft_token_ids.detach().cpu().tolist(),
+                main_ids.detach().cpu().tolist(),
+            )
+        # Match the reference accepted_num flow: update the MTP window from
+        # committed main-model outputs immediately, even after rejection.
+        self._advance_mtp_drafts(
+            inputs,
+            main_ids,
+            output.pre_hc_hidden,
+            accepted_counts=tuple(len(tokens) for tokens in accepted),
+        )
+        return DecodeResult(
+            hidden_states=None,
+            logits=pair_logits[::decode_seq],
+            accepted_token_ids=accepted,
+        )
+
+    def _execute_main_decode(
+        self,
+        model: RuntimeModel,
+        prepared: DeepSeekV4PreparedDecodeInputs,
+        *,
+        active_seq: int,
+    ) -> _DeepSeekV4MainDecodeOutput:
+        """Run the mode-independent packed main-model decode kernel."""
+        inputs = self._stage_decode_inputs(prepared)
         self._seed_decode_work_cache_from_group_ids(
             inputs.request_ids,
             inputs.ranks,
@@ -1981,7 +2083,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         decode_buffers = self._require_decode_buffers()
         x_hc = decode_buffers.x_hc_a
-        active_seq = self._compiled.layout.decode_seq if speculative_step else 1
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
         self._debug_tensor_stats("decode.input.initial.active", x_hc[:, :active_decode_tokens, :, :])
 
@@ -2011,67 +2112,44 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
             raise RuntimeError("DeepSeekV4 packed decode produced non-finite active hidden rows")
 
-        decode_seq = self._compiled.layout.decode_seq
-        owner_offset = decode_seq - 1 if speculative_step else 0
-        owner_rows = tuple(
-            (rank, local_row * decode_seq + owner_offset)
-            for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
+        return _DeepSeekV4MainDecodeOutput(
+            inputs=inputs,
+            hidden=hidden_buffer,
+            pre_hc_hidden=pre_hc_hidden_buffer,
         )
-        logits = self._logits_for_hidden(
-            hidden_buffer,
-            owner_rows=owner_rows,
-            label="decode",
-        ).float()
-        if speculative_step:
-            pair_owner_rows = tuple(
-                (rank, local_row * decode_seq + offset)
-                for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
-                for offset in range(decode_seq)
-            )
-            pair_logits = self._logits_for_hidden(
-                hidden_buffer,
-                owner_rows=pair_owner_rows,
-                label="decode.mtp_main",
-            ).float()
-            main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
-            assert draft_token_ids is not None
-            accepted = accept_mtp_tokens(main_ids, draft_token_ids)
-            self._mtp_proposed_tokens += inputs.actual_batch
-            self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
-            for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
-                state = self._require_mtp_request_state(request_id)
-                state.proposed_tokens += 1
-                state.accepted_tokens += int(len(tokens) == decode_seq)
-            logger.info(
-                "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
-                self._mtp_accepted_tokens,
-                self._mtp_proposed_tokens,
-                100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
-            )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "DeepSeekV4 MTP step: draft=%s main=%s",
-                    draft_token_ids.detach().cpu().tolist(),
-                    main_ids.detach().cpu().tolist(),
+
+    @staticmethod
+    def _ignore_prefill_context(
+        inputs: DeepSeekV4PreparedPrefillInputs,
+        pre_hc_hidden: torch.Tensor,
+    ) -> None:
+        """Ignore main-prefill intermediates in autoregressive mode."""
+        return None
+
+    def _capture_mtp_prefill_context(
+        self,
+        inputs: DeepSeekV4PreparedPrefillInputs,
+        pre_hc_hidden: torch.Tensor,
+    ) -> None:
+        """Retain request-local main-prefill inputs needed to seed MTP."""
+        for request_id, rank, actual_tokens in zip(
+            inputs.request_ids,
+            inputs.ranks,
+            inputs.actual_tokens,
+            strict=True,
+        ):
+            self._mtp_request_states[request_id] = _DeepSeekV4MtpRequestState(
+                prefill_context=_DeepSeekV4MtpPrefillContext(
+                    rank=rank,
+                    actual_tokens=actual_tokens,
+                    hidden_states=inputs.x_hc[rank, :, 0].detach().cpu().clone(),
+                    prev_hidden_states=pre_hc_hidden[rank].detach().cpu().clone(),
+                    input_ids=inputs.input_ids[rank].detach().cpu().clone(),
+                    position_ids=inputs.position_ids[rank].detach().cpu().clone(),
+                    block_table=inputs.ori_block_table[rank].detach().cpu().clone(),
+                    slot_mapping=inputs.ori_slot_mapping[rank].detach().cpu().clone(),
                 )
-            # Match the reference accepted_num flow: update the MTP window from
-            # committed main-model outputs immediately, even after rejection.
-            # On rejection only row 0 is accepted; the helper prepends the last
-            # committed MTP row instead of consuming row 1, whose hidden state
-            # depends on the rejected draft. The next cache-first main decode
-            # overwrites the rejected position with the committed token.
-            self._advance_mtp_drafts(
-                inputs,
-                main_ids,
-                pre_hc_hidden_buffer,
-                accepted_counts=tuple(len(tokens) for tokens in accepted),
             )
-            return DecodeResult(
-                hidden_states=None,
-                logits=pair_logits[::decode_seq],
-                accepted_token_ids=accepted,
-            )
-        return DecodeResult(hidden_states=None, logits=logits)
 
     def _require_prefill_callable(self) -> DeepSeekV4L3Callable:
         if self._compiled.prefill is None:
@@ -4039,68 +4117,116 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         return positions
 
-    def _decode_positions(
+    def _decode_assignment(self, batch: DecodeBatch) -> _DeepSeekV4DecodeAssignment:
+        """Assign scheduler rows to the fixed rank-local decode tile."""
+        layout = self._compiled.layout
+        actual_batch = len(batch.request_ids)
+        if actual_batch <= 0:
+            raise ValueError("DeepSeekV4 decode batch must not be empty")
+        if len(batch.cache_partitions) != actual_batch:
+            raise ValueError("DeepSeekV4 decode requires one cache partition per request")
+        ranks = tuple(int(rank) for rank in batch.cache_partitions)
+        if min(ranks) < 0 or max(ranks) >= layout.ranks:
+            raise ValueError(f"DeepSeekV4 decode cache partitions must be in [0, {layout.ranks - 1}]")
+        indices_by_rank: list[list[int]] = [[] for _ in range(layout.ranks)]
+        local_rows = [0] * actual_batch
+        for request_index, rank in enumerate(ranks):
+            local_row = len(indices_by_rank[rank])
+            if local_row >= layout.decode_batch:
+                raise ValueError(
+                    f"DeepSeekV4 rank {rank} decode batch exceeds local capacity {layout.decode_batch}"
+                )
+            local_rows[request_index] = local_row
+            indices_by_rank[rank].append(request_index)
+        return _DeepSeekV4DecodeAssignment(
+            ranks=ranks,
+            local_rows=tuple(local_rows),
+            per_rank_counts=tuple(len(indices) for indices in indices_by_rank),
+            indices_by_rank=tuple(tuple(indices) for indices in indices_by_rank),
+        )
+
+    def _autoregressive_decode_positions(
         self,
         batch: DecodeBatch,
         actual_batch: int,
-        *,
-        use_decode_pair: bool,
     ) -> tuple[tuple[int, ...], ...]:
+        """Return the single current position for each autoregressive request."""
         decode_seq = self._compiled.layout.decode_seq
         positions = []
         for row in range(actual_batch):
             seq_len = int(batch.seq_lens[row].item())
-            active_seq = decode_seq if use_decode_pair else 1
-            if seq_len < active_seq:
-                raise ValueError(
-                    f"decode seq_lens must be >= active sequence width ({active_seq}), got {seq_len}"
-                )
-            if use_decode_pair:
-                # MTP feeds ``decode_seq`` real trailing tokens ending at the last real
-                # position ``seq_len-1``.
-                first_position = seq_len - decode_seq
-                positions.append(tuple(first_position + offset for offset in range(decode_seq)))
-            else:
-                # Normal autoregressive decode has one new main-model input. Keep
-                # the fixed S=2 metadata shape, but only slot zero is active.
-                positions.append((seq_len - 1,) * decode_seq)
+            if seq_len < 1:
+                raise ValueError("decode seq_lens must be positive")
+            positions.append((seq_len - 1,) * decode_seq)
         return tuple(positions)
 
-    def _decode_token_rows(
+    def _mtp_decode_positions(
+        self,
+        batch: DecodeBatch,
+        actual_batch: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return the two real trailing positions used for MTP verification."""
+        decode_seq = self._compiled.layout.decode_seq
+        positions = []
+        for row in range(actual_batch):
+            seq_len = int(batch.seq_lens[row].item())
+            if seq_len < decode_seq:
+                raise ValueError(
+                    f"decode seq_lens must be >= MTP sequence width ({decode_seq}), got {seq_len}"
+                )
+            first_position = seq_len - decode_seq
+            positions.append(tuple(first_position + offset for offset in range(decode_seq)))
+        return tuple(positions)
+
+    def _autoregressive_decode_token_rows(
         self,
         token_ids: torch.Tensor,
         actual_batch: int,
-        *,
-        vocab_size: int,
-        prev_token_ids: torch.Tensor | None = None,
-        use_decode_pair: bool = False,
     ) -> torch.Tensor:
+        """Expand one current token per request to the fixed sequence width."""
         layout = self._compiled.layout
+        token_ids = token_ids.detach().cpu().to(torch.long)
         if token_ids.ndim == 1:
             active = token_ids[:actual_batch].reshape(actual_batch, 1)
         else:
             active = token_ids[:actual_batch, :1]
-        prev_active = None
-        if prev_token_ids is not None:
-            prev_active = prev_token_ids[:actual_batch].reshape(actual_batch, 1)
+        return active.expand(actual_batch, layout.decode_seq).clone()
+
+    def _mtp_decode_token_rows(
+        self,
+        token_ids: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        actual_batch: int,
+    ) -> torch.Tensor:
+        """Build explicit [committed token, draft token] verification rows."""
+        layout = self._compiled.layout
+        if layout.decode_seq != 2:
+            raise ValueError("DeepSeekV4 MTP verification requires decode_seq=2")
+        current = token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
+        previous = prev_token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
+        return torch.stack((previous, current), dim=1)
+
+    def _pad_decode_token_rows(
+        self,
+        active: torch.Tensor,
+        actual_batch: int,
+        *,
+        vocab_size: int,
+    ) -> torch.Tensor:
+        """Pad explicit token rows to the fixed local decode batch."""
+        layout = self._compiled.layout
+        if active.ndim != 2 or active.shape[1] != layout.decode_seq:
+            raise ValueError("decode token rows must have shape [requests, decode_seq]")
+        if actual_batch <= 0 or active.shape[0] < actual_batch:
+            raise ValueError("decode token rows must cover every active request")
         if vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         rows = torch.empty(layout.decode_tokens, dtype=torch.long).reshape(
             layout.decode_batch,
             layout.decode_seq,
         )
-        if use_decode_pair and prev_active is not None:
-            rows.copy_(prev_active[0, 0].expand(layout.decode_batch, layout.decode_seq))
-            rows[:, layout.decode_seq - 1].copy_(active[0, 0])
-        else:
-            rows.copy_(active[0, 0].expand(layout.decode_batch, layout.decode_seq))
-        for row in range(actual_batch):
-            if use_decode_pair and prev_active is not None:
-                # Earlier slots use prev token; final slot uses last token.
-                rows[row].copy_(prev_active[row, 0].expand(layout.decode_seq))
-                rows[row, layout.decode_seq - 1].copy_(active[row, 0])
-            else:
-                rows[row].copy_(active[row, 0].expand(layout.decode_seq))
+        rows.copy_(active[0].expand(layout.decode_batch, layout.decode_seq))
+        rows[:actual_batch].copy_(active[:actual_batch])
         return rows.reshape(layout.decode_tokens)
 
     def _decode_kv_seq_lens(self, seq_lens: torch.Tensor, actual_batch: int) -> torch.Tensor:

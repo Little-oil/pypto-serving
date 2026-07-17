@@ -60,7 +60,7 @@ def _unused_local_port() -> int:
 def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
-    command = [
+    return [
         sys.executable,
         "-m",
         "pypto_serving.cli",
@@ -83,19 +83,17 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
         "--max-model-len",
         "260",
         "--max-num-seqs",
-        os.environ.get("PYPTO_DSV4_CONCURRENT_REQUESTS", "1"),
+        "1",
         "--max-num-batched-tokens",
         "512",
         "--long-prefill-token-threshold",
         "2048",
+        "--enable-mtp",
         "--no-enable-prefix-caching",
         "--port",
         str(port),
         "--show-startup-logs",
     ]
-    if os.environ.get("PYPTO_DSV4_ENABLE_MTP", "0") == "1":
-        command.append("--enable-mtp")
-    return command
 
 
 def _wait_for_health(process: subprocess.Popen, port: int, deadline: float) -> None:
@@ -182,51 +180,6 @@ def _request_completion(process: subprocess.Popen, port: int, deadline: float) -
     raise TimeoutError("DeepSeek completion exceeded the end-to-end timeout")
 
 
-def _request_concurrent_completions(
-    process: subprocess.Popen,
-    port: int,
-    deadline: float,
-    count: int,
-) -> list[dict]:
-    """Release concurrent HTTP requests together so the scheduler co-batches them."""
-    if count <= 0:
-        raise ValueError("completion request count must be positive")
-    if count == 1:
-        return [_request_completion(process, port, deadline)]
-    barrier = threading.Barrier(count)
-    results: queue.Queue[tuple[int, bool, object]] = queue.Queue(maxsize=count)
-
-    def request_one(index: int) -> None:
-        try:
-            barrier.wait(timeout=max(1.0, deadline - time.monotonic()))
-            results.put((index, True, _request_completion(process, port, deadline)))
-        except BaseException as exc:
-            results.put((index, False, exc))
-
-    threads = [
-        threading.Thread(target=request_one, args=(index,), daemon=True)
-        for index in range(count)
-    ]
-    for thread in threads:
-        thread.start()
-
-    responses: list[dict | None] = [None] * count
-    for _ in range(count):
-        timeout = max(1.0, deadline - time.monotonic())
-        try:
-            index, succeeded, value = results.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError("concurrent DeepSeek completions exceeded the timeout") from None
-        if not succeeded:
-            if isinstance(value, BaseException):
-                raise value
-            raise RuntimeError(f"concurrent completion failed: {value}")
-        if not isinstance(value, dict):
-            raise TypeError(f"completion response must be a JSON object, got {type(value).__name__}")
-        responses[index] = value
-    return [response for response in responses if response is not None]
-
-
 def _stop_process_group(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -293,7 +246,6 @@ def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> No
     port = _unused_local_port()
     log_path = tmp_path / "deepseek-v4-server.log"
     deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
-    concurrent_requests = int(os.environ.get("PYPTO_DSV4_CONCURRENT_REQUESTS", "1"))
 
     try:
         with log_path.open("w", encoding="utf-8") as server_log:
@@ -307,19 +259,14 @@ def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> No
             )
             try:
                 _wait_for_health(process, port, deadline)
-                responses = _request_concurrent_completions(
-                    process,
-                    port,
-                    deadline,
-                    concurrent_requests,
-                )
-                for response in responses:
-                    print(f"DeepSeek completion response: {response}", flush=True)
-                    assert response.get("model") == MODEL_ID
-                    choices = response.get("choices")
-                    assert isinstance(choices, list) and len(choices) == 1
-                    assert choices[0].get("text") == EXPECTED_TEXT
-                    assert choices[0].get("finish_reason") == "length"
+                response = _request_completion(process, port, deadline)
+                print(f"DeepSeek completion response: {response}", flush=True)
+
+                assert response.get("model") == MODEL_ID
+                choices = response.get("choices")
+                assert isinstance(choices, list) and len(choices) == 1
+                assert choices[0].get("text") == EXPECTED_TEXT
+                assert choices[0].get("finish_reason") == "length"
             finally:
                 _stop_process_group(process)
     except BaseException:

@@ -439,6 +439,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             device_id=self._device_ids[0],
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
+            enable_mtp=self._enable_mtp,
         )
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:

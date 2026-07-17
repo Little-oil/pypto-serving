@@ -19,18 +19,16 @@ import torch
 
 import pypto_serving.cli.main as cli
 from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
+from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
-from pypto_serving.model.deepseek import npu_executor, npu_runner, weight_loader
+from pypto_serving.model.deepseek import npu_executor, weight_loader
 from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CacheLayout,
-    DeepSeekV4CacheMetadataBuilder,
+    DeepSeekV4CacheManager,
     DeepSeekV4CompiledKernels,
-    DeepSeekV4InputBuilder,
     DeepSeekV4L3Callable,
-    DeepSeekV4LayerCache,
     DeepSeekV4ModelRunner,
     accept_mtp_tokens,
-    build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
 )
 from pypto_serving.model.deepseek.weight_loader import (
@@ -43,7 +41,6 @@ from pypto_serving.model.deepseek.weight_loader import (
     pack_deepseek_v4_layer_weights,
 )
 from pypto_serving.model.model_loader import ModelLoader
-from pypto_serving.serving.engine import async_engine
 
 
 def test_accept_mtp_tokens_commits_second_main_token_only_on_draft_match():
@@ -89,9 +86,6 @@ def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
         (),
         {
             "actual_batch": 1,
-            "request_ids": ("req-a",),
-            "ranks": (0,),
-            "local_rows": (0,),
             "position_ids": torch.tensor(
                 [[7, 8, 0, 0, 0, 0, 0, 0]] * runner._compiled.layout.ranks,
                 dtype=torch.int32,
@@ -103,144 +97,37 @@ def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
         runner._compiled.layout.ranks * runner._compiled.layout.decode_seq * 4,
         dtype=torch.float32,
     ).reshape(runner._compiled.layout.ranks, runner._compiled.layout.decode_seq, 4, 1)
-    tail_hidden = torch.full((4, 1), 99.0, dtype=torch.float32)
-    runner._mtp_request_states["req-a"] = npu_runner._DeepSeekV4MtpRequestState(
-        tail_token_id=9,
-        tail_pre_hc_hidden=tail_hidden,
-        tail_position=6,
+    tail_hidden = torch.full(
+        (runner._compiled.layout.ranks, 4, 1),
+        99.0,
+        dtype=torch.float32,
     )
+    runner._mtp_tail_token_id = torch.tensor([9], dtype=torch.long)
+    runner._mtp_tail_pre_hc_hidden = tail_hidden
+    runner._mtp_tail_position = torch.tensor([6], dtype=torch.int32)
 
     committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
         main_pre_hc,
-        request_index=0,
         accepted_count=1,
     )
 
     assert committed_ids.tolist() == [9, 11]
     assert committed_positions.tolist() == [6, 7]
-    torch.testing.assert_close(committed_hidden[0], tail_hidden)
-    torch.testing.assert_close(committed_hidden[1], main_pre_hc[0, 0])
+    torch.testing.assert_close(committed_hidden[:, 0], tail_hidden)
+    torch.testing.assert_close(committed_hidden[:, 1], main_pre_hc[:, 0])
 
     committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
         main_pre_hc,
-        request_index=0,
         accepted_count=2,
     )
 
     assert committed_ids.tolist() == [11, 12]
     assert committed_positions.tolist() == [7, 8]
-    torch.testing.assert_close(committed_hidden, main_pre_hc[0])
-
-
-def test_deepseek_mtp_decode_packs_request_local_state_and_scheduler_blocks():
-    layout = DeepSeekV4CacheLayout(ranks=2, decode_batch=2, decode_seq=2, decode_tokens=4)
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=layout,
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=(),
-            layer_plan=(),
-            kernel_dir="",
-            mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
-            embedding_weight=torch.arange(32, dtype=torch.float32).reshape(32, 1),
-        )
-    )
-    runner._mtp_request_states.update(
-        {
-            "req-a": npu_runner._DeepSeekV4MtpRequestState(
-                draft_token_id=10,
-                tail_token_id=9,
-                tail_pre_hc_hidden=torch.full((4, 1), 90.0),
-                tail_position=6,
-            ),
-            "req-b": npu_runner._DeepSeekV4MtpRequestState(
-                draft_token_id=20,
-                tail_token_id=19,
-                tail_pre_hc_hidden=torch.full((4, 1), 190.0),
-                tail_position=16,
-            ),
-        }
-    )
-    buffers = type(
-        "MtpBuffers",
-        (),
-        {
-            "decode_input_ids": torch.zeros((2, 4), dtype=torch.long),
-            "decode_hidden_in": torch.zeros((2, 4, 1), dtype=torch.bfloat16),
-            "decode_prev_hidden_in": torch.zeros((2, 4, 4, 1), dtype=torch.float32),
-            "decode_position_ids": torch.zeros((2, 4), dtype=torch.int32),
-            "decode_slot_mapping": torch.zeros((2, 4), dtype=torch.long),
-            "decode_swa_indices": torch.zeros((2, 4, 128), dtype=torch.int32),
-            "decode_swa_lens": torch.zeros((2, 4), dtype=torch.int32),
-            "decode_hidden_out": torch.zeros((2, 4, 1), dtype=torch.bfloat16),
-            "decode_pre_hc_out": torch.zeros((2, 4, 4, 1), dtype=torch.float32),
-        },
-    )()
-    runner._mtp_buffers = buffers
-    runner._mtp_decode_args = lambda: ()
-    scalar_args = []
-    runner._run_l3 = lambda *args: scalar_args.append(args[-1])
-
-    def fake_logits(hidden, *, owner_rows, label):
-        assert hidden is buffers.decode_hidden_out
-        assert owner_rows == ((0, 1), (1, 1))
-        assert label == "mtp.decode"
-        logits = torch.zeros((2, 32), dtype=torch.float32)
-        logits[0, 30] = 1
-        logits[1, 31] = 1
-        return logits
-
-    runner._logits_for_hidden = fake_logits
-    inputs = type(
-        "PreparedInputs",
-        (),
-        {
-            "actual_batch": 2,
-            "request_ids": ("req-a", "req-b"),
-            "ranks": (0, 1),
-            "local_rows": (0, 0),
-            "per_rank_counts": (1, 1),
-            "position_ids": torch.tensor([[7, 8, 0, 0], [17, 18, 0, 0]], dtype=torch.int32),
-            "block_ids_by_group": ({"ori": (3,)}, {"ori": (5,)}),
-        },
-    )()
-    main_ids = torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
-    main_pre_hc = torch.arange(2 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4, 1)
-
-    runner._advance_mtp_drafts(
-        inputs,
-        main_ids,
-        main_pre_hc,
-        accepted_counts=(2, 1),
-    )
-
-    assert scalar_args == [2]
-    assert buffers.decode_input_ids[0, :2].tolist() == [11, 12]
-    assert buffers.decode_input_ids[1, :2].tolist() == [19, 21]
-    assert buffers.decode_slot_mapping[0, :2].tolist() == [3 * 128 + 7, 3 * 128 + 8]
-    assert buffers.decode_slot_mapping[1, :2].tolist() == [5 * 128 + 16, 5 * 128 + 17]
-    assert runner._mtp_drafts_for_requests(("req-b", "req-a")).tolist() == [31, 30]
-    assert runner._mtp_request_states["req-a"].tail_token_id == 12
-    assert runner._mtp_request_states["req-a"].tail_position == 8
-    assert runner._mtp_request_states["req-b"].tail_token_id == 21
-    assert runner._mtp_request_states["req-b"].tail_position == 17
-
-
-def _group_block_ids(block_id: int) -> dict[str, list[int]]:
-    return {
-        "ori": [block_id],
-        "cmp": [block_id],
-        "idx": [block_id],
-        "hca_state": list(range(block_id * 16, (block_id + 1) * 16)),
-        "csa_state": list(range(block_id * 16, (block_id + 1) * 16)),
-        "csa_inner_state": list(range(block_id * 16, (block_id + 1) * 16)),
-    }
+    torch.testing.assert_close(committed_hidden, main_pre_hc)
 
 
 def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
@@ -249,8 +136,8 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
         [
             "--model", str(model_dir),
             "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "8",
-            "--ep", "8",
+            "--dp", "1",
+            "--tp", "8",
             "--block-size", "128",
             "--max-model-len", "260",
             "--dtype", "int8",
@@ -262,42 +149,23 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
 
     assert config.executor_cls == "PyptoDeepSeekV4Executor"
     assert config.device_ids == (0, 1, 2, 3, 4, 5, 6, 7)
-    assert config.parallel_config.placement_mode == "overlapped"
-    assert config.parallel_config.num_replicas == 1
-    assert config.parallel_config.data_parallel_size == 8
-    assert config.parallel_config.tensor_parallel_size == 1
-    assert config.parallel_config.expert_parallel_size == 8
     assert config.parallel_config.replica_device_groups == ((0, 1, 2, 3, 4, 5, 6, 7),)
     assert config.runtime_config.page_size == 128
     assert config.runtime_config.weight_dtype == "int8"
-    assert config.runtime_config.num_speculative_tokens == 1
-    assert tuple(group.name for group in config.runtime_config.kv_cache_groups) == (
-        "ori",
-        "cmp",
-        "idx",
-        "hca_state",
-        "csa_state",
-        "csa_inner_state",
-    )
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["enable_mtp"] is True
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        AttributeError("'PreTrainedConfig' object has no attribute 'max_position_embeddings'"),
-        TypeError("Field 'swiglu_limit' expected float, got int (value: 10)"),
-    ],
-)
-def test_tokenizer_falls_back_when_deepseek_config_validation_fails(tmp_path, monkeypatch, failure):
+def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
+    class StrictDataclassFieldValidationError(Exception):
+        pass
+
     class AutoTokenizer:
         @staticmethod
         def from_pretrained(*args, **kwargs):
-            raise failure
+            raise StrictDataclassFieldValidationError("attention_dropout expected float")
 
     sentinel = object()
-    (tmp_path / "tokenizer.json").write_text("{}")
     fake_transformers = type(
         "FakeTransformers",
         (),
@@ -311,129 +179,11 @@ def test_tokenizer_falls_back_when_deepseek_config_validation_fails(tmp_path, mo
     assert adapter.tokenizer is sentinel
 
 
-def test_load_tokenizer_prefers_tokenizer_json_without_parsing_model_config(tmp_path, monkeypatch):
-    sentinel = object()
-    (tmp_path / "tokenizer.json").write_text("{}")
-    monkeypatch.setattr(
-        tokenizer_module.TransformersTokenizerAdapter,
-        "from_tokenizer_file",
-        lambda model_dir: sentinel,
-    )
-    monkeypatch.setattr(
-        tokenizer_module.TransformersTokenizerAdapter,
-        "from_pretrained",
-        lambda *args, **kwargs: pytest.fail("AutoTokenizer must not parse config.json"),
-    )
-
-    assert tokenizer_module.load_tokenizer(tmp_path) is sentinel
-
-
-def test_cli_rejects_deepseek_non_w8a8_checkpoint(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path, quant_method="fp8")
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "8",
-            "--ep", "8",
-            "--block-size", "128",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="compressed-tensors"):
-        cli.build_serving_engine_config(args)
-
-
-def test_cli_rejects_deepseek_non_8_way_topology(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3",
-            "--dp", "4",
-            "--ep", "4",
-            "--block-size", "128",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="--dp 8 --ep 8"):
-        cli.build_serving_engine_config(args)
-
-
-def test_cli_rejects_deepseek_legacy_dp1_tp8_topology(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "1",
-            "--tp", "8",
-            "--block-size", "128",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="--dp 8 --ep 8"):
-        cli.build_serving_engine_config(args)
-
-
-def test_cli_rejects_deepseek_context_beyond_decode_state_table_capacity(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "8",
-            "--ep", "8",
-            "--block-size", "128",
-            "--max-model-len", "16385",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="--max-model-len 16384"):
-        cli.build_serving_engine_config(args)
-
-
-def test_deepseek_worker_step_timeout_default_allows_lazy_first_step(monkeypatch):
-    monkeypatch.delenv("SERVING_WORKER_STEP_TIMEOUT", raising=False)
-
-    assert async_engine._worker_step_timeout_seconds("PyptoDeepSeekV4Executor") == 1200.0
-    assert async_engine._worker_step_timeout_seconds("PyptoQwen14BExecutor") == 300.0
-
-    monkeypatch.setenv("SERVING_WORKER_STEP_TIMEOUT", "42")
-    assert async_engine._worker_step_timeout_seconds("PyptoDeepSeekV4Executor") == 42.0
-
-
-def test_deepseek_loader_keeps_w8a8_weights_lazy(tmp_path, monkeypatch):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    monkeypatch.setattr(
-        tokenizer_module.TransformersTokenizerAdapter,
-        "from_pretrained",
-        lambda *args, **kwargs: _Tokenizer(),
-    )
-
-    loaded = ModelLoader().load(
-        model_id="dsv4",
-        model_dir=str(model_dir),
-        runtime_config=RuntimeConfig(page_size=128, max_batch_size=4, max_seq_len=256, weight_dtype="int8"),
-    )
-
-    assert loaded.config.architecture == "DeepseekV4ForCausalLM"
-    assert loaded.config.head_dim == 512
-    assert loaded.runtime_model.layers == []
-    assert loaded.runtime_model.embed_tokens.numel() == 0
-    assert loaded.runtime_model.extra["family"] == "deepseek_v4"
-    assert loaded.runtime_model.extra["checkpoint_format"] == "w8a8-compressed-tensors"
-    assert "layers.0.attn.wq_b.scale" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.2.attn.indexer.wq_b.scale" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.3.attn.compressor.wkv.weight" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.3.ffn.gate.bias" in loaded.runtime_model.extra["weight_map"]
-
-
 def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_path, monkeypatch):
     model_dir = _write_deepseek_model_dir(tmp_path)
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     monkeypatch.setattr(
-        tokenizer_module.TransformersTokenizerAdapter,
+        model_loader.TransformersTokenizerAdapter,
         "from_pretrained",
         lambda *args, **kwargs: _Tokenizer(),
     )
@@ -469,7 +219,7 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     model_dir = _write_deepseek_model_dir(tmp_path)
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     monkeypatch.setattr(
-        tokenizer_module.TransformersTokenizerAdapter,
+        model_loader.TransformersTokenizerAdapter,
         "from_pretrained",
         lambda *args, **kwargs: _Tokenizer(),
     )
@@ -544,11 +294,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
         compile_kernels=True,
     )
 
-    compiled = executor._compile_model(loaded.runtime_model)
+    executor._compile_model(loaded.runtime_model)
 
     assert compiled_names == ["deepseek_v4_prefill", "deepseek_v4_decode"]
-    assert compiled.layout.decode_batch == 8
-    assert compiled.layout.decode_seq == 1
     # The packed l3_prefill_fwd emits final-normalized x_out and carries a trailing
     # num_tokens scalar. LM-head is computed on the host side.
     assert len(compiled_args["deepseek_v4_prefill"]) == len(npu_executor._PREFILL_FWD_TENSOR_ORDER) + 1
@@ -598,8 +346,8 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert prefill_args[prefill_order.index("pre_hc_hidden_out")].shape == (8, 128, 4, 4096)
     assert prefill_args[prefill_order.index("x_out")].shape == (8, 128, 4096)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
-    # Compress-state work caches are stacked across the CSA (x21) and HCA (x20)
-    # layer groups. Physical cache capacity is independent of decode B/S.
+    # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
+    # groups, each layer holding decode_batch (4) x state_max_blocks rows.
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hca_compress_state")].shape == (8, 20 * 64, 8, 1024)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_compress_state")].shape == (8, 21 * 65, 4, 2048)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_inner_compress_state")].shape == (
@@ -624,7 +372,7 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
-    assert decode_args[decode_order.index("block_table")].shape == (8, 8, 128)
+    assert decode_args[decode_order.index("block_table")].shape == (8, 4, 128)
     assert decode_args[decode_order.index("idx_kv_cache")].dtype == torch.int8
     assert decode_args[decode_order.index("idx_kv_scale")].shape == (8, 21 * 64, 128, 1, 1)
     # SWA/HCA/CSA metadata all use the cache-first full window, plus the paged
@@ -665,106 +413,6 @@ def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
         ),
     ):
         executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
-def test_deepseek_hc_input_builder_shapes_prefill_and_decode():
-    # Exercise a wide, batch-agnostic input layout independent of production B=4/S=2.
-    builder = DeepSeekV4InputBuilder(
-        layout=DeepSeekV4CacheLayout(decode_batch=32, decode_seq=2, decode_tokens=64), hidden_size=4
-    )
-
-    prefill = builder.prefill_x_hc(
-        [torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)],
-        ranks=[0],
-        token_rows=128,
-    )
-    decode = builder.decode_x_hc(
-        torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-        ranks=[0, 7],
-        local_rows=[0, 1],
-    )
-
-    assert prefill.shape == (8, 128, 4, 4)
-    assert prefill.dtype == torch.float32
-    assert prefill[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert prefill[7, 2, 3].tolist() == [8, 9, 10, 11]
-    assert prefill[0, 3, 0].tolist() == [0, 1, 2, 3]
-    assert decode.shape == (8, 64, 4, 4)
-    assert decode.dtype == torch.float32
-    assert decode[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert decode[0, 1, 3].tolist() == [0, 1, 2, 3]
-    assert decode[7, 2, 0].tolist() == [4, 5, 6, 7]
-    assert decode[7, 3, 3].tolist() == [4, 5, 6, 7]
-    assert decode[0, 4, 0].tolist() == [0, 1, 2, 3]
-    assert decode[7, 5, 3].tolist() == [0, 1, 2, 3]
-    assert torch.equal(decode[:, 4:], decode[:, 0:2].repeat(1, 30, 1, 1))
-
-
-def test_deepseek_layout_rejects_context_beyond_decode_state_capacity():
-    model = _runtime_model_for_embeddings()
-
-    with pytest.raises(ValueError, match="max_seq_len=16384"):
-        DeepSeekV4CacheLayout().validate_runtime(
-            model.config,
-            RuntimeConfig(page_size=128, max_batch_size=1, max_seq_len=16385, weight_dtype="int8"),
-            tuple(range(8)),
-        )
-
-
-def test_deepseek_layer_plan_tracks_attention_and_gate_modes():
-    plan = build_deepseek_v4_layer_plan(
-        compress_ratios=[0, 0, 4, 128, 4],
-        num_hidden_layers=5,
-        num_hash_layers=3,
-    )
-
-    assert [layer.attention_kind for layer in plan] == ["swa", "swa", "csa", "hca", "csa"]
-    assert [layer.include_tid2eid for layer in plan] == [True, True, True, False, False]
-    assert [layer.include_gate_bias for layer in plan] == [False, False, False, True, True]
-
-
-def test_deepseek_weight_store_groups_requested_reads_by_shard(tmp_path):
-    weight_map = {
-        "a": "one.safetensors",
-        "b": "one.safetensors",
-        "c": "two.safetensors",
-    }
-    for filename in set(weight_map.values()):
-        (tmp_path / filename).touch()
-    opened: list[tuple[str, str]] = []
-    reads: list[tuple[str, str]] = []
-    tensors = {
-        "a": torch.tensor([1]),
-        "c": torch.tensor([3]),
-    }
-
-    class _Reader:
-        def __init__(self, filename: str) -> None:
-            self.filename = filename
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def get_tensor(self, name: str) -> torch.Tensor:
-            reads.append((self.filename, name))
-            return tensors[name]
-
-    def _open(path: Path, device: str):
-        opened.append((path.name, device))
-        return _Reader(path.name)
-
-    store = DeepSeekV4WeightStore(model_dir=tmp_path, weight_map=weight_map, safe_open_fn=_open)
-
-    loaded = store.load_many(["c", "a"])
-
-    assert list(loaded) == ["c", "a"]
-    assert loaded["c"].item() == 3
-    assert loaded["a"].item() == 1
-    assert opened == [("two.safetensors", "cpu"), ("one.safetensors", "cpu")]
-    assert reads == [("two.safetensors", "c"), ("one.safetensors", "a")]
 
 
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
@@ -1096,122 +744,32 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     assert not runner._mtp_buffers.weights
 
 
-def test_deepseek_cache_metadata_maps_scheduler_block_ids():
-    metadata = DeepSeekV4CacheMetadataBuilder(layout=DeepSeekV4CacheLayout())
+def test_deepseek_cache_slots_tables_and_mappings():
+    manager = DeepSeekV4CacheManager(layout=DeepSeekV4CacheLayout())
 
-    table = metadata.block_table_from_ids([[64, 65]], max_blocks=4)
-    assert table.tolist() == [[64, 65, 0, 0]]
+    assert manager.allocate("req-a") == 0
+    assert manager.allocate("req-b") == 1
+    assert manager.allocate("req-a") == 0
 
-    cmp_mapping = metadata.slot_mapping_from_ids(
-        [[64]],
-        [[0, 4, 256]],
-        block_size=128,
-        compress_ratio=4,
-    )
-    base = 1 * 64 * 128
-    assert cmp_mapping.tolist() == [[base, base + 1, base + 64]]
+    table = manager.block_table([1], max_blocks=64)
+    assert table.shape == (1, 64)
+    assert table[0, 0].item() == 1
+    assert table[0, 63].item() == 61
 
-    hca_state_mapping = metadata.slot_mapping_from_ids(
-        [[64]],
+    cmp_mapping = manager.slot_mapping([1], [[0, 4, 256]], max_blocks=64, compress_ratio=4)
+    assert cmp_mapping.tolist() == [[128, 129, 192]]
+
+    hca_state_mapping = manager.slot_mapping(
+        [1],
         [[0, 128, 256]],
+        max_blocks=64,
         block_size=8,
         compress_ratio=128,
     )
-    assert hca_state_mapping.tolist() == [[64 * 8, 64 * 8 + 1, 64 * 8 + 2]]
+    assert hca_state_mapping.tolist() == [[8, 9, 10]]
 
-
-def test_deepseek_group_specs_match_fixed_decode_cache_pools():
-    specs = build_deepseek_v4_cache_group_specs(43, _deepseek_flash_compress_ratios())
-    by_name = {spec.name: spec for spec in specs}
-    layout = DeepSeekV4CacheLayout()
-
-    assert by_name["ori"].num_blocks == layout.decode_ori_max_blocks - 8
-    assert by_name["ori"].max_blocks_per_seq == layout.decode_ori_max_blocks // layout.decode_batch
-    assert by_name["cmp"].num_blocks == layout.cmp_max_blocks - 8
-    assert by_name["idx"].num_blocks == layout.idx_max_blocks - 8
-    assert by_name["ori"].num_partitions == layout.ranks
-    assert by_name["hca_state"].max_blocks_per_seq == (
-        layout.hca_state_max_blocks // layout.decode_batch
-    )
-    assert by_name["csa_state"].max_blocks_per_seq == (
-        layout.csa_state_max_blocks // layout.decode_batch
-    )
-    assert by_name["hca_state"].num_blocks == layout.hca_state_max_blocks - 8
-    assert by_name["csa_state"].num_blocks == layout.csa_state_max_blocks - 8
-    assert by_name["cmp"].spec.token_capacity == 128 * 4
-    assert len(by_name["idx"].layer_indices) == 21
-    assert len(by_name["hca_state"].layer_indices) == 20
-
-    mtp = {
-        spec.name: spec
-        for spec in build_deepseek_v4_cache_group_specs(
-            43,
-            _deepseek_flash_compress_ratios(),
-            decode_batch=4,
-        )
-    }
-    assert mtp["ori"].num_blocks == layout.decode_ori_max_blocks - 4
-    assert mtp["csa_state"].num_blocks == layout.csa_state_max_blocks - 4
-
-
-def test_deepseek_decode_uses_scheduler_group_block_ids():
-    runner, model = _runner_for_prepared_inputs()
-    grouped_ids = {
-        "ori": [3],
-        "cmp": [10],
-        "idx": [20],
-        "hca_state": list(range(16, 32)),
-        "csa_state": list(range(32, 48)),
-        "csa_inner_state": list(range(32, 48)),
-    }
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[5]], dtype=torch.long),
-            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=[grouped_ids],
-            cache_partitions=[0],
-        ),
-    )
-
-    assert prepared.block_ids_by_group[0]["ori"] == (3,)
-    assert prepared.block_table[0, 0, 0].item() == 3
-    assert prepared.cmp_block_table[0, 0, 0].item() == 10
-    assert prepared.idx_block_table[0, 0, 0].item() == 20
-    # Non-MTP decode activates only slot zero at the current position. Slot one
-    # retains fixed-shape filler metadata; fixed-B cache writes use reserved pages.
-    assert prepared.ori_slot_mapping[0, :2].tolist() == [3 * 128 + 127] * 2
-    assert prepared.csa_cmp_slot_mapping[0, :2].tolist() == [10 * 128 + 31] * 2
-    assert prepared.csa_state_slot_mapping[0, :2].tolist() == [47 * 4 + 3] * 2
-    assert prepared.csa_compress_state_block_table.shape == (8, 4, 4096)
-    assert prepared.csa_compress_state_block_table[0, 0, :18].tolist() == [
-        *range(32, 48),
-        32,
-        33,
-    ]
-
-
-def test_deepseek_grouped_ori_metadata_uses_scheduler_ring_blocks():
-    metadata = DeepSeekV4CacheMetadataBuilder(
-        layout=DeepSeekV4CacheLayout(ranks=1, decode_batch=4, decode_seq=1, decode_tokens=4)
-    )
-    block_ids = ((5, 2),)
-    positions = ((127, 128, 256),)
-
-    table = metadata.paged_ori_block_table_from_ids(block_ids)
-    slot_mapping = metadata.paged_decode_slot_mapping_from_ids(block_ids, positions)
-    indices, lens = metadata.swa_window_indices_and_lens_from_ids(block_ids, positions)
-
-    assert table.shape == (1, 128)
-    assert table[0, :5].tolist() == [5, 2, 5, 2, 5]
-    assert slot_mapping.tolist() == [[5 * 128 + 127, 2 * 128, 5 * 128]]
-    assert lens.tolist() == [128, 128, 128]
-    assert indices[1, 0].item() == 5 * 128 + 1
-    assert indices[1, 126].item() == 5 * 128 + 127
-    assert indices[1, 127].item() == 2 * 128
+    manager.release(["req-a"])
+    assert manager.allocate("req-c") == 0
 
 
 def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
@@ -1227,25 +785,23 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
             input_embeddings=embeddings,
             seq_lens=torch.tensor([129], dtype=torch.int32),
             positions=torch.tensor([[126, 127, 128]], dtype=torch.long),
-            block_ids_by_group=[_group_block_ids(0)],
-            cache_partitions=[0],
         ),
     )
 
-    assert prepared.request_ids == ("req-a",)
-    assert prepared.ranks == (0,)
-    assert prepared.actual_tokens == (3,)
+    assert prepared.request_id == "req-a"
+    assert prepared.slot == 0
+    assert prepared.actual_tokens == 3
     assert prepared.x_hc.shape == (8, 128, 4, 4)
     assert prepared.x_hc.dtype == torch.float32
     assert prepared.ori_block_table.shape == (8, 128)
-    assert prepared.ori_block_table[0, :4].tolist() == [0, 0, 0, 0]
+    assert prepared.ori_block_table[0, :4].tolist() == [0, 32, 64, 96]
     assert prepared.cmp_block_table.shape == (8, 32)
     assert prepared.idx_block_table.shape == (8, 64)
     assert prepared.position_ids.shape == (8, 128)
     assert prepared.position_ids[0, :4].tolist() == [126, 127, 128, 129]
     assert prepared.input_ids[0, :4].tolist() == [10, 11, 12, 10]
     assert prepared.ori_slot_mapping.shape == (8, 128)
-    assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 0, -1]
+    assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 4096, 8065]
     assert prepared.hca_cmp_slot_mapping.shape == (8, 128)
     assert prepared.hca_cmp_slot_mapping[0, :3].tolist() == [-1, 0, -1]
     assert prepared.hca_cmp_slot_mapping[0, 3].item() == -1
@@ -1256,27 +812,25 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.csa_idx_slot_mapping[0, :3].tolist() == [-1, 31, -1]
     assert prepared.csa_idx_slot_mapping[0, 3].item() == -1
     assert prepared.hca_state_slot_mapping.shape == (8, 128)
-    assert prepared.hca_compress_state_block_table[0, 14:18].tolist() == [14, 15, 0, 1]
     assert prepared.hca_state_slot_mapping[0, :4].tolist() == [
-        126,
-        127,
+        262,
+        263,
         0,
-        -1,
+        249,
     ]
     assert prepared.csa_state_slot_mapping.shape == (8, 128)
-    assert prepared.csa_compress_state_block_table[0, 14:18].tolist() == [14, 15, 0, 1]
     assert prepared.csa_state_slot_mapping[0, :4].tolist() == [
-        62,
-        63,
-        0,
-        -1,
+        70,
+        71,
+        196,
+        61,
     ]
     assert prepared.csa_inner_state_slot_mapping.shape == (8, 128)
     assert prepared.csa_inner_state_slot_mapping[0, :4].tolist() == [
-        62,
-        63,
-        0,
-        -1,
+        70,
+        71,
+        196,
+        61,
     ]
 
 
@@ -1295,119 +849,6 @@ def test_deepseek_prepare_decode_inputs_requires_hidden_states():
         )
 
 
-def test_deepseek_prefill_uses_scheduler_owned_rank_local_metadata():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_prefill_inputs(
-        model,
-        PrefillBatch(
-            request_ids=["req-b"],
-            token_ids=torch.tensor([[10, 11, 12]], dtype=torch.long),
-            input_embeddings=torch.arange(12, dtype=torch.bfloat16).reshape(1, 3, 4),
-            seq_lens=torch.tensor([3], dtype=torch.int32),
-            positions=torch.tensor([[0, 1, 2]], dtype=torch.long),
-            block_ids_by_group=[_group_block_ids(2)],
-            cache_partitions=[0],
-        ),
-    )
-
-    assert prepared.ori_block_table[0, 0].item() == 2
-    assert prepared.cmp_block_table[0, 0].item() == 2
-    assert prepared.idx_block_table[0, 0].item() == 2
-    assert prepared.ori_slot_mapping[0, :3].tolist() == [256, 257, 258]
-
-
-def test_deepseek_prefill_packs_distinct_requests_on_distinct_ranks():
-    runner, model = _runner_for_prepared_inputs()
-    embeddings = torch.zeros((2, 3, 4), dtype=torch.bfloat16)
-    embeddings[0, :3] = 1
-    embeddings[1, :2] = 2
-
-    prepared = runner.prepare_prefill_inputs(
-        model,
-        PrefillBatch(
-            request_ids=["rank-0", "rank-3"],
-            token_ids=torch.tensor([[10, 11, 12], [20, 21, 0]], dtype=torch.long),
-            input_embeddings=embeddings,
-            seq_lens=torch.tensor([3, 2], dtype=torch.int32),
-            positions=torch.tensor([[0, 1, 2], [0, 1, -1]], dtype=torch.long),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(1)],
-            cache_partitions=[0, 3],
-        ),
-    )
-
-    assert prepared.ranks == (0, 3)
-    assert prepared.actual_tokens == (3, 2)
-    assert prepared.input_ids[0, :3].tolist() == [10, 11, 12]
-    assert prepared.input_ids[3, :3].tolist() == [20, 21, 20]
-    assert prepared.x_hc[0, 0, 0].tolist() == [1, 1, 1, 1]
-    assert prepared.x_hc[3, 0, 0].tolist() == [2, 2, 2, 2]
-    assert prepared.x_hc[1, 0, 0].tolist() == [1, 1, 1, 1]
-    assert torch.all(prepared.ori_slot_mapping[1] == -1)
-
-
-def test_deepseek_decode_rejects_legacy_ungrouped_cache_metadata():
-    runner, model = _runner_for_prepared_inputs()
-
-    with pytest.raises(ValueError, match="requires grouped KV block IDs"):
-        runner.prepare_decode_inputs(
-            model,
-            DecodeBatch(
-                request_ids=["req-a"],
-                token_ids=torch.tensor([[5]], dtype=torch.long),
-                hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
-                seq_lens=torch.tensor([128], dtype=torch.int32),
-                cache_partitions=[0],
-            ),
-        )
-
-
-def test_deepseek_prepare_decode_inputs_uses_scratch_blocks_for_fixed_rows():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a", "req-b"],
-            token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-            hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-            seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(1)],
-            cache_partitions=[0, 0],
-        ),
-        use_decode_pair=True,
-    )
-
-    assert prepared.actual_batch == 2
-    assert prepared.local_rows == (0, 1)
-    assert prepared.per_rank_counts[0] == 2
-    assert prepared.x_hc.shape == (8, 8, 4, 4)
-    assert prepared.x_hc[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.x_hc[0, 1, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.x_hc[0, 2, 0].tolist() == [4, 5, 6, 7]
-    assert prepared.x_hc[0, 3, 0].tolist() == [4, 5, 6, 7]
-    assert prepared.x_hc[0, 4, 0].tolist() == [0, 1, 2, 3]
-    # No prev_token_ids supplied: inactive fixed rows mirror row 0's activation,
-    # but their cache metadata uses isolated reserved pages.
-    assert prepared.input_ids[0, :6].tolist() == [5, 5, 9, 9, 5, 5]
-    # Positions are the two real trailing slots (seq_len-2, seq_len-1).
-    assert prepared.position_ids[0, :6].tolist() == [126, 127, 3, 4, 126, 127]
-    # kv_seq_lens = seq_len: last written position is seq_len-1 and seq_len already
-    # counts the prefill-generated last token, so the KV history is seq_len entries.
-    assert prepared.kv_seq_lens[0, :4].tolist() == [128, 5, 128, 128]
-    assert prepared.block_table.shape == (8, 4, 128)
-    assert prepared.cmp_block_table.shape == (8, 4, 32)
-    assert prepared.ori_slot_mapping[0, :6].tolist() == [126, 127, 131, 132, 15998, 15999]
-    assert prepared.hca_cmp_slot_mapping[0, :6].tolist() == [-1, 0, -1, -1, -1, 3584]
-    assert prepared.csa_cmp_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 3615]
-    assert prepared.csa_idx_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 7711]
-    assert prepared.csa_state_slot_mapping[0, :6].tolist() == [62, 63, 67, 68, 246, 247]
-    assert prepared.block_table[0, 2, 0].item() == 124
-    assert prepared.cmp_block_table[0, 2, 0].item() == 28
-    assert prepared.csa_compress_state_block_table[0, 2, 0].item() == 61
-    assert prepared.block_table[1, :, 0].tolist() == [124, 125, 126, 127]
-
-
 def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
     runner, model = _runner_for_prepared_inputs()
 
@@ -1418,20 +859,17 @@ def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
             token_ids=torch.tensor([[5], [9]], dtype=torch.long),
             hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
             seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(1)],
-            cache_partitions=[0, 0],
         ),
-        use_decode_pair=True,
     )
 
-    # decode_batch=4, decode_seq=2 -> tokens 0,1 are row0 (slot 0, positions
+    # decode_batch=32, decode_seq=2 -> tokens 0,1 are row0 (slot 0, positions
     # 126,127); tokens 2,3 are row1 (slot 1, positions 3,4).
-    # Each active request owns one scheduler-selected ori ring block.
-    assert prepared.block_table.shape == (8, 4, 128)
-    assert prepared.block_table[0, 0, :4].tolist() == [0, 0, 0, 0]
-    assert prepared.block_table[0, 1, :4].tolist() == [1, 1, 1, 1]
+    # The fixed physical pool is interleaved by logical page and stable request slot.
+    assert prepared.block_table.shape == (8, 32, 128)
+    assert prepared.block_table[0, 0, :4].tolist() == [0, 32, 64, 96]
+    assert prepared.block_table[0, 1, :4].tolist() == [1, 33, 65, 97]
     # SWA full window (incl. current). token 1 = slot 0 pos 127 -> physical rows
-    # 0..127 in the ring; token 3 = request block 1 pos 4 -> rows 128..132.
+    # 0..127 in the pool; token 3 = slot 1 pos 4 -> rows 128..132.
     assert prepared.swa_lens[0, 0].item() == 127
     assert prepared.swa_lens[0, 1].item() == 128
     assert prepared.swa_lens[0, 3].item() == 5
@@ -1458,12 +896,9 @@ def test_deepseek_prepare_decode_inputs_feeds_two_real_tokens():
             token_ids=torch.tensor([[5], [9]], dtype=torch.long),
             hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
             seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(1)],
-            cache_partitions=[0, 0],
             prev_token_ids=torch.tensor([3, 7], dtype=torch.long),
             prev_hidden_states=torch.arange(8, 16, dtype=torch.bfloat16).reshape(2, 4),
         ),
-        use_decode_pair=True,
     )
 
     # Active rows get [prev_token, last_token]; positions are (seq_len-2, seq_len-1).
@@ -1479,105 +914,6 @@ def test_deepseek_prepare_decode_inputs_feeds_two_real_tokens():
     assert prepared.x_hc[0, 4, 0].tolist() == [0, 1, 2, 3]
 
 
-def test_deepseek_prepare_decode_inputs_uses_only_current_token_without_mtp():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[5]], dtype=torch.long),
-            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0)],
-            cache_partitions=[0],
-            prev_token_ids=torch.tensor([3], dtype=torch.long),
-            prev_hidden_states=torch.arange(4, 8, dtype=torch.bfloat16).reshape(1, 4),
-        ),
-    )
-
-    # Position 126 already exists in the resident prefill cache. Normal decode
-    # must process only token 5 at position 127; the previous token is an MTP-only input.
-    assert prepared.input_ids[0, :2].tolist() == [5, 5]
-    assert prepared.position_ids[0, :2].tolist() == [127, 127]
-    assert prepared.x_hc[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.ori_slot_mapping[0, :2].tolist() == [127, 127]
-
-
-def test_deepseek_non_mtp_decode_rejects_two_requests_on_one_dp_rank():
-    runner, model = _runner_for_prepared_inputs()
-
-    with pytest.raises(ValueError, match="at most one request per DP rank"):
-        runner.prepare_decode_inputs(
-            model,
-            DecodeBatch(
-                request_ids=["req-a", "req-b"],
-                token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-                hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-                seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-                block_ids_by_group=[_group_block_ids(0), _group_block_ids(1)],
-                cache_partitions=[0, 0],
-            ),
-        )
-
-
-def test_deepseek_decode_packs_rank_local_micro_batches():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["r0-a", "r1-a", "r0-b"],
-            token_ids=torch.tensor([[5], [7], [9]], dtype=torch.long),
-            hidden_states=torch.tensor(
-                [[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]],
-                dtype=torch.bfloat16,
-            ),
-            seq_lens=torch.tensor([128, 64, 32], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(0), _group_block_ids(1)],
-            cache_partitions=[0, 1, 0],
-        ),
-        use_decode_pair=True,
-    )
-
-    assert prepared.ranks == (0, 1, 0)
-    assert prepared.local_rows == (0, 0, 1)
-    assert prepared.per_rank_counts[:3] == (2, 1, 0)
-    assert prepared.input_ids[0, :4].tolist() == [5, 5, 9, 9]
-    assert prepared.input_ids[1, :2].tolist() == [7, 7]
-    assert prepared.block_table[0, 0, 0].item() == 0
-    assert prepared.block_table[0, 1, 0].item() == 1
-    assert prepared.block_table[1, 0, 0].item() == 0
-    assert prepared.x_hc[0, 0, 0].tolist() == [1, 1, 1, 1]
-    assert prepared.x_hc[0, 2, 0].tolist() == [3, 3, 3, 3]
-    assert prepared.x_hc[1, 0, 0].tolist() == [2, 2, 2, 2]
-
-
-def test_deepseek_decode_x_hc_prev_last_two_token_slots():
-    builder = DeepSeekV4InputBuilder(
-        layout=DeepSeekV4CacheLayout(decode_batch=32, decode_seq=2, decode_tokens=64), hidden_size=4
-    )
-
-    decode = builder.decode_x_hc(
-        torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-        ranks=[0, 7],
-        local_rows=[0, 1],
-        prev_embeddings=torch.arange(8, 16, dtype=torch.bfloat16).reshape(2, 4),
-        use_decode_pair=True,
-    )
-
-    assert decode.shape == (8, 64, 4, 4)
-    # Active row 0: slot 0 = prev, slot 1 = last.
-    assert decode[0, 0, 0].tolist() == [8, 9, 10, 11]
-    assert decode[0, 1, 3].tolist() == [0, 1, 2, 3]
-    # Active row 1: slot 0 = prev, slot 1 = last.
-    assert decode[7, 2, 0].tolist() == [12, 13, 14, 15]
-    assert decode[7, 3, 3].tolist() == [4, 5, 6, 7]
-    # Padding rows replicate active row 0's last embedding (both slots).
-    assert decode[0, 4, 0].tolist() == [0, 1, 2, 3]
-    assert decode[0, 5, 3].tolist() == [0, 1, 2, 3]
-
-
 def test_deepseek_stage_decode_inputs_uses_shared_buffers():
     runner, model = _runner_for_prepared_inputs()
     prepared = runner.prepare_decode_inputs(
@@ -1587,8 +923,6 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
             token_ids=torch.tensor([[5]], dtype=torch.long),
             hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
             seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0)],
-            cache_partitions=[0],
         ),
     )
 
@@ -1624,173 +958,7 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
         assert getattr(staged, name).is_shared()
 
 
-def test_deepseek_decode_zeroes_blocks_allocated_after_prefill():
-    runner, _model = _runner_for_prepared_inputs()
-    layout = runner._compiled.layout
-
-    def filled(layer_count: int, blocks_per_layer: int) -> torch.Tensor:
-        return torch.full(
-            (layout.ranks, layer_count * blocks_per_layer, 1),
-            7,
-            dtype=torch.float32,
-        )
-
-    cache = DeepSeekV4LayerCache(
-        kv_cache=filled(npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.decode_ori_max_blocks),
-        cmp_kv=filled(npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.cmp_max_blocks),
-        idx_kv_cache=filled(npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        idx_kv_scale=filled(npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        hca_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_HCA_NUM_LAYERS,
-            layout.hca_state_max_blocks,
-        ),
-        csa_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_state_max_blocks,
-        ),
-        csa_inner_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_inner_state_max_blocks,
-        ),
-    )
-    runner._decode_work_cache = cache
-    runner._decode_cache_block_ids["req-a"] = {
-        name: {0}
-        for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
-    }
-    groups = {
-        name: (0, 1)
-        for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
-    }
-
-    runner._seed_decode_work_cache_from_group_ids(
-        ("req-a",),
-        (2,),
-        (groups,),
-    )
-
-    tensors = (
-        (cache.kv_cache, npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.decode_ori_max_blocks),
-        (cache.cmp_kv, npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.cmp_max_blocks),
-        (cache.idx_kv_cache, npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        (cache.idx_kv_scale, npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        (
-            cache.hca_compress_state,
-            npu_runner.DEEPSEEK_V4_HCA_NUM_LAYERS,
-            layout.hca_state_max_blocks,
-        ),
-        (
-            cache.csa_compress_state,
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_state_max_blocks,
-        ),
-        (
-            cache.csa_inner_compress_state,
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_inner_state_max_blocks,
-        ),
-    )
-    for tensor, layer_count, blocks_per_layer in tensors:
-        pages = tensor.reshape(layout.ranks, layer_count, blocks_per_layer, 1)
-        assert torch.count_nonzero(pages[2, :, 1]) == 0
-        assert torch.all(pages[2, :, 0] == 7)
-        assert torch.all(pages[1, :, 1] == 7)
-    assert all(block_ids == {0, 1} for block_ids in runner._decode_cache_block_ids["req-a"].values())
-
-
-def test_deepseek_materializes_rank_stacked_resident_cache_and_syncs_only_new_pages():
-    layout = DeepSeekV4CacheLayout(
-        ranks=2,
-        decode_ori_max_blocks=2,
-        cmp_max_blocks=2,
-        idx_max_blocks=2,
-        hca_state_max_blocks=2,
-        csa_state_max_blocks=2,
-        csa_inner_state_max_blocks=2,
-    )
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=layout,
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=(),
-            layer_plan=(),
-            kernel_dir="",
-        )
-    )
-
-    def filled(layer_count: int, blocks_per_layer: int) -> torch.Tensor:
-        return torch.full((layout.ranks, layer_count * blocks_per_layer, 1), 7.0).share_memory_()
-
-    host = DeepSeekV4LayerCache(
-        kv_cache=filled(npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.decode_ori_max_blocks),
-        cmp_kv=filled(npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS, layout.cmp_max_blocks),
-        idx_kv_cache=filled(npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        idx_kv_scale=filled(npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-        hca_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_HCA_NUM_LAYERS,
-            layout.hca_state_max_blocks,
-        ),
-        csa_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_state_max_blocks,
-        ),
-        csa_inner_compress_state=filled(
-            npu_runner.DEEPSEEK_V4_CSA_NUM_LAYERS,
-            layout.csa_inner_state_max_blocks,
-        ),
-    )
-
-    class FakeWorker:
-        def __init__(self):
-            self.allocations = []
-            self.copies = []
-
-        def alloc_stacked_tensor(self, tensor, *, worker_ids):
-            ids = tuple(worker_ids)
-            base = 0x100000 + len(self.allocations) * 0x10000
-            shards = tuple(
-                npu_runner.DeviceTensor(base + rank * 0x1000, tensor.shape[1:], tensor.dtype)
-                for rank in range(tensor.shape[0])
-            )
-            stacked = npu_runner.StackedDeviceTensor(shards, tensor.shape, ids)
-            self.allocations.append((tensor, stacked))
-            return stacked
-
-        def copy_to(self, dst, src, nbytes, *, worker_id):
-            self.copies.append((dst, src, nbytes, worker_id))
-
-    worker = FakeWorker()
-    runner._l3_worker = worker
-    runner._decode_work_cache = host
-
-    resident = runner._materialize_decode_device_cache()
-
-    assert runner._materialize_decode_device_cache() is resident
-    assert len(worker.allocations) == 7
-    assert resident.kv_cache.full_shape == tuple(host.kv_cache.shape)
-    assert resident.kv_cache.worker_ids == (0, 1)
-
-    runner._initialize_decode_cache_blocks(
-        ("req-a",),
-        (1,),
-        ({"ori": (1,)},),
-    )
-
-    pages = host.kv_cache.reshape(
-        layout.ranks,
-        npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS,
-        layout.decode_ori_max_blocks,
-        1,
-    )
-    assert torch.count_nonzero(pages[1, :, 1]) == 0
-    assert torch.all(pages[1, :, 0] == 7)
-    assert len(worker.copies) == npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS
-    assert {copy[-1] for copy in worker.copies} == {1}
-
-
-def test_deepseek_run_decode_dispatches_rank_local_active_token_count():
+def test_deepseek_run_decode_dispatches_active_token_count():
     from types import SimpleNamespace
 
     runner, model = _runner_for_prepared_inputs()
@@ -1809,10 +977,10 @@ def test_deepseek_run_decode_dispatches_rank_local_active_token_count():
         captured["num_tokens"] = args[-1]
         args[-2].fill_(1)
 
-    def fake_logits(_hidden, *, owner_rows, label):
-        captured["owner_rows"] = owner_rows
+    def fake_logits(_hidden, *, active_rows, label):
+        captured["active_rows"] = active_rows
         captured["label"] = label
-        return torch.zeros((len(owner_rows), model.config.vocab_size), dtype=torch.float32)
+        return torch.zeros((len(active_rows), model.config.vocab_size), dtype=torch.float32)
 
     hidden_out = torch.empty(
         runner._compiled.layout.ranks,
@@ -1822,7 +990,6 @@ def test_deepseek_run_decode_dispatches_rank_local_active_token_count():
     )
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner._stage_decode_inputs = fake_stage
-    runner._seed_decode_work_cache_from_group_ids = lambda *_args, **_kwargs: None
     runner._require_decode_buffers = lambda: SimpleNamespace(
         x_hc_a=captured["prepared"].x_hc,
         pre_hc_hidden_out=torch.empty(
@@ -1841,20 +1008,15 @@ def test_deepseek_run_decode_dispatches_rank_local_active_token_count():
     result = runner.run_decode(
         model,
         DecodeBatch(
-            request_ids=["req-a", "req-b"],
-            token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-            hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-            seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=[_group_block_ids(0), _group_block_ids(0)],
-            cache_partitions=[0, 1],
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[5]], dtype=torch.long),
+            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
         ),
     )
 
-    assert captured["num_tokens"] == 1
-    assert captured["owner_rows"] == (
-        (0, 0),
-        (1, 0),
-    )
+    assert captured["num_tokens"] == runner._compiled.layout.decode_seq
+    assert captured["active_rows"] == (runner._compiled.layout.decode_seq - 1,)
     assert captured["label"] == "decode"
     assert captured["x_hc_shape"] == (
         runner._compiled.layout.ranks,
@@ -1862,119 +1024,59 @@ def test_deepseek_run_decode_dispatches_rank_local_active_token_count():
         runner._compiled.layout.hc_mult,
         model.config.hidden_size,
     )
-    assert result.logits.shape == (2, model.config.vocab_size)
-
-
-def test_deepseek_run_prefill_dispatches_active_prefill_token_count():
-    runner, model = _runner_for_prepared_inputs()
-    runner._compiled.prefill = DeepSeekV4L3Callable(compiled=object(), name="prefill")
-    captured: dict[str, object] = {}
-
-    def fake_stage(inputs):
-        captured["prepared"] = inputs
-        return inputs
-
-    def fake_prefill_fwd_args(pre_hc_hidden_out, x_out):
-        captured["pre_hc_out_shape"] = tuple(pre_hc_hidden_out.shape)
-        captured["x_out_shape"] = tuple(x_out.shape)
-        return (pre_hc_hidden_out, x_out)
-
-    def fake_run_l3(_callable, *args):
-        captured["num_tokens"] = args[-1]
-        args[-2].fill_(1)
-
-    def fake_logits(_hidden, *, owner_rows, label):
-        captured["owner_rows"] = owner_rows
-        captured["label"] = label
-        return torch.zeros((len(owner_rows), model.config.vocab_size), dtype=torch.float32)
-
-    runner._ensure_l3_shared_buffers = lambda _model: None
-    runner._stage_prefill_fwd_inputs = fake_stage
-    runner._require_prefill_pre_hc_output_buffer = lambda _hidden_size: torch.empty(
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.prefill_seq,
-        runner._compiled.layout.hc_mult,
-        model.config.hidden_size,
-        dtype=torch.float32,
-    )
-    runner._require_prefill_output_buffer = lambda _hidden_size: torch.empty(
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.prefill_seq,
-        model.config.hidden_size,
-        dtype=torch.bfloat16,
-    )
-    runner._prefill_fwd_args = fake_prefill_fwd_args
-    runner._run_l3 = fake_run_l3
-    runner._initialize_decode_cache_blocks = lambda *_args, **_kwargs: None
-    runner._logits_for_hidden = fake_logits
-
-    result = runner.run_prefill(
-        model,
-        PrefillBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[10, 11, 12]], dtype=torch.long),
-            input_embeddings=torch.arange(12, dtype=torch.bfloat16).reshape(1, 3, 4),
-            seq_lens=torch.tensor([3], dtype=torch.int32),
-            positions=torch.tensor([[0, 1, 2]], dtype=torch.long),
-            block_ids_by_group=[_group_block_ids(0)],
-            cache_partitions=[0],
-        ),
-    )
-
-    assert captured["prepared"].actual_tokens == (3,)
-    assert captured["num_tokens"] == 3
-    assert captured["owner_rows"] == ((0, 2),)
-    assert captured["label"] == "prefill"
-    assert captured["x_out_shape"] == (
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.prefill_seq,
-        model.config.hidden_size,
-    )
-    assert captured["pre_hc_out_shape"] == (
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.prefill_seq,
-        runner._compiled.layout.hc_mult,
-        model.config.hidden_size,
-    )
     assert result.logits.shape == (1, model.config.vocab_size)
 
 
-def test_deepseek_l3_dispatch_rejects_non_shared_tensor_before_worker_start():
-    runner, _model = _runner_for_prepared_inputs()
-
-    with pytest.raises(TypeError, match="before the L3 worker starts"):
-        runner._run_l3(DeepSeekV4L3Callable(compiled=object(), name="fake"), torch.zeros(1))
-
-
-def test_deepseek_l3_worker_requires_full_shared_preallocation_before_start():
-    runner, _model = _runner_for_prepared_inputs()
-
-    with pytest.raises(RuntimeError, match="shared host buffers are preallocated"):
-        runner._run_l3(
-            DeepSeekV4L3Callable(compiled=object(), name="fake"),
-            torch.zeros(1).share_memory_(),
-        )
-
-
-def test_deepseek_l3_scalars_are_runtime_python_ints():
-    runner, _model = _runner_for_prepared_inputs()
-
-    value = runner._int32_scalar(7)
-
-    assert isinstance(value, int)
-    assert value == 7
-
-
-def test_deepseek_cache_replicates_decode_padding_rows():
-    active = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-
-    padded = DeepSeekV4CacheMetadataBuilder.replicate_first_row(
-        active,
-        actual_rows=2,
-        kernel_rows=4,
+def test_deepseek_prefill_and_decode_reuse_same_cache_tensors():
+    layout = DeepSeekV4CacheLayout(
+        ranks=1,
+        prefill_seq=1,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+        block_size=1,
+        prefill_ori_max_blocks=1,
+        decode_ori_max_blocks=1,
+        ori_table_max_blocks=1,
+        cmp_max_blocks=1,
+        idx_max_blocks=1,
+        hca_state_max_blocks=1,
+        csa_state_max_blocks=1,
+        csa_inner_state_max_blocks=1,
+        c128_state_block_size=1,
+        c4_state_block_size=1,
+        prefill_cmp_max_blocks=1,
+        prefill_idx_max_blocks=1,
+        prefill_hca_state_max_blocks=1,
+        prefill_csa_state_max_blocks=1,
+        prefill_csa_inner_state_max_blocks=1,
     )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            freqs_cos=torch.empty((1, 1), dtype=torch.bfloat16),
+            freqs_sin=torch.empty((1, 1), dtype=torch.bfloat16),
+        )
+    )
+    cache = runner._ensure_decode_work_cache()
+    prefill = runner._ensure_prefill_fwd_buffers(hidden_size=1)
 
-    assert padded.tolist() == [[10, 11], [20, 21], [10, 11], [10, 11]]
+    for name in (
+        "kv_cache",
+        "cmp_kv",
+        "idx_kv_cache",
+        "idx_kv_scale",
+        "hca_compress_state",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+    ):
+        assert prefill.tensors[name] is getattr(cache, name)
 
 
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
@@ -2013,8 +1115,23 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
 
 
-def test_deepseek_release_invalidates_only_finished_cache_owner():
-    layout = DeepSeekV4CacheLayout(decode_batch=3)
+def test_deepseek_unified_cache_zeroing_is_isolated_by_slot():
+    layout = DeepSeekV4CacheLayout(
+        ranks=1,
+        decode_batch=2,
+        decode_seq=1,
+        decode_tokens=2,
+        block_size=1,
+        prefill_ori_max_blocks=2,
+        decode_ori_max_blocks=2,
+        cmp_max_blocks=2,
+        idx_max_blocks=2,
+        hca_state_max_blocks=2,
+        csa_state_max_blocks=2,
+        csa_inner_state_max_blocks=2,
+        c128_state_block_size=1,
+        c4_state_block_size=1,
+    )
     runner = DeepSeekV4ModelRunner(
         compiled=DeepSeekV4CompiledKernels(
             layout=layout,
@@ -2026,23 +1143,16 @@ def test_deepseek_release_invalidates_only_finished_cache_owner():
             kernel_dir="",
         )
     )
-    runner._decode_cache_block_ids.update(
-        {
-            "request-a": {"ori": {0}},
-            "request-b": {"ori": {1}},
-        }
-    )
-    runner._mtp_request_states.update(
-        {
-            "request-a": npu_runner._DeepSeekV4MtpRequestState(draft_token_id=1),
-            "request-b": npu_runner._DeepSeekV4MtpRequestState(draft_token_id=2),
-        }
-    )
+    cache = runner._ensure_decode_work_cache()
+    for tensor in cache.__dict__.values():
+        tensor.fill_(1)
 
-    runner.release_finished_requests(["request-a"])
+    runner._zero_unified_cache_slot(0)
 
-    assert runner._decode_cache_block_ids == {"request-b": {"ori": {1}}}
-    assert set(runner._mtp_request_states) == {"request-b"}
+    for tensor in cache.__dict__.values():
+        per_layer = tensor.reshape(layout.ranks, -1, 2, *tensor.shape[2:])
+        assert torch.count_nonzero(per_layer[:, :, 0]) == 0
+        assert torch.all(per_layer[:, :, 1] == 1)
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:
@@ -2265,7 +1375,8 @@ def _runtime_model_for_embeddings():
 def _runner_for_prepared_inputs() -> tuple[DeepSeekV4ModelRunner, object]:
     model = _runtime_model_for_embeddings()
     compiled = DeepSeekV4CompiledKernels(
-        layout=DeepSeekV4CacheLayout(),
+        # Exercise a wide, batch-agnostic input layout independent of production B=8/S=1.
+        layout=DeepSeekV4CacheLayout(decode_batch=32, decode_seq=2, decode_tokens=64),
         model_dir="",
         weight_map={},
         weight_store=None,
@@ -2321,11 +1432,11 @@ def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
         raise AssertionError("host LM-head must not dispatch an L3 program")
 
     runner._run_l3 = fail_run_l3
-    logits = runner._logits_for_hidden(hidden, owner_rows=((0, 5), (1, 2)))
+    logits = runner._logits_for_hidden(hidden, active_rows=(5, 2))
 
     assert logits.shape == (2, 5)
     assert logits[0].tolist() == [15, 16, 17, 31, 33]
-    assert logits[1].tolist() == [24, 25, 26, 49, 51]
+    assert logits[1].tolist() == [6, 7, 8, 13, 15]
 
 
 def test_deepseek_final_hidden_normalizes_before_hc_head_projection_overflows():
