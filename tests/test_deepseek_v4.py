@@ -668,6 +668,103 @@ def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slice
     assert all(tensor.is_contiguous() for tensor in stacked.tensors.values())
 
 
+def test_deepseek_stacked_weight_staging_retains_ordinary_host_storage():
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._stacked_weight_buffers = None
+    runner._l3_worker = None
+    weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    staged = runner._stage_stacked_weights(
+        weight_loader.DeepSeekV4StackedLayerWeights(tensors={"weight": weight})
+    )
+
+    assert staged.tensors["weight"] is weight
+    assert not staged.tensors["weight"].is_shared()
+
+
+def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypatch):
+    main_weight = torch.zeros((1, 2), dtype=torch.float32)
+    mtp_weight = torch.ones((1, 2), dtype=torch.float32)
+    compiled_program = object()
+    captured = {}
+
+    class FakeDistributedWorker:
+        def release_inherited_host_tensors(self):
+            pass
+
+        def __init__(self, compiled, *, inherited_host_tensors):
+            captured["compiled"] = compiled
+            captured["inherited"] = inherited_host_tensors
+
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._l3_worker = None
+    runner._stacked_weight_buffers = {"main": main_weight}
+    runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
+    runner._compiled = type(
+        "Compiled",
+        (),
+        {"l3_callables": lambda _self: (DeepSeekV4L3Callable(compiled_program, "decode"),)},
+    )()
+    runner._assert_l3_shared_buffers_preallocated = lambda: None
+
+    worker = runner._shared_l3_worker()
+
+    assert isinstance(worker, FakeDistributedWorker)
+    assert captured["compiled"] == [compiled_program]
+    assert captured["inherited"] == [main_weight, mtp_weight]
+
+
+def test_deepseek_worker_rejects_runtime_without_inherited_resident_upload(monkeypatch):
+    class OutdatedDistributedWorker:
+        pass
+
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", OutdatedDistributedWorker)
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._l3_worker = None
+    runner._compiled = type(
+        "Compiled",
+        (),
+        {"l3_callables": lambda _self: (DeepSeekV4L3Callable(object(), "decode"),)},
+    )()
+    runner._assert_l3_shared_buffers_preallocated = lambda: None
+
+    with pytest.raises(RuntimeError, match="inherited resident weights require"):
+        runner._shared_l3_worker()
+
+
+def test_deepseek_resident_upload_releases_inherited_host_references():
+    main_weight = torch.zeros((1, 2), dtype=torch.float32)
+    mtp_weight = torch.ones((1, 2), dtype=torch.float32)
+
+    class FakeWorker:
+        def __init__(self):
+            self.released = False
+
+        def alloc_stacked_tensor(self, tensor):
+            return tensor
+
+        def free_stacked_tensor(self, _tensor):
+            pass
+
+        def release_inherited_host_tensors(self):
+            self.released = True
+
+    worker = FakeWorker()
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._stacked_weight_buffers = {"main": main_weight}
+    runner._stacked_device_weights = None
+    runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
+    runner._mtp_device_weights = None
+    runner._shared_l3_worker = lambda: worker
+
+    runner._materialize_resident_weights()
+
+    assert worker.released
+    assert runner._stacked_weight_buffers is None
+    assert not runner._mtp_buffers.weights
+
+
 def test_deepseek_cache_slots_tables_and_mappings():
     manager = DeepSeekV4CacheManager(layout=DeepSeekV4CacheLayout())
 
@@ -1013,11 +1110,14 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
             mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
         )
     )
-    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={})
+    weight = torch.arange(2, dtype=torch.float32)
+    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={"weight": weight})
 
     buffers = runner._ensure_mtp_buffers(hidden_size=1)
 
     assert buffers is not None
+    assert buffers.weights["weight"] is weight
+    assert not buffers.weights["weight"].is_shared()
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
 
 
