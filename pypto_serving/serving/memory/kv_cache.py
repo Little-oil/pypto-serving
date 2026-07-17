@@ -14,10 +14,14 @@ from dataclasses import dataclass, field
 
 import torch
 
-from pypto_serving.config.types import KvAllocation, ModelConfig, RuntimeConfig
+from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 
 
 NONE_HASH = hash(("__none__",))
+
+
+class KVCacheCapacityError(RuntimeError):
+    """Raised when a cache allocation cannot fit in the physical pools."""
 
 
 def hash_block_tokens(parent_hash: int, token_ids: tuple[int, ...]) -> int:
@@ -122,6 +126,24 @@ class _CachePool:
     value_pages: torch.Tensor | None = None
 
 
+@dataclass
+class _GroupBlockPool:
+    """Rank-partitioned physical block namespaces for one cache family."""
+
+    spec: KVCacheGroupSpec
+    blocks: list[KVCacheBlock]
+    blocks_per_partition: int
+    free_queues: tuple[FreeKVCacheBlockQueue, ...]
+    request_blocks: dict[str, list[KVCacheBlock]] = field(default_factory=dict)
+    request_partitions: dict[str, int] = field(default_factory=dict)
+
+    def num_free_blocks_in(self, partition: int) -> int:
+        return len(self.free_queues[partition])
+
+    def local_block_id(self, block: KVCacheBlock) -> int:
+        return block.block_id % self.blocks_per_partition
+
+
 class KvCacheManager:
     """Unified KV block metadata and paged KV tensor storage manager."""
 
@@ -140,6 +162,9 @@ class KvCacheManager:
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[int, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
+        self._group_pools: dict[str, _GroupBlockPool] = {}
+        self._group_request_partitions: dict[str, int] = {}
+        self._next_group_partition = 0
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -428,6 +453,236 @@ class KvCacheManager:
         alloc.page_ids.clear()
         alloc.tokens_capacity = 0
         alloc.tokens_used = 0
+
+    @property
+    def has_groups(self) -> bool:
+        """Return whether model-specific cache groups are configured."""
+        return bool(self._group_pools)
+
+    @property
+    def group_names(self) -> tuple[str, ...]:
+        """Return cache group names in stable allocation order."""
+        return tuple(self._group_pools)
+
+    def init_groups(
+        self,
+        group_specs: tuple[KVCacheGroupSpec, ...],
+        *,
+        max_batch_size: int,
+    ) -> None:
+        """Initialize independent physical pools for model-specific caches."""
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
+        if not group_specs:
+            return
+        names = [group.name for group in group_specs]
+        if len(names) != len(set(names)):
+            raise ValueError("KV cache group names must be unique")
+
+        partition_counts = {group.num_partitions for group in group_specs}
+        if len(partition_counts) != 1:
+            raise ValueError("KV cache groups must use the same num_partitions")
+
+        requested_sizes = {
+            group.name: group.num_blocks or max_batch_size * group.max_blocks_per_seq
+            for group in group_specs
+        }
+        undersized = [
+            group.name
+            for group in group_specs
+            if requested_sizes[group.name] < group.max_blocks_per_seq
+        ]
+        if undersized:
+            raise ValueError(
+                "KV cache groups cannot hold one maximum-length sequence: " + ", ".join(undersized)
+            )
+        if self._group_pools:
+            existing = {
+                name: (pool.spec, pool.blocks_per_partition)
+                for name, pool in self._group_pools.items()
+            }
+            requested = {
+                group.name: (group, requested_sizes[group.name])
+                for group in group_specs
+            }
+            if existing != requested:
+                raise ValueError("KV cache groups are already initialized with different specifications")
+            return
+
+        for group in group_specs:
+            blocks_per_partition = requested_sizes[group.name]
+            total_blocks = blocks_per_partition * group.num_partitions
+            blocks = [KVCacheBlock(block_id=block_id) for block_id in range(total_blocks)]
+            free_queues = tuple(FreeKVCacheBlockQueue() for _ in range(group.num_partitions))
+            for partition, free_queue in enumerate(free_queues):
+                start = partition * blocks_per_partition
+                free_queue.append_n(blocks[start : start + blocks_per_partition])
+            self._group_pools[group.name] = _GroupBlockPool(
+                spec=group,
+                blocks=blocks,
+                blocks_per_partition=blocks_per_partition,
+                free_queues=free_queues,
+            )
+
+    def required_group_block_counts(self, token_count: int) -> dict[str, int]:
+        """Return the per-group allocation size needed for ``token_count``."""
+        if token_count < 0:
+            raise ValueError("token_count must not be negative")
+        return {
+            name: min(
+                pool.spec.max_blocks_per_seq,
+                math.ceil(token_count / pool.spec.spec.token_capacity),
+            )
+            for name, pool in self._group_pools.items()
+        }
+
+    @property
+    def group_partition_count(self) -> int:
+        """Return the number of independent grouped-cache namespaces."""
+        if not self._group_pools:
+            return 1
+        return next(iter(self._group_pools.values())).spec.num_partitions
+
+    def group_request_partition(self, request_id: str) -> int | None:
+        """Return the stable cache partition assigned to a request."""
+        return self._group_request_partitions.get(request_id)
+
+    def _candidate_group_partitions(
+        self,
+        request_id: str,
+        required: dict[str, int],
+    ) -> list[int]:
+        assigned = self._group_request_partitions.get(request_id)
+        candidates = [assigned] if assigned is not None else list(range(self.group_partition_count))
+        return [
+            partition
+            for partition in candidates
+            if all(
+                max(0, required[name] - len(pool.request_blocks.get(request_id, ())))
+                <= pool.num_free_blocks_in(partition)
+                for name, pool in self._group_pools.items()
+            )
+        ]
+
+    def _select_group_partition(self, request_id: str, required: dict[str, int]) -> int | None:
+        candidates = self._candidate_group_partitions(request_id, required)
+        if not candidates:
+            return None
+        assigned = self._group_request_partitions.get(request_id)
+        if assigned is not None:
+            return assigned
+
+        first_pool = next(iter(self._group_pools.values()))
+        owned_counts = {
+            partition: sum(
+                request_partition == partition
+                for request_partition in first_pool.request_partitions.values()
+            )
+            for partition in candidates
+        }
+        minimum = min(owned_counts.values())
+        least_loaded = {partition for partition, count in owned_counts.items() if count == minimum}
+        for offset in range(self.group_partition_count):
+            partition = (self._next_group_partition + offset) % self.group_partition_count
+            if partition in least_loaded:
+                self._next_group_partition = (partition + 1) % self.group_partition_count
+                return partition
+        raise RuntimeError("group partition selection became inconsistent")
+
+    def can_ensure_group_blocks(
+        self,
+        request_id: str,
+        token_count: int,
+        *,
+        partition: int | None = None,
+    ) -> bool:
+        """Return whether every group can atomically grow this request."""
+        required = self.required_group_block_counts(token_count)
+        if partition is not None:
+            assigned = self._group_request_partitions.get(request_id)
+            if assigned is not None and assigned != partition:
+                return False
+            if not 0 <= partition < self.group_partition_count:
+                return False
+            return partition in self._candidate_group_partitions(request_id, required)
+        return bool(self._candidate_group_partitions(request_id, required))
+
+    def ensure_group_blocks(
+        self,
+        request_id: str,
+        token_count: int,
+        *,
+        partition: int | None = None,
+    ) -> dict[str, list[int]]:
+        """Atomically grow all cache groups for a request and return block IDs."""
+        if not self._group_pools:
+            return {}
+        required = self.required_group_block_counts(token_count)
+        assigned = self._group_request_partitions.get(request_id)
+        if partition is not None and assigned is not None and partition != assigned:
+            raise ValueError(
+                f"Request {request_id!r} is assigned to cache partition {assigned}, got {partition}"
+            )
+        selected = partition if partition is not None else self._select_group_partition(request_id, required)
+        if selected is None or not self.can_ensure_group_blocks(
+            request_id,
+            token_count,
+            partition=selected,
+        ):
+            shortages = []
+            for name, pool in self._group_pools.items():
+                needed = max(0, required[name] - len(pool.request_blocks.get(request_id, ())))
+                free = max(
+                    (pool.num_free_blocks_in(candidate) for candidate in range(self.group_partition_count)),
+                    default=0,
+                )
+                if needed > free:
+                    shortages.append(f"{name}: need {needed}, free {free}")
+            if not shortages:
+                shortages.append("no cache partition can satisfy all groups atomically")
+            raise KVCacheCapacityError(
+                "Insufficient grouped KV cache blocks (" + "; ".join(shortages) + ")"
+            )
+
+        self._group_request_partitions.setdefault(request_id, selected)
+        for name, pool in self._group_pools.items():
+            owned = pool.request_blocks.setdefault(request_id, [])
+            pool.request_partitions.setdefault(request_id, selected)
+            for _ in range(required[name] - len(owned)):
+                block = pool.free_queues[selected].popleft()
+                if block is None:  # The atomic capacity check above makes this an invariant violation.
+                    raise RuntimeError(f"KV cache group {name!r} free queue became inconsistent")
+                block.ref_cnt = 1
+                owned.append(block)
+        return {
+            name: [pool.local_block_id(block) for block in pool.request_blocks.get(request_id, ())]
+            for name, pool in self._group_pools.items()
+        }
+
+    def release_all_group_requests(self, request_id: str) -> None:
+        """Release every grouped block owned by a request."""
+        for pool in self._group_pools.values():
+            partition = pool.request_partitions.pop(request_id, None)
+            for block in pool.request_blocks.pop(request_id, []):
+                if block.ref_cnt != 1:
+                    raise RuntimeError(
+                        f"Grouped KV block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
+                    )
+                block.ref_cnt = 0
+                if partition is None:
+                    raise RuntimeError(f"Grouped request {request_id!r} has blocks without a partition")
+                pool.free_queues[partition].append(block)
+        self._group_request_partitions.pop(request_id, None)
+
+    def group_num_blocks(self, group_name: str) -> int:
+        """Return the rank-local physical block capacity of one cache group."""
+        return self._group_pool(group_name).blocks_per_partition
+
+    def _group_pool(self, group_name: str) -> _GroupBlockPool:
+        try:
+            return self._group_pools[group_name]
+        except KeyError as exc:
+            raise KeyError(f"KV cache group {group_name!r} is not registered") from exc
 
     def _pool(self, model_id: str) -> _CachePool:
         """Return the registered cache pool for a model."""

@@ -52,6 +52,57 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class KVCacheSpec:
+    """Physical layout and logical capacity of one cache block."""
+
+    block_size: int
+    page_size_bytes: int
+    compress_ratio: int = 1
+
+    def __post_init__(self) -> None:
+        if self.block_size <= 0:
+            raise ValueError("KV cache block_size must be positive")
+        if self.page_size_bytes <= 0:
+            raise ValueError("KV cache page_size_bytes must be positive")
+        if self.compress_ratio <= 0:
+            raise ValueError("KV cache compress_ratio must be positive")
+
+    @property
+    def token_capacity(self) -> int:
+        """Return the number of source tokens represented by one block."""
+        return self.block_size * self.compress_ratio
+
+
+@dataclass(frozen=True)
+class KVCacheGroupSpec:
+    """Describe one independently allocated model-specific cache family."""
+
+    name: str
+    layer_indices: tuple[int, ...]
+    spec: KVCacheSpec
+    max_blocks_per_seq: int
+    # Fixed kernel layouts may expose a physical pool smaller than the serving
+    # configuration's generic max batch size. In that case this is the source
+    # of truth for scheduler-visible block IDs in one cache partition.
+    num_blocks: int | None = None
+    # Some distributed kernels combine rank-local data parallelism with expert
+    # parallelism. Each rank then owns an independent cache namespace whose
+    # physical block IDs start at zero. ``num_partitions`` describes those
+    # namespaces without flattening them into one conflicting block-ID space.
+    num_partitions: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("KV cache group name must not be empty")
+        if self.max_blocks_per_seq <= 0:
+            raise ValueError("KV cache max_blocks_per_seq must be positive")
+        if self.num_blocks is not None and self.num_blocks <= 0:
+            raise ValueError("KV cache num_blocks must be positive when specified")
+        if self.num_partitions <= 0:
+            raise ValueError("KV cache num_partitions must be positive")
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Runtime limits and device placement for one loaded model."""
 
@@ -70,6 +121,8 @@ class RuntimeConfig:
     max_num_batched_tokens: int = 4096
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
+    # Model-specific cache families. Empty means the generic single KV pool.
+    kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -189,6 +242,8 @@ class PrefillBatch:
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     positions: torch.Tensor | None = None
     block_ids: list[list[int]] = field(default_factory=list)
+    block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
+    cache_partitions: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -215,6 +270,8 @@ class DecodeBatch:
     allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
+    block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
+    cache_partitions: list[int] = field(default_factory=list)
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``

@@ -243,7 +243,7 @@ jobs:
           run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --timeout 1200 --max-time 1800 \
+            --timeout 1200 --max-time 2700 \
             --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks

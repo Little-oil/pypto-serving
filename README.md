@@ -113,6 +113,9 @@ python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 
 - All model/device/runtime options are passed via CLI arguments. Run
   `pypto-serving --help` for the full list.
+- Parallel serving development notes live in `docs/dev/parallel.md`.
+- Generated kernel artifacts are written under `build_output/` and are ignored
+  by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
   local Ascend runtime environment to be available in the active Python
   environment.

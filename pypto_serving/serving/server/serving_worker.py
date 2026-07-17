@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -203,7 +204,22 @@ class WorkerProcess:
     def _execute_step(self, cmd: StepCommand) -> StepResult:
         """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
-        new_tokens: dict[str, list[int]] = {}
+        new_tokens: dict[str, int | list[int]] = {}
+
+        preempted_request_ids = [
+            request.request_id for request in scheduler_output.preempted_requests
+        ]
+        if preempted_request_ids:
+            release_preempted = getattr(self.executor, "release_finished_requests", None)
+            if callable(release_preempted):
+                release_preempted(preempted_request_ids)
+
+        prefill_requests = [
+            sr for sr in scheduler_output.scheduled_requests if sr.is_prefill
+        ]
+        decode_requests = [
+            sr for sr in scheduler_output.scheduled_requests if not sr.is_prefill
+        ]
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -211,12 +227,48 @@ class WorkerProcess:
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
             with self.executor.session():
-                if cmd.prefill_requests:
-                    self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
-                if cmd.decode_requests:
-                    self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
+                if prefill_requests:
+                    max_prefill_batch = self.executor.max_prefill_batch_size
+                    if max_prefill_batch is None:
+                        self._batch_prefill(prefill_requests, runtime_model, new_tokens)
+                    else:
+                        if max_prefill_batch <= 0:
+                            raise ValueError("executor max_prefill_batch_size must be positive")
+                        for chunk in self._partitioned_prefill_chunks(
+                            prefill_requests,
+                            max_prefill_batch,
+                        ):
+                            self._batch_prefill(chunk, runtime_model, new_tokens)
+                if decode_requests:
+                    self._batch_decode(decode_requests, runtime_model, new_tokens)
 
         return StepResult(new_tokens=new_tokens)
+
+    @staticmethod
+    def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
+        """Pack at most one local-prefill request from each cache partition."""
+        pending = list(scheduled)
+        chunks: list[list] = []
+        while pending:
+            chunk = []
+            deferred = []
+            used_partitions: set[int] = set()
+            for item in pending:
+                partition = item.cache_partition
+                can_add = len(chunk) < max_batch and (
+                    partition is None or partition not in used_partitions
+                )
+                if can_add:
+                    chunk.append(item)
+                    if partition is not None:
+                        used_partitions.add(partition)
+                else:
+                    deferred.append(item)
+            if not chunk:
+                raise RuntimeError("unable to form a prefill dispatch chunk")
+            chunks.append(chunk)
+            pending = deferred
+        return chunks
 
     def _batch_prefill(
         self,
@@ -274,6 +326,8 @@ class WorkerProcess:
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
                     positions=positions_tensor,
                     block_ids=block_ids_list,
+                    block_ids_by_group=[sr.block_ids_by_group for sr in scheduled],
+                    cache_partitions=[sr.cache_partition for sr in scheduled],
                 ),
             )
 
@@ -344,6 +398,8 @@ class WorkerProcess:
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
                     block_ids=block_ids_list,
+                    block_ids_by_group=[sr.block_ids_by_group for sr in scheduled],
+                    cache_partitions=[sr.cache_partition for sr in scheduled],
                     prev_token_ids=prev_token_tensor,
                     prev_hidden_states=prev_embeddings,
                 ),
@@ -414,6 +470,17 @@ def _worker_entry(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+
+    # Spawned workers do not inherit the parent's logging config; configure a
+    # stderr handler so per-stage progress logs (weight load, preflight) are
+    # visible alongside kernel/perf output.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
 
     worker = WorkerProcess(config, input_queue, output_queue)
     try:

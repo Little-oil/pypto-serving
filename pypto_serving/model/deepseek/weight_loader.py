@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ContextManager, Protocol
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class _SafeTensorReader(Protocol):
@@ -643,21 +646,23 @@ class DeepSeekV4WeightStore:
         weights across the compress_ratio==4 layers in order; HCA-group weights
         across the compress_ratio==128 layers in order. Each per-layer tensor is
         ``[ranks, d1, ...]`` and stacking concatenates on dim 1.
+
+        Layers are packed serially. A thread pool was tried but regressed: pack
+        is a mixed IO+CPU workload and per-layer packing allocates ~8 GB of
+        intermediate tensors (256 routed experts each ``torch.stack``-ed and
+        rank-replicated), so N parallel layers multiply peak allocation and
+        contend on CPU memory bandwidth; the GIL-switch cost also exceeded the
+        parallel gain when workers <= layer count. Serial packing keeps the
+        working set to one layer at a time and lets the disk prefetcher run.
         """
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
-        first = self.load_packed_layer_weights(
-            0,
-            ranks=ranks,
-            n_routed_experts=n_routed_experts,
-            compress_ratio=int(compress_ratios[0]),
-            include_tid2eid=num_hash_layers > 0,
-            include_gate_bias=num_hash_layers <= 0,
-        )
-        stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
-        csa_order = 0
-        hca_order = 0
+
+        per_layer: list[DeepSeekV4PackedLayerWeights] = []
+        import time
+
+        pack_t0 = time.perf_counter()
         for layer_id in range(num_hidden_layers):
             compress_ratio = int(compress_ratios[layer_id])
             destinations = _stacked_layer_destinations(
@@ -681,9 +686,14 @@ class DeepSeekV4WeightStore:
                     include_gate_bias=layer_id >= num_hash_layers,
                     destinations=destinations,
                 )
-            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
-            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
-        return DeepSeekV4StackedLayerWeights(tensors=stacked)
+            )
+            if layer_id % 5 == 0 or layer_id == num_hidden_layers - 1:
+                logger.info(
+                    "DeepSeekV4 weight load progress: layer %d/%d",
+                    layer_id + 1,
+                    num_hidden_layers,
+                )
+        return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
 
     def load_mtp_weights(
         self,

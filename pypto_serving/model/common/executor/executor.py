@@ -54,6 +54,11 @@ class ModelExecutor(ABC):
         """
         return False
 
+    @property
+    def max_prefill_batch_size(self) -> int | None:
+        """Return an executor-specific prefill dispatch limit, if any."""
+        return None
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)

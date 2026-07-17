@@ -182,7 +182,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         parallel_config=parallel_config,
         executor_cls=_executor_cls_for_model_family(model_family),
         executor_kwargs=executor_kwargs,
-        runtime_config=_build_runtime_config(args),
+        runtime_config=_build_runtime_config(
+            args,
+            model_family=model_family,
+            config_data=model_config_data,
+        ),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
@@ -191,10 +195,30 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     )
 
 
-def _build_runtime_config(args: argparse.Namespace):
+def _build_runtime_config(
+    args: argparse.Namespace,
+    *,
+    model_family: str = "qwen",
+    config_data: dict[str, object] | None = None,
+):
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
+
+    kv_cache_groups = ()
+    if model_family == "deepseek_v4":
+        from pypto_serving.model.deepseek.npu_runner import build_deepseek_v4_cache_group_specs
+
+        config_data = config_data or {}
+        compress_ratios = config_data.get("compress_ratios")
+        if not isinstance(compress_ratios, list):
+            compress_ratios = None
+        num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
+        kv_cache_groups = build_deepseek_v4_cache_group_specs(
+            num_hidden_layers,
+            compress_ratios,
+            decode_batch=4 if args.enable_mtp else 8,
+        )
 
     return RuntimeConfig(
         page_size=args.block_size,
@@ -205,6 +229,7 @@ def _build_runtime_config(args: argparse.Namespace):
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        kv_cache_groups=kv_cache_groups,
     )
 
 
@@ -281,13 +306,21 @@ def _validate_model_topology(
         raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
     if args.block_size != 128:
         raise ValueError("DeepSeekV4 kernels require --block-size 128")
-    if args.max_num_seqs > 64:
-        raise ValueError("DeepSeekV4 decode kernels support at most --max-num-seqs 64")
-    if args.max_model_len > 260:
+    from pypto_serving.model.deepseek.npu_runner import DeepSeekV4CacheLayout
+
+    layout = DeepSeekV4CacheLayout()
+    max_global_batch = layout.ranks * layout.decode_batch
+    if args.max_num_seqs > max_global_batch:
+        raise ValueError(
+            "DeepSeekV4 decode kernels support at most "
+            f"--max-num-seqs {max_global_batch} ({layout.decode_batch} per rank)"
+        )
+    max_model_len = layout.prefill_csa_state_max_blocks * layout.c4_state_block_size
+    if args.max_model_len > max_model_len:
         raise ValueError(
             "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
-            "--max-model-len 260. Increase the decode CSA state table depth in pypto-lib "
-            "before serving longer contexts."
+            f"--max-model-len {max_model_len}. Increase the decode CSA state table depth "
+            "in pypto-lib before serving longer contexts."
         )
 
 
@@ -306,13 +339,13 @@ def run_serve(
     except ImportError as e:
         raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
 
-    from pypto_serving.model.tokenizer import TransformersTokenizerAdapter
+    from pypto_serving.model.tokenizer import load_tokenizer
     from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
     from pypto_serving.serving.server.server import create_serving_app
 
     model_id = config.model_id
     get_profiler(process_name="pypto-serving-api")
-    tokenizer = TransformersTokenizerAdapter.from_pretrained(config.model_dir)
+    tokenizer = load_tokenizer(config.model_dir)
     async_engine = AsyncLLMEngine(
         config=config,
         tokenizer=tokenizer,
