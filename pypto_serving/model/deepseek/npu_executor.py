@@ -35,6 +35,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_HC_MULT,
     DEEPSEEK_V4_IDX_HEAD_DIM,
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+    DEEPSEEK_V4_MAX_LOGIT_ROWS,
     DeepSeekV4CacheLayout,
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
@@ -569,8 +570,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         position ids, input ids), the RoPE tables and the compressor-state
         block tables are shared single per-rank copies, matching decode -- the kernel
         slices them per layer internally. Prefill runs final RMSNorm and emits
-        normalized hidden rows, then runs the device-side LM-head. It takes a
-        trailing ``num_tokens`` scalar.
+        normalized hidden rows, then runs the device-side LM-head using
+        owner-major token counts and selected logits-row metadata.
         """
         cfg = config_module.FLASH
         single = self._layer_common_dummy_tensors(
@@ -705,12 +706,18 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     dtype=torch.bfloat16,
                 ),
                 "hidden_out": torch.empty((ranks, seq, hidden), dtype=torch.bfloat16),
-                "logits": torch.empty((ranks, 1, model.config.vocab_size), dtype=torch.float32),
+                "logits": torch.empty(
+                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, model.config.vocab_size),
+                    dtype=torch.float32,
+                ),
+                "num_tokens_per_owner": torch.full((ranks,), seq, dtype=torch.int32),
+                "logit_row_indices": torch.zeros(
+                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), dtype=torch.int32
+                ),
+                "num_logit_rows": torch.ones((ranks,), dtype=torch.int32),
             }
         )
-        # The packed prefill kernel emits last-token device LM-head logits and
-        # takes a trailing INT32 ``num_tokens`` scalar.
-        return (*self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER), self._int32_arg(seq))
+        return self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER)
 
     def _decode_dummy_args(
         self,
@@ -885,11 +892,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 ),
                 "hidden_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
                 "logits": torch.empty((ranks, tokens, model.config.vocab_size), dtype=torch.float32),
+                "num_tokens_per_owner": torch.full((ranks,), tokens, dtype=torch.int32),
+                "logit_row_indices": torch.arange(tokens, dtype=torch.int32).expand(ranks, -1).contiguous(),
+                "num_logit_rows": torch.full((ranks,), tokens, dtype=torch.int32),
             }
         )
-        # The packed decode kernel takes a trailing INT32 ``num_tokens`` scalar
-        # (the real active token count), mirroring prefill.
-        return (*self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER), self._int32_arg(tokens))
+        return self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER)
 
     def _layer_common_dummy_tensors(
         self,
