@@ -48,14 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--devices",
         default=None,
-        help="Comma-separated NPU device ids for DP x TP placement, for example 0,1,2,3.",
+        help="Comma-separated NPU device ids for the requested parallel placement.",
     )
     parser.add_argument(
         "--data-parallel-size",
         "--dp",
         type=int,
         default=1,
-        help="Data-parallel replica count.",
+        help="Data-parallel size. DeepSeekV4 uses model-local attention DP.",
     )
     parser.add_argument(
         "--tensor-parallel-size",
@@ -63,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Tensor-parallel group size.",
+    )
+    parser.add_argument(
+        "--expert-parallel-size",
+        "--ep",
+        type=int,
+        default=1,
+        help="Expert-parallel group size.",
     )
     parser.add_argument(
         "--data-parallel-routing",
@@ -99,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
-    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 32).")
+    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 16).")
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
     parser.add_argument(
         "--long-prefill-token-threshold",
@@ -138,7 +145,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_dir = str(Path(args.model).resolve())
     executor_kwargs = _build_executor_kwargs()
     devices = parse_device_ids(args.devices, default_device=args.device)
-    model_family = _detect_model_family(Path(model_dir))
+    model_config_data = _read_model_config(Path(model_dir))
+    model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["enable_mtp"] = args.enable_mtp
@@ -147,12 +155,20 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        expert_parallel_size=args.expert_parallel_size,
+        enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
+        placement_mode="overlapped" if model_family == "deepseek_v4" else "replica",
     )
-    _validate_model_topology(model_family, args, parallel_config)
+    _validate_model_topology(
+        model_family,
+        args,
+        parallel_config,
+        config_data=model_config_data,
+    )
     first_group = parallel_config.replica_device_groups[0]
-    worker_device_ids = first_group if parallel_config.data_parallel_size == 1 else ()
+    worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     enable_prefix_cache = args.enable_prefix_caching
     if model_family == "deepseek_v4":
         enable_prefix_cache = False
@@ -203,15 +219,25 @@ def _build_executor_kwargs() -> dict[str, object]:
     return executor_kwargs
 
 
-def _detect_model_family(model_dir: Path) -> str:
-    """Return the serving model family inferred from config.json."""
+def _read_model_config(model_dir: Path) -> dict[str, object]:
+    """Read config.json once for model detection, validation, and runtime setup."""
     config_path = model_dir / "config.json"
     if not config_path.exists():
-        return "qwen"
+        return {}
     try:
-        config_data = json.loads(config_path.read_text())
-    except json.JSONDecodeError:
-        return "qwen"
+        data = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _detect_model_family(
+    model_dir: Path,
+    *,
+    config_data: dict[str, object] | None = None,
+) -> str:
+    """Return the serving model family inferred from config.json."""
+    config_data = _read_model_config(model_dir) if config_data is None else config_data
     model_type = str(config_data.get("model_type") or "").lower()
     architectures = {str(item).lower() for item in (config_data.get("architectures") or [])}
     if model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures:
@@ -230,19 +256,27 @@ def _validate_model_topology(
     model_family: str,
     args: argparse.Namespace,
     parallel_config,
+    *,
+    config_data: dict[str, object] | None = None,
 ) -> None:
     """Validate model-specific serving topology constraints."""
     if model_family != "deepseek_v4":
         return
-    config_data = json.loads((Path(args.model).resolve() / "config.json").read_text())
+    if config_data is None:
+        config_data = _read_model_config(Path(args.model).resolve())
     quantization = config_data.get("quantization_config") or {}
     if quantization.get("quant_method") != "compressed-tensors":
         raise ValueError(
             "DeepSeekV4 serving requires the quantized W8A8 compressed-tensors checkpoint "
             "such as /data/models/dsv4-flash-w8a8; the original checkpoint is too large for 8 NPUs."
         )
-    if parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size != 8:
-        raise ValueError("DeepSeekV4 serving requires --dp 1 --tp 8")
+    if (
+        parallel_config.placement_mode != "overlapped"
+        or parallel_config.data_parallel_size != 8
+        or parallel_config.expert_parallel_size != 8
+        or parallel_config.tensor_parallel_size != 1
+    ):
+        raise ValueError("DeepSeekV4 serving requires --dp 8 --ep 8 with --tp 1 (the default)")
     if len(parallel_config.devices) != 8:
         raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
     if args.block_size != 128:
@@ -300,6 +334,7 @@ def run_serve(
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
     print(f"  Platform: {config.platform}, Device groups: {_format_device_groups(config)}")
+    print(f"  Parallelism: {_format_parallelism(config)}")
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
@@ -315,6 +350,17 @@ def _format_device_groups(config: EngineConfig) -> str:
     if parallel_config is None:
         return str(list(config.worker_device_ids()))
     return str([list(group) for group in parallel_config.replica_device_groups])
+
+
+def _format_parallelism(config: EngineConfig) -> str:
+    parallel_config = config.parallel_config
+    if parallel_config is None:
+        return f"replicas=1, worker_group_size={len(config.worker_device_ids())}"
+    return (
+        f"mode={parallel_config.placement_mode}, replicas={parallel_config.num_replicas}, "
+        f"dp={parallel_config.data_parallel_size}, tp={parallel_config.tensor_parallel_size}, "
+        f"ep={parallel_config.expert_parallel_size}"
+    )
 
 
 def _validate_backend(backend: str) -> None:

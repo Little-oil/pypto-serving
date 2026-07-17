@@ -136,8 +136,8 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
         [
             "--model", str(model_dir),
             "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "1",
-            "--tp", "8",
+            "--dp", "8",
+            "--ep", "8",
             "--block-size", "128",
             "--max-model-len", "260",
             "--dtype", "int8",
@@ -149,6 +149,11 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
 
     assert config.executor_cls == "PyptoDeepSeekV4Executor"
     assert config.device_ids == (0, 1, 2, 3, 4, 5, 6, 7)
+    assert config.parallel_config.placement_mode == "overlapped"
+    assert config.parallel_config.num_replicas == 1
+    assert config.parallel_config.data_parallel_size == 8
+    assert config.parallel_config.tensor_parallel_size == 1
+    assert config.parallel_config.expert_parallel_size == 8
     assert config.parallel_config.replica_device_groups == ((0, 1, 2, 3, 4, 5, 6, 7),)
     assert config.runtime_config.page_size == 128
     assert config.runtime_config.weight_dtype == "int8"

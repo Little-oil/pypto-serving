@@ -13,11 +13,18 @@ from dataclasses import dataclass
 
 
 _SUPPORTED_ROUTING_POLICIES = {"least_pending_tokens"}
+_SUPPORTED_PLACEMENT_MODES = {"replica", "overlapped"}
 
 
 @dataclass(frozen=True)
 class ParallelConfig:
-    """Serving parallelism contract for logical model replicas."""
+    """Serving parallelism contract for replica and model-local rank groups.
+
+    ``replica`` placement keeps the historical serving contract: DP creates
+    independent model replicas and each replica owns one TP device group.
+    ``overlapped`` placement describes hybrid kernels whose DP, TP, and EP
+    axes reuse the same physical ranks, as DeepSeekV4 does.
+    """
 
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
@@ -27,6 +34,8 @@ class ParallelConfig:
     all2all_backend: str = "none"
     devices: tuple[int, ...] = (0,)
     data_parallel_routing: str = "least_pending_tokens"
+    expert_parallel_size: int = 1
+    placement_mode: str = "replica"
 
     def __post_init__(self) -> None:
         devices = tuple(int(device) for device in self.devices)
@@ -36,12 +45,40 @@ class ParallelConfig:
             raise ValueError("data_parallel_size must be >= 1")
         if self.tensor_parallel_size < 1:
             raise ValueError("tensor_parallel_size must be >= 1")
+        if self.expert_parallel_size < 1:
+            raise ValueError("expert_parallel_size must be >= 1")
         if self.pipeline_parallel_size < 1:
             raise ValueError("pipeline_parallel_size must be >= 1")
         if self.pipeline_parallel_size != 1:
             raise ValueError("pipeline_parallel_size > 1 is not supported yet")
-        if self.enable_expert_parallel:
-            raise ValueError("expert parallel is not supported yet")
+        if self.placement_mode not in _SUPPORTED_PLACEMENT_MODES:
+            supported = ", ".join(sorted(_SUPPORTED_PLACEMENT_MODES))
+            raise ValueError(
+                f"unsupported placement_mode={self.placement_mode!r}; supported modes: {supported}"
+            )
+        if self.placement_mode == "replica" and (
+            self.enable_expert_parallel or self.expert_parallel_size != 1
+        ):
+            raise ValueError("expert parallel requires overlapped placement")
+        if self.placement_mode == "overlapped":
+            if self.enable_expert_parallel != (self.expert_parallel_size > 1):
+                raise ValueError(
+                    "enable_expert_parallel must match expert_parallel_size > 1 "
+                    "for overlapped placement"
+                )
+            world_size = self.worker_group_size
+            axes = {
+                "data_parallel_size": self.data_parallel_size,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "expert_parallel_size": self.expert_parallel_size,
+            }
+            invalid = {name: size for name, size in axes.items() if size not in (1, world_size)}
+            if invalid:
+                details = ", ".join(f"{name}={size}" for name, size in invalid.items())
+                raise ValueError(
+                    "overlapped parallel axes must be singleton or span the full worker group: "
+                    + details
+                )
         if self.data_parallel_routing not in _SUPPORTED_ROUTING_POLICIES:
             supported = ", ".join(sorted(_SUPPORTED_ROUTING_POLICIES))
             raise ValueError(
@@ -53,35 +90,68 @@ class ParallelConfig:
         if len(set(devices)) != len(devices):
             raise ValueError(f"devices must not contain duplicates: {devices}")
 
-        expected_devices = self.data_parallel_size * self.tensor_parallel_size
+        expected_devices = self.num_replicas * self.worker_group_size
         if len(devices) != expected_devices:
             raise ValueError(
-                "number of devices must equal data_parallel_size * tensor_parallel_size: "
-                f"devices={len(devices)}, data_parallel_size={self.data_parallel_size}, "
-                f"tensor_parallel_size={self.tensor_parallel_size}"
+                "number of devices does not match the parallel placement: "
+                f"devices={len(devices)}, replicas={self.num_replicas}, "
+                f"worker_group_size={self.worker_group_size}, placement_mode={self.placement_mode!r}"
             )
 
     @property
+    def num_replicas(self) -> int:
+        """Return the number of independently routed serving replicas."""
+        if self.placement_mode == "overlapped":
+            return 1
+        return self.data_parallel_size
+
+    @property
+    def worker_group_size(self) -> int:
+        """Return the number of devices owned by one serving worker."""
+        if self.placement_mode == "overlapped":
+            return max(
+                self.data_parallel_size,
+                self.tensor_parallel_size,
+                self.expert_parallel_size,
+            )
+        return self.tensor_parallel_size
+
+    @property
     def replica_device_groups(self) -> tuple[tuple[int, ...], ...]:
-        """Return devices grouped by DP replica, each group being one TP group."""
+        """Return devices grouped by independently routed serving replica."""
         groups = []
-        for dp_rank in range(self.data_parallel_size):
-            start = dp_rank * self.tensor_parallel_size
-            end = start + self.tensor_parallel_size
+        for replica_rank in range(self.num_replicas):
+            start = replica_rank * self.worker_group_size
+            end = start + self.worker_group_size
             groups.append(self.devices[start:end])
         return tuple(groups)
 
     def for_replica(self, device_group: tuple[int, ...]) -> "ParallelConfig":
-        """Return a single-DP-replica view for one worker process."""
+        """Return the parallel topology visible to one serving worker."""
+        if self.placement_mode == "overlapped":
+            return ParallelConfig(
+                data_parallel_size=self.data_parallel_size,
+                tensor_parallel_size=self.tensor_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                enable_expert_parallel=self.enable_expert_parallel,
+                expert_placement_strategy=self.expert_placement_strategy,
+                all2all_backend=self.all2all_backend,
+                devices=device_group,
+                data_parallel_routing=self.data_parallel_routing,
+                placement_mode=self.placement_mode,
+            )
         return ParallelConfig(
             data_parallel_size=1,
             tensor_parallel_size=len(device_group),
+            expert_parallel_size=1,
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             expert_placement_strategy=self.expert_placement_strategy,
             all2all_backend=self.all2all_backend,
             devices=device_group,
             data_parallel_routing=self.data_parallel_routing,
+            placement_mode=self.placement_mode,
         )
 
 
