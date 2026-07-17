@@ -12,14 +12,19 @@ the same eight physical ranks, so this is one model replica rather than eight
 independent serving replicas:
 
 ```bash
-task-submit --device 8,9,10,11,12,13,14,15 --max-time 0 --timeout 0 --ptoas 0.48 --run "PYPTO_RUNTIME_LOG=error PTO2_RING_DEP_POOL=131072 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_HEAP=2147483648 PTO2_OP_EXECUTE_TIMEOUT_US=400000000 PTO2_STREAM_SYNC_TIMEOUT_MS=440000 PTO2_SCHEDULER_TIMEOUT_MS=320000 SERVING_WORKER_STEP_TIMEOUT=1800 pypto-serving --model /data/models/dsv4-flash-w8a8 --served-model-name dsv4-flash-w8a8 --backend npu --platform a2a3 --devices 8,9,10,11,12,13,14,15 --dp 8 --ep 8 --tp 1 --block-size 128 --max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 512 --long-prefill-token-threshold 2048 --no-enable-prefix-caching --port 8225 --show-startup-logs"
+task-submit --device 8,9,10,11,12,13,14,15 --max-time 0 --timeout 0 --ptoas 0.48 --run "PYPTO_RUNTIME_LOG=error PTO2_RING_DEP_POOL=131072 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_HEAP=2147483648 PTO2_OP_EXECUTE_TIMEOUT_US=400000000 PTO2_STREAM_SYNC_TIMEOUT_MS=440000 PTO2_SCHEDULER_TIMEOUT_MS=320000 SERVING_WORKER_STEP_TIMEOUT=1800 pypto-serving --model /data/models/dsv4-flash-w8a8 --served-model-name dsv4-flash-w8a8 --backend npu --platform a2a3 --devices 8,9,10,11,12,13,14,15 --dp 8 --ep 8 --tp 1 --block-size 128 --max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 512 --long-prefill-token-threshold 2048 --enable-mtp --no-enable-prefix-caching --port 8225 --show-startup-logs"
 ```
 
 Each NPU runs one prefill row at a time, so DP=8 admits up to eight prefill
-requests in one global step. Decode uses B4S2 on each rank, for a maximum of 32
-global active rows. The scheduler may admit fewer long-context requests when a
-rank's fixed pypto-lib cache pools are full. MTP currently supports one global
-request; add `--enable-mtp --max-num-seqs 1` when testing that path.
+requests in one global step. MTP decode uses B4S2 on each rank, for a maximum of
+32 global active rows. The scheduler may admit fewer long-context requests when
+a rank's fixed pypto-lib cache pools are full.
+
+MTP prefill context, draft token, committed tail, and acceptance counters are
+owned by request ID. MTP prefill and decode share one worker-resident cache, but
+each request addresses it with the scheduler-owned rank-local `ori` block IDs.
+The scheduler reserves the extra speculative position before dispatch, including
+when a draft crosses a 128-token page boundary.
 
 The seven main-model KV/state pools are allocated during runner preflight as
 rank-sharded worker-resident tensors. Prefill and decode pass the same device

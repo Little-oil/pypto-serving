@@ -121,6 +121,8 @@ class RuntimeConfig:
     max_num_batched_tokens: int = 4096
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
+    # Extra cache positions and execution tokens reserved for speculative decode.
+    num_speculative_tokens: int = 0
     # Model-specific cache families. Empty means the generic single KV pool.
     kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
 

@@ -229,6 +229,7 @@ def _build_runtime_config(
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        num_speculative_tokens=1 if args.enable_mtp else 0,
         kv_cache_groups=kv_cache_groups,
     )
 

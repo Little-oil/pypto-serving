@@ -48,6 +48,11 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    num_speculative_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_speculative_tokens < 0:
+            raise ValueError("num_speculative_tokens must be non-negative")
 
 
 @dataclass
@@ -220,7 +225,18 @@ class Scheduler:
                 running_to_keep.append(request)
                 continue
 
-            if not self._try_allocate_request_blocks(request, num_new):
+            is_prefill = request.is_prefill
+            speculative_tokens = (
+                self.config.num_speculative_tokens
+                if not is_prefill and request.temperature <= 0.0
+                else 0
+            )
+            scheduled_tokens = num_new + speculative_tokens
+            if scheduled_tokens > token_budget:
+                running_to_keep.append(request)
+                continue
+
+            if not self._try_allocate_request_blocks(request, scheduled_tokens):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
@@ -229,11 +245,10 @@ class Scheduler:
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
                 output.preempted_requests.append(preempted["request"])
-                if not self._try_allocate_request_blocks(request, num_new):
+                if not self._try_allocate_request_blocks(request, scheduled_tokens):
                     running_to_keep.append(request)
                     continue
 
-            is_prefill = request.is_prefill
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
             output.scheduled_requests.append(
                 ScheduledRequest(
@@ -250,12 +265,12 @@ class Scheduler:
                 )
             )
             scheduled_req_ids.add(request.request_id)
-            num_scheduled_tokens[request.request_id] = num_new
+            num_scheduled_tokens[request.request_id] = scheduled_tokens
             if is_prefill:
                 output.num_prefill_tokens += num_new
             else:
-                output.num_decode_tokens += num_new
-            token_budget -= num_new
+                output.num_decode_tokens += scheduled_tokens
+            token_budget -= scheduled_tokens
             running_to_keep.append(request)
 
         self.running = running_to_keep

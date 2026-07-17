@@ -104,6 +104,63 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+def test_scheduler_reserves_cache_and_budget_for_speculative_token():
+    manager = KvCacheManager(num_blocks=4, block_size=4, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=2,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    initial_blocks = manager.allocate_block_ids(1)
+    assert initial_blocks is not None
+    request = Request(
+        request_id="speculative",
+        prompt_token_ids=[1, 2, 3],
+        max_new_tokens=4,
+        num_computed_tokens=3,
+        output_token_ids=[4],
+        allocated_block_ids=initial_blocks,
+        status=RequestStatus.RUNNING,
+        temperature=0.0,
+    )
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_requests) == 1
+    assert output.scheduled_requests[0].num_new_tokens == 1
+    assert output.num_decode_tokens == 2
+    assert len(request.allocated_block_ids) == 2
+
+
+def test_scheduler_does_not_dispatch_speculative_decode_without_pair_budget():
+    manager = KvCacheManager(num_blocks=4, block_size=4, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=1,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    request = Request(
+        request_id="speculative",
+        prompt_token_ids=[1],
+        max_new_tokens=4,
+        num_computed_tokens=1,
+        output_token_ids=[2],
+        status=RequestStatus.RUNNING,
+        temperature=0.0,
+    )
+    scheduler.running.append(request)
+
+    assert scheduler.schedule().is_empty
+
+
 def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)

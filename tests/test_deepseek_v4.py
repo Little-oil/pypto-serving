@@ -89,6 +89,7 @@ def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
         (),
         {
             "actual_batch": 1,
+            "request_ids": ("req-a",),
             "ranks": (0,),
             "local_rows": (0,),
             "position_ids": torch.tensor(
@@ -102,37 +103,133 @@ def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
         runner._compiled.layout.ranks * runner._compiled.layout.decode_seq * 4,
         dtype=torch.float32,
     ).reshape(runner._compiled.layout.ranks, runner._compiled.layout.decode_seq, 4, 1)
-    tail_hidden = torch.full(
-        (runner._compiled.layout.ranks, 4, 1),
-        99.0,
-        dtype=torch.float32,
+    tail_hidden = torch.full((4, 1), 99.0, dtype=torch.float32)
+    runner._mtp_request_states["req-a"] = npu_runner._DeepSeekV4MtpRequestState(
+        tail_token_id=9,
+        tail_pre_hc_hidden=tail_hidden,
+        tail_position=6,
     )
-    runner._mtp_tail_token_id = torch.tensor([9], dtype=torch.long)
-    runner._mtp_tail_pre_hc_hidden = tail_hidden
-    runner._mtp_tail_position = torch.tensor([6], dtype=torch.int32)
 
     committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
         main_pre_hc,
+        request_index=0,
         accepted_count=1,
     )
 
     assert committed_ids.tolist() == [9, 11]
     assert committed_positions.tolist() == [6, 7]
-    torch.testing.assert_close(committed_hidden[:, 0], tail_hidden)
-    torch.testing.assert_close(committed_hidden[:, 1], main_pre_hc[:, 0])
+    torch.testing.assert_close(committed_hidden[0], tail_hidden)
+    torch.testing.assert_close(committed_hidden[1], main_pre_hc[0, 0])
 
     committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
         main_pre_hc,
+        request_index=0,
         accepted_count=2,
     )
 
     assert committed_ids.tolist() == [11, 12]
     assert committed_positions.tolist() == [7, 8]
-    torch.testing.assert_close(committed_hidden, main_pre_hc)
+    torch.testing.assert_close(committed_hidden, main_pre_hc[0])
+
+
+def test_deepseek_mtp_decode_packs_request_local_state_and_scheduler_blocks():
+    layout = DeepSeekV4CacheLayout(ranks=2, decode_batch=2, decode_seq=2, decode_tokens=4)
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
+            embedding_weight=torch.arange(32, dtype=torch.float32).reshape(32, 1),
+        )
+    )
+    runner._mtp_request_states.update(
+        {
+            "req-a": npu_runner._DeepSeekV4MtpRequestState(
+                draft_token_id=10,
+                tail_token_id=9,
+                tail_pre_hc_hidden=torch.full((4, 1), 90.0),
+                tail_position=6,
+            ),
+            "req-b": npu_runner._DeepSeekV4MtpRequestState(
+                draft_token_id=20,
+                tail_token_id=19,
+                tail_pre_hc_hidden=torch.full((4, 1), 190.0),
+                tail_position=16,
+            ),
+        }
+    )
+    buffers = type(
+        "MtpBuffers",
+        (),
+        {
+            "decode_input_ids": torch.zeros((2, 4), dtype=torch.long),
+            "decode_hidden_in": torch.zeros((2, 4, 1), dtype=torch.bfloat16),
+            "decode_prev_hidden_in": torch.zeros((2, 4, 4, 1), dtype=torch.float32),
+            "decode_position_ids": torch.zeros((2, 4), dtype=torch.int32),
+            "decode_slot_mapping": torch.zeros((2, 4), dtype=torch.long),
+            "decode_swa_indices": torch.zeros((2, 4, 128), dtype=torch.int32),
+            "decode_swa_lens": torch.zeros((2, 4), dtype=torch.int32),
+            "decode_hidden_out": torch.zeros((2, 4, 1), dtype=torch.bfloat16),
+            "decode_pre_hc_out": torch.zeros((2, 4, 4, 1), dtype=torch.float32),
+        },
+    )()
+    runner._mtp_buffers = buffers
+    runner._mtp_decode_args = lambda: ()
+    scalar_args = []
+    runner._run_l3 = lambda *args: scalar_args.append(args[-1])
+
+    def fake_logits(hidden, *, owner_rows, label):
+        assert hidden is buffers.decode_hidden_out
+        assert owner_rows == ((0, 1), (1, 1))
+        assert label == "mtp.decode"
+        logits = torch.zeros((2, 32), dtype=torch.float32)
+        logits[0, 30] = 1
+        logits[1, 31] = 1
+        return logits
+
+    runner._logits_for_hidden = fake_logits
+    inputs = type(
+        "PreparedInputs",
+        (),
+        {
+            "actual_batch": 2,
+            "request_ids": ("req-a", "req-b"),
+            "ranks": (0, 1),
+            "local_rows": (0, 0),
+            "per_rank_counts": (1, 1),
+            "position_ids": torch.tensor([[7, 8, 0, 0], [17, 18, 0, 0]], dtype=torch.int32),
+            "block_ids_by_group": ({"ori": (3,)}, {"ori": (5,)}),
+        },
+    )()
+    main_ids = torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+    main_pre_hc = torch.arange(2 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4, 1)
+
+    runner._advance_mtp_drafts(
+        inputs,
+        main_ids,
+        main_pre_hc,
+        accepted_counts=(2, 1),
+    )
+
+    assert scalar_args == [2]
+    assert buffers.decode_input_ids[0, :2].tolist() == [11, 12]
+    assert buffers.decode_input_ids[1, :2].tolist() == [19, 21]
+    assert buffers.decode_slot_mapping[0, :2].tolist() == [3 * 128 + 7, 3 * 128 + 8]
+    assert buffers.decode_slot_mapping[1, :2].tolist() == [5 * 128 + 16, 5 * 128 + 17]
+    assert runner._mtp_drafts_for_requests(("req-b", "req-a")).tolist() == [31, 30]
+    assert runner._mtp_request_states["req-a"].tail_token_id == 12
+    assert runner._mtp_request_states["req-a"].tail_position == 8
+    assert runner._mtp_request_states["req-b"].tail_token_id == 21
+    assert runner._mtp_request_states["req-b"].tail_position == 17
 
 
 def _group_block_ids(block_id: int) -> dict[str, list[int]]:
@@ -173,6 +270,7 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.parallel_config.replica_device_groups == ((0, 1, 2, 3, 4, 5, 6, 7),)
     assert config.runtime_config.page_size == 128
     assert config.runtime_config.weight_dtype == "int8"
+    assert config.runtime_config.num_speculative_tokens == 1
     assert tuple(group.name for group in config.runtime_config.kv_cache_groups) == (
         "ori",
         "cmp",
@@ -1934,10 +2032,17 @@ def test_deepseek_release_invalidates_only_finished_cache_owner():
             "request-b": {"ori": {1}},
         }
     )
+    runner._mtp_request_states.update(
+        {
+            "request-a": npu_runner._DeepSeekV4MtpRequestState(draft_token_id=1),
+            "request-b": npu_runner._DeepSeekV4MtpRequestState(draft_token_id=2),
+        }
+    )
 
     runner.release_finished_requests(["request-a"])
 
     assert runner._decode_cache_block_ids == {"request-b": {"ori": {1}}}
+    assert set(runner._mtp_request_states) == {"request-b"}
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:
