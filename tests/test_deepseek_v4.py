@@ -867,68 +867,6 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
         assert getattr(staged, name).is_shared()
 
 
-def test_deepseek_keeps_stacked_weights_in_prefork_cpu_memory():
-    runner, model = _runner_for_prepared_inputs()
-    weight = torch.arange(16, dtype=torch.int8).reshape(2, 8)
-    stacked = weight_loader.DeepSeekV4StackedLayerWeights(tensors={"small_weight": weight})
-    runner.load_packed_global_weights = lambda: None
-    runner._static_freqs_cos_tensor = lambda: None
-    runner._static_freqs_sin_tensor = lambda: None
-    runner._ensure_decode_buffers = lambda _hidden_size: None
-    runner._ensure_decode_work_cache = lambda: None
-    runner._require_prefill_output_buffer = lambda _hidden_size: None
-    runner._static_final_norm_weight_tensor = lambda: None
-    runner.load_stacked_layer_weights = lambda: stacked
-    runner._hc_head_tensors = lambda: None
-    runner._ensure_prefill_fwd_buffers = lambda _hidden_size: None
-    runner._assert_l3_shared_buffers_preallocated = lambda: None
-
-    runner._ensure_l3_shared_buffers(model)
-
-    assert runner._stacked_weight_buffers == {"small_weight": weight}
-    assert not weight.is_shared()
-
-
-def test_deepseek_registers_inherited_weights_before_distributed_worker_fork(monkeypatch):
-    import pypto.runtime
-    from types import SimpleNamespace
-
-    runner, _model = _runner_for_prepared_inputs()
-    weight = torch.arange(16, dtype=torch.int8).reshape(2, 8)
-    mtp_weight = torch.arange(8, dtype=torch.int8).reshape(2, 4)
-    runner._stacked_weight_buffers = {"small_weight": weight}
-    runner._mtp_buffers = SimpleNamespace(weights={"small_mtp_weight": mtp_weight})
-    runner._compiled.prefill = DeepSeekV4L3Callable(compiled=object(), name="prefill")
-    runner._compiled.mtp_prefill = DeepSeekV4L3Callable(compiled=object(), name="mtp_prefill")
-    runner._assert_l3_shared_buffers_preallocated = lambda: None
-    captured: dict[str, object] = {}
-
-    class _DistributedWorker:
-        def __init__(self, compiled, *, inherited_host_tensors):
-            captured["compiled"] = compiled
-            captured["inherited"] = inherited_host_tensors
-
-        def run(self, compiled, *args, **kwargs):
-            captured["dispatch"] = (compiled, args, kwargs)
-            return "ok"
-
-    monkeypatch.setattr(pypto.runtime, "DistributedWorker", _DistributedWorker)
-
-    worker = runner._shared_l3_worker()
-
-    assert worker is runner._l3_worker
-    assert captured["compiled"] == [
-        runner._compiled.prefill.compiled,
-        runner._compiled.mtp_prefill.compiled,
-    ]
-    assert captured["inherited"] == (weight, mtp_weight)
-    assert runner._run_l3(runner._compiled.prefill, weight) == "ok"
-    dispatched_compiled, dispatched_args, dispatched_kwargs = captured["dispatch"]
-    assert dispatched_compiled is runner._compiled.prefill.compiled
-    assert dispatched_args[0] is weight
-    assert dispatched_kwargs == {}
-
-
 def test_deepseek_run_decode_dispatches_active_token_count():
     from types import SimpleNamespace
 
@@ -1075,16 +1013,12 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
             mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
         )
     )
-    weight = torch.arange(4, dtype=torch.int8).reshape(1, 4)
-    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={"small_weight": weight})
+    runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={})
 
     buffers = runner._ensure_mtp_buffers(hidden_size=1)
 
     assert buffers is not None
-    assert buffers.weights["small_weight"] is weight
-    assert not weight.is_shared()
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
-    assert buffers.prefill_kv_cache.is_shared()
 
 
 def test_deepseek_unified_cache_zeroing_is_isolated_by_slot():
