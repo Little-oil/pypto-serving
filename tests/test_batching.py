@@ -48,6 +48,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
+from pypto_serving.serving.server.ipc import DecodeRequest, NewRequestData
 from pypto_serving.serving.server.serving_worker import WorkerProcess
 from pypto_serving.worker.worker import WorkerTensor
 
@@ -591,25 +592,29 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
     worker.executor = executor
     worker.sampler = _FailingSampler()
     worker.model_record = SimpleNamespace(config=model.config)
+    worker._req_cache = {
+        "decode": NewRequestData(
+            request_id="decode",
+            prompt_token_ids=[1],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=None,
+        )
+    }
 
-    request = Request(
+    # last_token=3 (the one output token), prev_token=prompt_ids[-1]=1, seq_len=2.
+    decode_req = DecodeRequest(
         request_id="decode",
-        prompt_token_ids=[1],
-        max_new_tokens=2,
-        temperature=0.0,
-    )
-    request.output_token_ids.append(3)
-    scheduled = ScheduledRequest(
-        request=request,
-        num_new_tokens=1,
-        is_prefill=False,
+        last_token=3,
+        prev_token=1,
+        seq_len=2,
         block_ids=[0],
     )
-    new_tokens: dict[str, int] = {}
+    new_tokens: dict[str, list[int]] = {}
 
-    worker._batch_decode([scheduled], model, new_tokens)
+    worker._batch_decode([decode_req], model, new_tokens)
 
-    assert new_tokens == {"decode": 0}
+    assert new_tokens == {"decode": [0]}
     assert executor.decode_calls == 1
     assert executor.decode_hidden_seen[0] is None
 

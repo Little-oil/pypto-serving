@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
-from pypto_serving.config.types import RuntimeConfig, StepOutput, WorkerCommand
+from pypto_serving.config.types import RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
@@ -28,6 +28,16 @@ from pypto_serving.serving.sched.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulerOutput,
+)
+from pypto_serving.serving.server.ipc import (
+    DecodeRequest,
+    NewRequestData,
+    PrefillRequest,
+    ShutdownCommand,
+    StepCommand,
+    StepResult,
+    decode_result,
+    encode_command,
 )
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from pypto_serving.tools.profile import profile_instant, profile_span
@@ -173,6 +183,9 @@ class ReplicaEngineCore:
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
+        # Tracks which request_ids the worker has already received via
+        # NewRequestData — prompt tokens are sent exactly once per request.
+        self._worker_known_req_ids: set[str] = set()
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -332,18 +345,13 @@ class ReplicaEngineCore:
                 cat="scheduler",
                 args={"scheduled": len(scheduler_output.scheduled_requests)},
             ):
-                self._input_queue.put(
-                    WorkerCommand(
-                        type="step",
-                        scheduler_output=scheduler_output,
-                        finished_request_ids=finished_ids or None,
-                    )
-                )
+                step_cmd = self._build_step_command(scheduler_output, finished_ids)
+                self._input_queue.put(encode_command(step_cmd))
 
             try:
                 with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                     step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
-                    step_output: StepOutput = await asyncio.to_thread(
+                    raw_output = await asyncio.to_thread(
                         self._output_queue.get, timeout=step_timeout
                     )
             except queue.Empty:
@@ -351,27 +359,118 @@ class ReplicaEngineCore:
                 self._handle_step_error(scheduler_output)
                 continue
 
-            if step_output.error:
-                logger.error(f"Worker returned error: {step_output.error}")
+            step_result = decode_result(raw_output)
+            error = step_result.error
+            # Unwrap list[int] values back to int | list[int] for update_from_output.
+            new_tokens: dict[str, int | list[int]] = {
+                req_id: (tokens[0] if len(tokens) == 1 else tokens)
+                for req_id, tokens in step_result.new_tokens.items()
+            }
+
+            if error:
+                logger.error(f"Worker returned error: {error}")
                 self._handle_step_error(scheduler_output)
                 continue
 
             with profile_span(
                 "scheduler.process_step_output",
                 cat="scheduler",
-                args={"new_tokens": len(step_output.new_tokens)},
+                args={"new_tokens": len(new_tokens)},
             ):
-                self._process_step_output(scheduler_output, step_output)
+                self._process_step_output(scheduler_output, new_tokens)
 
         logger.info("Engine loop stopped")
 
+    def _build_step_command(
+        self,
+        scheduler_output: SchedulerOutput,
+        finished_ids: list[str],
+    ) -> StepCommand:
+        """Build a lightweight StepCommand from the scheduler output.
+
+        Prompt tokens for requests that the worker has not yet seen are shipped
+        as ``NewRequestData`` entries exactly once; subsequent steps carry only
+        per-request deltas (~1 KB total at batch 16).
+        """
+        new_requests: list[NewRequestData] = []
+        prefill_requests: list[PrefillRequest] = []
+        decode_requests: list[DecodeRequest] = []
+
+        for sr in scheduler_output.scheduled_requests:
+            req = sr.request
+            req_id = req.request_id
+
+            # Register with worker the first time this request is scheduled.
+            if req_id not in self._worker_known_req_ids:
+                new_requests.append(NewRequestData(
+                    request_id=req_id,
+                    prompt_token_ids=list(req.prompt_token_ids),
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                ))
+                self._worker_known_req_ids.add(req_id)
+
+            if sr.is_prefill:
+                num_computed = sr.num_computed_tokens
+                num_new = sr.num_new_tokens
+                chunk_tokens = req.prompt_token_ids[num_computed: num_computed + num_new]
+                prefill_requests.append(PrefillRequest(
+                    request_id=req_id,
+                    chunk_tokens=list(chunk_tokens),
+                    num_computed_tokens=num_computed,
+                    block_ids=list(sr.block_ids),
+                ))
+            else:
+                output_ids = req.output_token_ids
+                prompt_ids = req.prompt_token_ids
+                last_token = output_ids[-1] if output_ids else prompt_ids[-1]
+                if len(output_ids) >= 2:
+                    prev_token = output_ids[-2]
+                elif output_ids and prompt_ids:
+                    prev_token = prompt_ids[-1]
+                else:
+                    prev_token = last_token
+                decode_requests.append(DecodeRequest(
+                    request_id=req_id,
+                    last_token=last_token,
+                    prev_token=prev_token,
+                    seq_len=req.num_tokens,
+                    block_ids=list(sr.block_ids),
+                ))
+
+        # Remove finished requests from the known-set so they are re-registered
+        # if the same request_id is ever reused (unlikely but correct).
+        for req_id in finished_ids:
+            self._worker_known_req_ids.discard(req_id)
+
+        return StepCommand(
+            new_requests=new_requests,
+            prefill_requests=prefill_requests,
+            decode_requests=decode_requests,
+            finished_request_ids=finished_ids,
+        )
+
+    def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
+        """On worker error, abort all requests in the failed batch."""
+        for sr in scheduler_output.scheduled_requests:
+            request_id = sr.request.request_id
+            ctx = self._request_contexts.get(request_id)
+            if ctx is not None:
+                ctx.queue.put_nowait(
+                    TokenOutput(finished=True, finish_reason="error")
+                )
+            if request_id not in self._pending_free_ids:
+                self._pending_free_ids.append(request_id)
+            self.scheduler.abort_request(request_id)
+
     def _process_step_output(
-        self, scheduler_output: SchedulerOutput, step_output: StepOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        new_tokens: dict[str, int | list[int]],
     ) -> None:
         """Process worker results: update scheduler state, push tokens to request queues."""
-        request_outputs = self.scheduler.update_from_output(
-            scheduler_output, step_output.new_tokens
-        )
+        request_outputs = self.scheduler.update_from_output(scheduler_output, new_tokens)
 
         for req_output in request_outputs:
             ctx = self._request_contexts.get(req_output.request_id)
@@ -403,26 +502,14 @@ class ReplicaEngineCore:
             )
             ctx.queue.put_nowait(token_output)
 
-    def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
-        """On worker error, abort all requests in the failed batch."""
-        for sr in scheduler_output.scheduled_requests:
-            request_id = sr.request.request_id
-            ctx = self._request_contexts.get(request_id)
-            if ctx is not None:
-                ctx.queue.put_nowait(
-                    TokenOutput(finished=True, finish_reason="error")
-                )
-            if request_id not in self._pending_free_ids:
-                self._pending_free_ids.append(request_id)
-            self.scheduler.abort_request(request_id)
-
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue
         process = self._worker_process
 
         if input_q is not None:
             with contextlib.suppress(Exception):
-                input_q.put(WorkerCommand(type="shutdown"))
+                # New protocol: send encoded ShutdownCommand bytes.
+                input_q.put(encode_command(ShutdownCommand()))
 
         if process is not None:
             with contextlib.suppress(Exception):
