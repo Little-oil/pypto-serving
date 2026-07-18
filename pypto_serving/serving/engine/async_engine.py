@@ -121,6 +121,17 @@ class EngineConfig:
 class _RequestContext:
     request: Request
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # When False (non-streaming), intermediate TokenOutputs are suppressed and
+    # only the final one is enqueued — one queue push / one HTTP wake-up per
+    # request instead of one per token. Stop-string detection still runs every
+    # step; only publishing is deferred (cf. vLLM's FINAL_ONLY output kind).
+    stream: bool = True
+    # Incremental-detokenization state (avoids re-decoding the full output each
+    # step, which would be O(N^2) over a generation). detok_text is the running
+    # cumulative text; the offsets bound the per-step decode window.
+    detok_text: str = ""
+    detok_prefix_offset: int = 0
+    detok_read_offset: int = 0
 
 
 @dataclass
@@ -283,7 +294,7 @@ class ReplicaEngineCore:
                 top_k=config.top_k,
             )
 
-            ctx = _RequestContext(request=request)
+            ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
             logger.info(
@@ -477,9 +488,7 @@ class ReplicaEngineCore:
             if ctx is None:
                 continue
 
-            text = ""
-            if ctx.request.output_token_ids:
-                text = self.tokenizer.decode(ctx.request.output_token_ids)
+            text = self._detokenize_incrementally(ctx)
 
             if not req_output.finished and ctx.request.stop_strings:
                 for stop in ctx.request.stop_strings:
@@ -494,6 +503,13 @@ class ReplicaEngineCore:
             if req_output.finished:
                 self._pending_free_ids.append(req_output.request_id)
 
+            # Non-streaming requests only need the final output: suppress
+            # intermediate ones to save a queue push and HTTP-coroutine wake-up
+            # per token. Detok + stop detection above still ran this step, so the
+            # final text is complete.
+            if not ctx.stream and not req_output.finished:
+                continue
+
             token_output = TokenOutput(
                 token_id=req_output.new_token_id,
                 text=text,
@@ -501,6 +517,37 @@ class ReplicaEngineCore:
                 finish_reason=req_output.finish_reason,
             )
             ctx.queue.put_nowait(token_output)
+
+    def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
+        """Decode only the newly-completed text and append it to the running text.
+
+        O(1) amortized per step (bounded decode window) instead of re-decoding
+        the full output_token_ids every step (O(N^2) over a generation).
+        Returns the cumulative decoded text so far.
+        """
+        output_ids = ctx.request.output_token_ids
+        if not output_ids:
+            return ctx.detok_text
+
+        # Decode a short window: [prefix_offset:] gives context so the delta is
+        # rendered identically to a full decode; the delta is the tail beyond
+        # what [prefix_offset:read_offset] already covered.
+        prefix_ids = output_ids[ctx.detok_prefix_offset: ctx.detok_read_offset]
+        new_ids = output_ids[ctx.detok_prefix_offset:]
+
+        prefix_text = self.tokenizer.decode(prefix_ids) if prefix_ids else ""
+        new_text = self.tokenizer.decode(new_ids)
+
+        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+            # No new complete text yet (e.g. mid multi-token character); wait for
+            # more tokens without advancing offsets.
+            return ctx.detok_text
+
+        delta = new_text[len(prefix_text):]
+        ctx.detok_text += delta
+        ctx.detok_prefix_offset = ctx.detok_read_offset
+        ctx.detok_read_offset = len(output_ids)
+        return ctx.detok_text
 
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue

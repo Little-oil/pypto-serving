@@ -37,11 +37,16 @@ from pypto_serving.model.qwen.npu_runner import (
     _kernel_trace_name,
     _run_timing_us,
 )
-from pypto_serving.serving.engine.async_engine import ReplicaEngineCore, TokenOutput
+from pypto_serving.serving.engine.async_engine import (
+    ReplicaEngineCore,
+    TokenOutput,
+    _RequestContext,
+)
 from pypto_serving.serving.engine.engine import LLMEngine
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
+    RequestOutput,
     RequestStatus,
     ScheduledRequest,
     Scheduler,
@@ -617,6 +622,168 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
     assert new_tokens == {"decode": [0]}
     assert executor.decode_calls == 1
     assert executor.decode_hidden_seen[0] is None
+
+
+def test_incremental_detok_matches_full_decode_and_hides_partial_chars():
+    """Incremental detok must equal a full decode and never stream a partial char.
+
+    Guards the O(N^2) -> O(N) detokenization fix: cumulative text produced step
+    by step must match tokenizer.decode(all_ids), and an incomplete multi-token
+    character (rendered as U+FFFD) must be withheld until it completes.
+    """
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+
+    class _MultiByteTokenizer:
+        # tokens 6+7 together render '★'; 6 alone is an incomplete char.
+        _table = {1: "He", 2: "llo", 3: " wor", 4: "ld", 5: "!"}
+
+        def decode(self, ids):
+            out, i = [], 0
+            while i < len(ids):
+                t = ids[i]
+                if t == 6:
+                    if i + 1 < len(ids) and ids[i + 1] == 7:
+                        out.append("★"); i += 2; continue
+                    out.append("�"); i += 1; continue
+                if t == 7:
+                    out.append("★"); i += 1; continue
+                out.append(self._table[t]); i += 1
+            return "".join(out)
+
+    core.tokenizer = _MultiByteTokenizer()
+    ctx = _RequestContext(request=SimpleNamespace(output_token_ids=[]))
+
+    seq = [1, 2, 3, 4, 5, 6, 7]
+    cumulative = ""
+    per_step = []
+    for k in range(1, len(seq) + 1):
+        ctx.request.output_token_ids = seq[:k]
+        cumulative = core._detokenize_incrementally(ctx)
+        per_step.append(cumulative)
+
+    # No partial char ever leaked, and the final text equals a full decode.
+    assert all("�" not in text for text in per_step)
+    assert per_step[4] == "Hello world!"       # step 6 (idx 5) withholds partial
+    assert per_step[5] == "Hello world!"        # still withheld
+    assert cumulative == core.tokenizer.decode(seq) == "Hello world!★"
+
+
+class _ScriptedScheduler:
+    """Stub scheduler: returns one preset RequestOutput per _process_step_output call."""
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.finished = []
+
+    def update_from_output(self, scheduler_output, new_tokens):
+        return [self._outputs.pop(0)]
+
+    def finish_request(self, request_id, status):
+        self.finished.append((request_id, status))
+
+
+class _WordTokenizer:
+    _table = {1: "a", 2: "b", 3: "c", 4: "STOP"}
+
+    def decode(self, ids):
+        return "".join(self._table[t] for t in ids)
+
+
+def _drive(core, ctx, token_ids):
+    """Append each token and run one _process_step_output step per token."""
+    for t in token_ids:
+        ctx.request.output_token_ids.append(t)
+        core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+
+
+def test_non_streaming_suppresses_intermediate_outputs():
+    """A non-streaming request enqueues exactly one (final) TokenOutput; a
+    streaming request enqueues one per token."""
+    seq = [1, 2, 3]
+
+    # --- non-streaming: stream=False -> only the final token is published ---
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _WordTokenizer()
+    core._pending_free_ids = []
+    outputs = [
+        RequestOutput(request_id="r", new_token_id=1),
+        RequestOutput(request_id="r", new_token_id=2),
+        RequestOutput(request_id="r", new_token_id=3, finished=True, finish_reason="FINISHED_LENGTH"),
+    ]
+    core.scheduler = _ScriptedScheduler(outputs)
+    ns_ctx = _RequestContext(
+        request=Request(request_id="r", prompt_token_ids=[9], max_new_tokens=3),
+        stream=False,
+    )
+    core._request_contexts = {"r": ns_ctx}
+
+    _drive(core, ns_ctx, seq)
+
+    assert ns_ctx.queue.qsize() == 1
+    final = ns_ctx.queue.get_nowait()
+    assert final.finished is True
+    assert final.text == "abc"                 # full cumulative text on the final output
+    assert "r" in core._pending_free_ids
+
+    # --- streaming: stream=True -> one TokenOutput per token ---
+    core2 = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core2.tokenizer = _WordTokenizer()
+    core2._pending_free_ids = []
+    outputs2 = [
+        RequestOutput(request_id="r", new_token_id=1),
+        RequestOutput(request_id="r", new_token_id=2),
+        RequestOutput(request_id="r", new_token_id=3, finished=True, finish_reason="FINISHED_LENGTH"),
+    ]
+    core2.scheduler = _ScriptedScheduler(outputs2)
+    s_ctx = _RequestContext(
+        request=Request(request_id="r", prompt_token_ids=[9], max_new_tokens=3),
+        stream=True,
+    )
+    core2._request_contexts = {"r": s_ctx}
+
+    _drive(core2, s_ctx, seq)
+
+    assert s_ctx.queue.qsize() == 3
+    texts = [s_ctx.queue.get_nowait().text for _ in range(3)]
+    assert texts == ["a", "ab", "abc"]         # cumulative text grows each step
+
+
+def test_non_streaming_still_detects_stop_string():
+    """Stop-string detection must run every step even when outputs are
+    suppressed, so a non-streaming request stops mid-generation and publishes
+    exactly one finished output."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _WordTokenizer()
+    core._pending_free_ids = []
+    # Would run 4 tokens, but token 4 decodes to "STOP" which is a stop string.
+    outputs = [
+        RequestOutput(request_id="r", new_token_id=1),
+        RequestOutput(request_id="r", new_token_id=2),
+        RequestOutput(request_id="r", new_token_id=4),   # -> text ends with "STOP"
+        RequestOutput(request_id="r", new_token_id=3),   # should never be reached
+    ]
+    scheduler = _ScriptedScheduler(outputs)
+    core.scheduler = scheduler
+    ctx = _RequestContext(
+        request=Request(
+            request_id="r",
+            prompt_token_ids=[9],
+            max_new_tokens=4,
+            stop_strings=("STOP",),
+        ),
+        stream=False,
+    )
+    core._request_contexts = {"r": ctx}
+
+    _drive(core, ctx, [1, 2, 4])
+
+    # Stop detected at step 3: scheduler.finish_request called, one final output.
+    assert scheduler.finished == [("r", RequestStatus.FINISHED_STOP)]
+    assert ctx.queue.qsize() == 1
+    final = ctx.queue.get_nowait()
+    assert final.finished is True
+    assert final.finish_reason == "FINISHED_STOP"
+    assert final.text == "abSTOP"
 
 
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
