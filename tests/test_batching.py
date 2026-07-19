@@ -53,7 +53,13 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
-from pypto_serving.serving.server.ipc import DecodeRequest, NewRequestData
+from pypto_serving.serving.server.ipc import (
+    DecodeRequest,
+    NewRequestData,
+    StepResult,
+    decode_command,
+    encode_result,
+)
 from pypto_serving.serving.server.serving_worker import WorkerProcess
 from pypto_serving.worker.worker import WorkerTensor
 
@@ -123,6 +129,46 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
         assert isinstance(token, TokenOutput)
         assert token.finished is True
         assert token.finish_reason == "error"
+
+
+def test_abort_request_schedules_worker_cleanup():
+    """An aborted request must ride the next StepCommand's finished_request_ids,
+    otherwise its worker-side _req_cache entry and device slots leak."""
+    aborted: list[str] = []
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = SimpleNamespace(abort_request=aborted.append)
+    core._pending_free_ids = []
+    core._request_contexts = {"req-x": SimpleNamespace(queue=asyncio.Queue())}
+
+    asyncio.run(core.abort_request("req-x"))
+
+    # Scheduler aborted, context removed.
+    assert aborted == ["req-x"]
+    assert "req-x" not in core._request_contexts
+    # The id is queued for worker release exactly once.
+    assert core._pending_free_ids == ["req-x"]
+
+    # Idempotent: a second abort (or an abort racing the finish path) must not
+    # enqueue a duplicate free id.
+    asyncio.run(core.abort_request("req-x"))
+    assert core._pending_free_ids == ["req-x"]
+
+
+def test_abort_request_emits_abort_token_before_scheduling_free():
+    """The client-facing queue receives a FINISHED_ABORTED token on abort."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
+    core._pending_free_ids = []
+    queue: asyncio.Queue = asyncio.Queue()
+    core._request_contexts = {"req-y": SimpleNamespace(queue=queue)}
+
+    asyncio.run(core.abort_request("req-y"))
+
+    token = queue.get_nowait()
+    assert isinstance(token, TokenOutput)
+    assert token.finished is True
+    assert token.finish_reason == "FINISHED_ABORTED"
+    assert core._pending_free_ids == ["req-y"]
 
 
 def _model(
@@ -668,6 +714,43 @@ def test_incremental_detok_matches_full_decode_and_hides_partial_chars():
     assert cumulative == core.tokenizer.decode(seq) == "Hello world!★"
 
 
+def test_finalize_detok_flushes_trailing_incomplete_char_at_eos():
+    """If generation stops while a multi-token char is incomplete, the finished
+    step must flush the authoritative full decode instead of the withheld text.
+
+    Guards the FINAL_ONLY truncation bug: the incremental path withholds a
+    trailing U+FFFD forever (no later token completes it once generation ends),
+    so _finalize_detokenization must fall back to a full decode.
+    """
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+
+    class _TrailingByteTokenizer:
+        # token 6 alone is an incomplete char (U+FFFD); it is the last token.
+        _table = {1: "Hi", 2: "!"}
+
+        def decode(self, ids):
+            out = []
+            for t in ids:
+                out.append("�" if t == 6 else self._table[t])
+            return "".join(out)
+
+    core.tokenizer = _TrailingByteTokenizer()
+    ctx = _RequestContext(request=SimpleNamespace(output_token_ids=[]))
+
+    # Drive incremental decode up to the trailing incomplete token.
+    for k in range(1, 4):
+        ctx.request.output_token_ids = [1, 2, 6][:k]
+        incremental = core._detokenize_incrementally(ctx)
+
+    # Incremental withholds the trailing U+FFFD (never emits a partial char).
+    assert incremental == "Hi!"
+    assert "�" not in incremental
+
+    # On finish, the authoritative full decode is flushed (no truncation).
+    final = core._finalize_detokenization(ctx)
+    assert final == core.tokenizer.decode([1, 2, 6]) == "Hi!�"
+
+
 class _ScriptedScheduler:
     """Stub scheduler: returns one preset RequestOutput per _process_step_output call."""
 
@@ -784,6 +867,108 @@ def test_non_streaming_still_detects_stop_string():
     assert final.finished is True
     assert final.finish_reason == "FINISHED_STOP"
     assert final.text == "abSTOP"
+
+
+def test_non_streaming_final_output_uses_full_decode_on_incomplete_char():
+    """FINAL_ONLY must publish the full-decode text on finish, even when the
+    last token leaves a multi-token character incomplete (U+FFFD)."""
+
+    class _TrailingByteTokenizer:
+        _table = {1: "a", 2: "b"}
+
+        def decode(self, ids):
+            return "".join("�" if t == 6 else self._table[t] for t in ids)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _TrailingByteTokenizer()
+    core._pending_free_ids = []
+    outputs = [
+        RequestOutput(request_id="r", new_token_id=1),
+        RequestOutput(request_id="r", new_token_id=2),
+        RequestOutput(request_id="r", new_token_id=6, finished=True, finish_reason="FINISHED_LENGTH"),
+    ]
+    core.scheduler = _ScriptedScheduler(outputs)
+    ctx = _RequestContext(
+        request=Request(request_id="r", prompt_token_ids=[9], max_new_tokens=3),
+        stream=False,
+    )
+    core._request_contexts = {"r": ctx}
+
+    _drive(core, ctx, [1, 2, 6])
+
+    assert ctx.queue.qsize() == 1
+    final = ctx.queue.get_nowait()
+    assert final.finished is True
+    # Not the withheld "ab": the trailing incomplete char is flushed.
+    assert final.text == "ab�"
+
+
+def test_process_step_output_schedules_free_once_on_normal_finish():
+    """A normally-finished request is scheduled for worker release exactly once
+    by _process_step_output (the add_request finally must not re-add it)."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _WordTokenizer()
+    core._pending_free_ids = []
+    outputs = [
+        RequestOutput(request_id="r", new_token_id=1, finished=True, finish_reason="FINISHED_LENGTH"),
+    ]
+    core.scheduler = _ScriptedScheduler(outputs)
+    ctx = _RequestContext(
+        request=Request(request_id="r", prompt_token_ids=[9], max_new_tokens=1),
+        stream=False,
+    )
+    core._request_contexts = {"r": ctx}
+
+    _drive(core, ctx, [1])
+
+    # Scheduled once. The engine loop will drain this into the next StepCommand;
+    # add_request's finally must not append it again (double-release guard).
+    assert core._pending_free_ids == ["r"]
+    # _schedule_worker_free is idempotent while the id is still queued.
+    core._schedule_worker_free("r")
+    assert core._pending_free_ids == ["r"]
+
+
+def test_flush_pending_frees_sends_cleanup_only_step_command():
+    """Aborting the last active request must not pin it on the worker: when no
+    work is schedulable, _flush_pending_frees emits a cleanup-only StepCommand
+    carrying the pending ids and drains the worker reply."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
+    core._worker_known_req_ids = {"aborted"}
+    core._pending_free_ids = ["aborted"]
+
+    sent: list[bytes] = []
+    core._input_queue = SimpleNamespace(put=sent.append)
+    # Worker replies with an empty StepResult for the cleanup-only step.
+    core._output_queue = SimpleNamespace(
+        get=lambda timeout=None: encode_result(StepResult(new_tokens={}))
+    )
+
+    asyncio.run(core._flush_pending_frees())
+
+    # Exactly one cleanup command was sent, carrying the pending id and no work.
+    assert len(sent) == 1
+    cmd = decode_command(sent[0])
+    assert cmd.finished_request_ids == ["aborted"]
+    assert cmd.new_requests == []
+    assert cmd.prefill_requests == []
+    assert cmd.decode_requests == []
+    # Pending list drained; known-set no longer tracks the released id.
+    assert core._pending_free_ids == []
+    assert "aborted" not in core._worker_known_req_ids
+
+
+def test_flush_pending_frees_noop_when_nothing_pending():
+    """No cleanup command is sent when there is nothing to free."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._pending_free_ids = []
+    sent: list[bytes] = []
+    core._input_queue = SimpleNamespace(put=sent.append)
+
+    asyncio.run(core._flush_pending_frees())
+
+    assert sent == []
 
 
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):

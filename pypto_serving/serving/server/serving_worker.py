@@ -23,6 +23,7 @@ from pypto_serving.config.types import (
     PrefillBatch,
     SamplingParams,
 )
+from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
@@ -172,21 +173,27 @@ class WorkerProcess:
         logger.info("Worker exiting")
 
     def _handle_step_command(self, cmd: StepCommand) -> None:
-        """Handle a new-protocol StepCommand and push an encoded StepResult."""
-        # 1. Register new requests into the cache.
-        for nr in cmd.new_requests:
-            self._req_cache[nr.request_id] = nr
+        """Handle a StepCommand and push an encoded StepResult.
 
-        # 2. Release finished requests from device and cache.
-        if cmd.finished_request_ids:
-            release_finished = getattr(self.executor, "release_finished_requests", None)
-            if callable(release_finished):
-                release_finished(cmd.finished_request_ids)
-            for req_id in cmd.finished_request_ids:
-                self._req_cache.pop(req_id, None)
-
-        # 3. Execute the step and return the encoded result.
+        The whole body is guarded: an exception during request registration or
+        device-resource release (steps 1-2) would otherwise propagate out of the
+        busy loop and crash the worker. Any failure is reported back to the
+        engine as an error result so the loop keeps serving.
+        """
         try:
+            # 1. Register new requests into the cache.
+            for nr in cmd.new_requests:
+                self._req_cache[nr.request_id] = nr
+
+            # 2. Release finished requests from device and cache.
+            if cmd.finished_request_ids:
+                release_finished = getattr(self.executor, "release_finished_requests", None)
+                if callable(release_finished):
+                    release_finished(cmd.finished_request_ids)
+                for req_id in cmd.finished_request_ids:
+                    self._req_cache.pop(req_id, None)
+
+            # 3. Execute the step and return the encoded result.
             result = self._execute_step(cmd)
             self.output_queue.put(encode_result(result))
         except Exception as e:
@@ -412,6 +419,11 @@ def _worker_entry(
     try:
         num_pages = worker.init_device_and_model()
         num_pages_value.value = num_pages
+        # Model weights, compiled kernels and KV-cache objects are now resident.
+        # Freeze them so the GC won't rescan them during decode (avoids
+        # multi-ms gen2 pauses landing mid-step). Must happen in this process:
+        # gc.freeze() does not cross the spawn boundary.
+        freeze_gc_heap()
         ready_event.set()
         worker.busy_loop()
     except Exception as e:

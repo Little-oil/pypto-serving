@@ -89,7 +89,12 @@ class _Harness:
 
 
 async def _collect(engine, prompt: str, max_new_tokens: int) -> list[int]:
-    """Drive one request to completion and return its generated token ids."""
+    """Drive one request to completion and return its generated token ids.
+
+    Streaming is enabled so every generated token is emitted as its own
+    ``TokenOutput``; non-streaming requests only surface the final cumulative
+    text (FINAL_ONLY), which carries just the last ``token_id``.
+    """
     from pypto_serving.config.types import GenerateConfig
 
     request_id = engine.generate_request_id()
@@ -98,6 +103,7 @@ async def _collect(engine, prompt: str, max_new_tokens: int) -> list[int]:
         temperature=0.0,
         top_p=1.0,
         top_k=None,
+        stream=True,
     )
     tokens: list[int] = []
     async for output in engine.add_request(request_id, prompt, config):
