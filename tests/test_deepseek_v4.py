@@ -672,7 +672,6 @@ def test_deepseek_stacked_weight_staging_retains_ordinary_host_storage():
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._stacked_weight_buffers = None
     runner._l3_worker = None
-    runner._supports_inherited_resident_upload = lambda: True
     weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     staged = runner._stage_stacked_weights(
@@ -683,21 +682,6 @@ def test_deepseek_stacked_weight_staging_retains_ordinary_host_storage():
     assert not staged.tensors["weight"].is_shared()
 
 
-def test_deepseek_stacked_weight_staging_falls_back_to_shared_storage():
-    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._stacked_weight_buffers = None
-    runner._l3_worker = None
-    runner._supports_inherited_resident_upload = lambda: False
-    weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-
-    staged = runner._stage_stacked_weights(
-        weight_loader.DeepSeekV4StackedLayerWeights(tensors={"weight": weight})
-    )
-
-    assert staged.tensors["weight"].is_shared()
-    torch.testing.assert_close(staged.tensors["weight"], weight)
-
-
 def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypatch):
     main_weight = torch.zeros((1, 2), dtype=torch.float32)
     mtp_weight = torch.ones((1, 2), dtype=torch.float32)
@@ -705,9 +689,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     captured = {}
 
     class FakeDistributedWorker:
-        def release_inherited_host_tensors(self):
-            pass
-
         def __init__(self, compiled, *, inherited_host_tensors):
             captured["compiled"] = compiled
             captured["inherited"] = inherited_host_tensors
@@ -731,29 +712,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert captured["inherited"] == [main_weight, mtp_weight]
 
 
-def test_deepseek_worker_falls_back_without_inherited_resident_upload(monkeypatch):
-    captured = {}
-
-    class OutdatedDistributedWorker:
-        def __init__(self, compiled):
-            captured["compiled"] = compiled
-
-    monkeypatch.setattr("pypto.runtime.DistributedWorker", OutdatedDistributedWorker)
-    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._l3_worker = None
-    runner._compiled = type(
-        "Compiled",
-        (),
-        {"l3_callables": lambda _self: (DeepSeekV4L3Callable(object(), "decode"),)},
-    )()
-    runner._assert_l3_shared_buffers_preallocated = lambda: None
-
-    worker = runner._shared_l3_worker()
-
-    assert isinstance(worker, OutdatedDistributedWorker)
-    assert len(captured["compiled"]) == 1
-
-
 def test_deepseek_resident_upload_releases_inherited_host_references():
     main_weight = torch.zeros((1, 2), dtype=torch.float32)
     mtp_weight = torch.ones((1, 2), dtype=torch.float32)
@@ -768,7 +726,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
         def free_stacked_tensor(self, _tensor):
             pass
 
-        def release_inherited_host_tensors(self):
+        def release_inherited_host_tensor_refs(self):
             self.released = True
 
     worker = FakeWorker()
@@ -1131,7 +1089,6 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
             mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
         )
     )
-    runner._supports_inherited_resident_upload = lambda: True
     weight = torch.arange(2, dtype=torch.float32)
     runner.load_mtp_weights = lambda: weight_loader.DeepSeekV4MtpWeights(tensors={"weight": weight})
 

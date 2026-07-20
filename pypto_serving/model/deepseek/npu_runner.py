@@ -2460,15 +2460,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         tokens = layout.decode_tokens
         hidden = int(hidden_size)
         loaded = self.load_mtp_weights()
-        if self._supports_inherited_resident_upload():
-            weights = dict(loaded.tensors)
-        else:
-            weights = {
-                name: self._new_shared_like(tensor, name=f"mtp_weight[{name}]")
-                for name, tensor in loaded.tensors.items()
-            }
-            for name, tensor in loaded.tensors.items():
-                self._copy_shared(weights[name], tensor, name=f"mtp_weight[{name}]")
+        weights = dict(loaded.tensors)
         mtp_kv_cache = self._shared_empty(
             (ranks, layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
             torch.bfloat16,
@@ -2714,26 +2706,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _stage_stacked_weights(self, weights: DeepSeekV4StackedLayerWeights) -> DeepSeekV4StackedLayerWeights:
         """Retain immutable layer-stacked weights for fork inheritance and resident upload."""
-        inherited_upload = self._supports_inherited_resident_upload()
         buffers = self._stacked_weight_buffers
         if buffers is None:
             self._ensure_shared_host_allocation_before_worker("stacked layer weights")
-            if inherited_upload:
-                buffers = dict(weights.tensors)
-            else:
-                buffers = {
-                    name: self._new_shared_like(tensor, name=f"stacked_weight[{name}]")
-                    for name, tensor in weights.tensors.items()
-                }
+            buffers = dict(weights.tensors)
             self._stacked_weight_buffers = buffers
 
         missing = sorted(set(weights.tensors) - set(buffers))
         if missing:
             raise KeyError(f"DeepSeekV4 stacked-weight buffers are missing: {', '.join(missing)}")
 
-        if not inherited_upload:
-            for name, tensor in weights.tensors.items():
-                self._copy_shared(buffers[name], tensor, name=f"stacked_weight[{name}]")
         return DeepSeekV4StackedLayerWeights(tensors=buffers)
 
     def _hc_head_tensors(self) -> dict[str, torch.Tensor]:
@@ -2996,12 +2978,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype).share_memory_()
 
     @staticmethod
-    def _new_shared_like(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
-        if tensor.device.type != "cpu":
-            raise ValueError(f"{name} must be a CPU tensor")
-        return torch.empty_like(tensor.contiguous(), memory_format=torch.contiguous_format).share_memory_()
-
-    @staticmethod
     def _copy_shared(dst: torch.Tensor, src: torch.Tensor, *, name: str) -> None:
         if src.device.type != "cpu":
             src = src.cpu()
@@ -3143,9 +3119,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 resident MTP weights uploaded; released_parent_host_bytes=%d",
                 parent_host_bytes,
             )
-        release_inherited = getattr(worker, "release_inherited_host_tensors", None)
-        if callable(release_inherited):
-            release_inherited()
+        worker.release_inherited_host_tensor_refs()
 
     def _invalidate_resident_cache_tensors(self) -> None:
         """Free resident KV/compressor state so the next request starts clean."""
@@ -3169,22 +3143,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
             compiled = [callable_spec.compiled for callable_spec in compiled_callables]
-            if self._supports_inherited_resident_upload():
-                worker = DistributedWorker(compiled, inherited_host_tensors=self._inherited_host_weights())
-            else:
-                logger.info(
-                    "PyPTO runtime lacks inherited resident upload; using shared Host weight staging"
-                )
-                worker = DistributedWorker(compiled)
+            worker = DistributedWorker(compiled, inherited_host_tensors=self._inherited_host_weights())
             self._l3_worker = worker
         return worker
-
-    @staticmethod
-    def _supports_inherited_resident_upload() -> bool:
-        """Return whether the installed runtime can upload from inherited storage."""
-        from pypto.runtime import DistributedWorker  # noqa: PLC0415
-
-        return callable(getattr(DistributedWorker, "release_inherited_host_tensors", None))
 
     def _inherited_host_weights(self) -> list[torch.Tensor]:
         """Return immutable main and MTP weights that must be visible at worker fork."""
