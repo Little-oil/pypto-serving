@@ -668,18 +668,18 @@ def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slice
     assert all(tensor.is_contiguous() for tensor in stacked.tensors.values())
 
 
-def test_deepseek_stacked_weight_staging_retains_ordinary_host_storage():
+def test_deepseek_retain_stacked_host_weights_keeps_ordinary_storage():
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._stacked_weight_buffers = None
+    runner._stacked_host_weights = None
     runner._l3_worker = None
     weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
-    staged = runner._stage_stacked_weights(
+    retained = runner._retain_stacked_host_weights(
         weight_loader.DeepSeekV4StackedLayerWeights(tensors={"weight": weight})
     )
 
-    assert staged.tensors["weight"] is weight
-    assert not staged.tensors["weight"].is_shared()
+    assert retained.tensors["weight"] is weight
+    assert not retained.tensors["weight"].is_shared()
 
 
 def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypatch):
@@ -696,7 +696,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._l3_worker = None
-    runner._stacked_weight_buffers = {"main": main_weight}
+    runner._stacked_host_weights = {"main": main_weight}
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._compiled = type(
         "Compiled",
@@ -731,7 +731,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
 
     worker = FakeWorker()
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._stacked_weight_buffers = {"main": main_weight}
+    runner._stacked_host_weights = {"main": main_weight}
     runner._stacked_device_weights = None
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._mtp_device_weights = None
@@ -740,7 +740,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     runner._materialize_resident_weights()
 
     assert worker.released
-    assert runner._stacked_weight_buffers is None
+    assert runner._stacked_host_weights is None
     assert not runner._mtp_buffers.weights
 
 

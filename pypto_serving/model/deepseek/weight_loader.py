@@ -180,10 +180,6 @@ DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES = (
     "hca_cmp_ape",
     "hca_cmp_norm_w",
 )
-_DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE = 4
-_DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE = 128
-
-
 @dataclass(frozen=True)
 class DeepSeekV4StackedLayerWeights:
     """All hidden-layer weights stacked on the layer axis for ``l3_decode_fwd``.
@@ -685,8 +681,8 @@ class DeepSeekV4WeightStore:
                     include_gate_bias=layer_id >= num_hash_layers,
                     destinations=destinations,
                 )
-            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE)
-            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE)
+            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
+            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
         return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
     def load_mtp_weights(
@@ -766,11 +762,11 @@ def _allocate_stacked_layer_weights(
         (fwd_names, len(compress_ratios)),
         (
             DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES,
-            sum(int(ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE for ratio in compress_ratios),
+            sum(int(ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO for ratio in compress_ratios),
         ),
         (
             DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
-            sum(int(ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE for ratio in compress_ratios),
+            sum(int(ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO for ratio in compress_ratios),
         ),
     )
     stacked: dict[str, torch.Tensor] = {}
@@ -804,9 +800,9 @@ def _stacked_layer_destinations(
             destinations[name] = stacked[name][:, order * width : (order + 1) * width]
 
     add(fwd_names, layer_id)
-    if compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE:
+    if compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO:
         add(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES, csa_order)
-    elif compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE:
+    elif compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO:
         add(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES, hca_order)
     return destinations
 
