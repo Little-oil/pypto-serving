@@ -497,7 +497,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             save_kernels=config.save_kernels,
             save_kernels_dir=config.save_kernels_dir,
             codegen_only=True,
-            pto_isa_commit=config.pto_isa_commit,
             diagnostic_phase=config.diagnostic_phase,
             disabled_diagnostics=config.disabled_diagnostics,
             compile_profiling=config.compile_profiling,
