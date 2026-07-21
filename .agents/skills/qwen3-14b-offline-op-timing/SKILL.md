@@ -28,15 +28,13 @@ Same as online: set `SA_PROFILE_OUTPUT=<absolute dir, fresh per run>` and `SA_PR
 `npu_generate.py` takes `--prompt` as **required text** (there is no `--prompt-len` / `--prompt-file` / synthetic option), so for a fixed input length build a prompt of exactly N tokens with the tokenizer first. Template (queue-wrapped; `--device-id {}` is filled by `--device auto`):
 
 ```bash
-# helper: emit a plain-text prompt of exactly N tokens for the model tokenizer
-make_prompt() { python -c "
-from transformers import AutoTokenizer; import sys
-N,MD=int(sys.argv[1]),sys.argv[2]
-t=AutoTokenizer.from_pretrained(MD); b=t('The quick brown fox jumps over the lazy dog. ')['input_ids']
-sys.stdout.write(t.decode((b*((N//len(b))+1))[:N]))" "$1" "$2"; }
+# helper: emit a prompt of exactly N tokens (repeated single-token word; "hello"
+# is 1 token for the Qwen3 tokenizer, so "hello"*N is exactly N tokens — no
+# decode/encode round-trip loss)
+make_prompt() { python -c "import sys; sys.stdout.write('hello'*int(sys.argv[1]))" "$1"; }
 
 MODEL_DIR=/path/to/Qwen3-14B
-PROMPT="$(make_prompt 3338 "$MODEL_DIR")"     # N = the config's input length
+PROMPT="$(make_prompt 3338)"      # N = the config's input length
 
 task-submit --device auto --run --max-time 0 --timeout 0 \
 "SA_PROFILE_OUTPUT=/abs/path/profile-offline \
@@ -51,13 +49,17 @@ python examples/model/qwen3_14b/npu_generate.py \
     --max-seq-len 4096 \
     --max-new-tokens 128 \
     --max-num-seqs 16 \
+    --num-prompts 16 \
     --max-num-batched-tokens 4096 \
+    --no-enable-prefix-caching \
     --npu-memory-utilization 0.9"
 ```
 
 Notes specific to the offline entry:
 
-- `npu_generate.py` runs a **single prompt** (`engine.generate_result(model_id, prompt, config)`). `--max-num-seqs` is the runtime `max_batch_size` config — it shapes the compiled kernel, it does **not** run 16 requests. So each config is one generation, and `kernel.decode_fwd` fires once per decode step for that single sequence.
+- `--num-prompts 16` calls `engine.generate_batch(model_id, [prompt]*16, config)` — **real batch** of 16 concurrent requests (each identical, matching the workload spec). `--max-num-seqs 16` sets the compile-time batch capacity.
+- `make_prompt N` builds an EXACT N-token prompt by repeating `"hello"` (1 token for the Qwen3 tokenizer). Unlike sentence-repeat + decode, no decode/encode round-trip loss.
+- When total prompt tokens across all requests exceed `--max-num-batched-tokens` (default 4096), the engine automatically splits into **chunked prefill**. Each `run_prefill` call packs up to 4096 new tokens, greedily filling requests in order (req0 first, then req1, etc.). Completed requests drop out of subsequent chunks. The decode loop runs after all prefill chunks finish. For config 1 (`3338/128/16`, 16×3338≈53k total), this produces ~14 chunks.
 - `--profile` / `--profile-verbose` are **optional and separate** from `SA_PROFILE`: they print npu_generate's own phase / per-kernel timing summary. The `SA_PROFILE` trace is collected from the env vars alone.
 - The prompt is injected into the `task-submit` quoted string via `\"$PROMPT\"`; the tokenizer-built prompt is plain text with no shell-special characters. If you supply your own prompt, make sure it is shell-safe or pass it the same way.
 - The entry calls `merge_profile()` in its `finally` block, so `trace.json` is produced even if generation raises.
@@ -71,7 +73,7 @@ The same two configs as the online skill. Offline they map to npu_generate args 
 | 1 — `3338/128/16` | 3338 | 128 | 16 | long prefill |
 | 2 — `128/128/16` | 128 | 128 | 16 | balanced |
 
-Run both (one generation each; rebuild the prompt with the matching `N`). Keep `prompt_tokens + max-new-tokens <= --max-seq-len` (4096).
+Run both (one batched generation each; rebuild the prompt with the matching `N`). Keep `prompt_tokens + max-new-tokens <= --max-seq-len` (4096).
 
 ## 5. Flush and merge fragments
 
@@ -79,14 +81,11 @@ Automatic for offline: `npu_generate.py` calls `merge_profile()` in its `finally
 
 ## 6. Read operator timing from the trace
 
-Identical to the online skill — the trace is the same Chrome trace-event format with the same kernel names. Use the event schema, the kernel-name table, and the compact aggregator in `qwen3-14b-online-perf-test` §6 (filter `ph=="X"`, group by `name`, sum `dur`; for kernel rows prefer `args.device_wall_us`; exclude one-time startup spans). For a single offline generation the notable spans are `kernel.prefill_fwd` (once) and `kernel.decode_fwd` (once per decode step, ≈ `--max-new-tokens`).
+Identical to the online skill — the trace is the same Chrome trace-event format with the same kernel names. Use the event schema, the kernel-name table, and the compact aggregator in `qwen3-14b-online-perf-test` §6 (filter `ph=="X"`, group by `name`, sum `dur`; for kernel rows prefer `args.device_wall_us`; exclude one-time startup spans).
 
 ## 7. Interpreting the results
 
-Same metrics as online §7. Offline-specific notes:
-
-- `kernel.decode_fwd` count ≈ `--max-new-tokens` (one decode step per generated token, single sequence); `kernel.prefill_fwd` fires once for the prompt; `kernel.greedy_sample_fwd` is cheap.
-- Because only one sequence runs, `decode_fwd` is **single-sequence decode** (no cross-sequence batching). It is not directly comparable to the online skill's batched `decode_fwd` without accounting for the running batch size — keep the two labeled separately.
+Same metrics as online §7 (batching works identically now that `--num-prompts 16` generates a real batch).
 
 ## 8. Troubleshooting
 
@@ -98,7 +97,7 @@ Same metrics as online §7. Offline-specific notes:
 
 **d) Prompt length mismatch.** `npu_generate.py` has no length knob — the input length is the token count of `--prompt`. Use `make_prompt N` to hit an exact length; verify with the tokenizer if precision matters. Keep `prompt_tokens + max-new-tokens <= --max-seq-len`.
 
-**e) Single-sequence caveat.** `--max-num-seqs 16` only configures the compiled kernel shape; one sequence actually runs. Do not read the offline `decode_fwd` as a batched-decode number.
+**e) Not actually batched.** The command must include `--num-prompts 16` (not just `--max-num-seqs 16`) for real batch-16 generation. Without `--num-prompts`, `npu_generate.py` runs only 1 request regardless of `--max-num-seqs`.
 
 ## 9. Checklist
 
@@ -107,4 +106,4 @@ Same metrics as online §7. Offline-specific notes:
 3. Run `npu_generate.py` (queue-wrapped) with the config's `--max-new-tokens` and `--max-num-seqs`; wait for the generation to finish.
 4. Repeat for the second config (`3338/128/16` and `128/128/16`).
 5. Confirm `merge_profile()` ran in `finally` (or run `scripts/merge_profile.sh`).
-6. Aggregate `ph=X` spans by `name` using the online §6 aggregator; report `kernel.prefill_fwd` / `decode_fwd` / `greedy_sample_fwd` total+count+mean, `args.device_wall_us`, and TPOT ≈ mean `decode_fwd`. Label the numbers as single-sequence offline.
+6. Aggregate `ph=X` spans by `name` using the online §6 aggregator; report `kernel.prefill_fwd` / `decode_fwd` / `greedy_sample_fwd` total+count+mean, `args.device_wall_us`, and TPOT ≈ mean `decode_fwd`.
