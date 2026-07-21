@@ -99,16 +99,24 @@ def percentile(sorted_list, p):
 
 async def run_bench(args):
     url = f"http://{args.host}:{args.port}/v1/completions"
-    prompts = [
-        "The capital of France is",
-        "Explain quantum computing in one sentence:",
-        "Write a haiku about the ocean:",
-        "What is 2+2? Answer:",
-        "The meaning of life is",
-        "Python is a programming language that",
-        "In the year 2050,",
-        "The fastest animal on Earth is",
-    ]
+    if args.input_len:
+        # Single synthetic prompt of ~N tokens via whole-sentence repeats. Whole sentences keep
+        # the decode/re-encode round-trip stable (cutting mid-token shrinks the count). The base
+        # sentence is ~10 tokens/repeat for typical BPE tokenizers, so the count lands within a
+        # few tokens of N; the exact count the server sees is in its log and the prefill_fwd span.
+        base = "The quick brown fox jumps over the lazy dog. "
+        prompts = [base * max(1, round(args.input_len / 10))]
+    else:
+        prompts = [
+            "The capital of France is",
+            "Explain quantum computing in one sentence:",
+            "Write a haiku about the ocean:",
+            "What is 2+2? Answer:",
+            "The meaning of life is",
+            "Python is a programming language that",
+            "In the year 2050,",
+            "The fastest animal on Earth is",
+        ]
 
     tasks = []
     for i in range(args.num_requests):
@@ -119,6 +127,8 @@ async def run_bench(args):
     print(f"Target: {url}")
     print(f"Requests: {args.num_requests}, Concurrency: {args.concurrency}")
     print(f"Max tokens: {args.max_tokens}, Temperature: {args.temperature}")
+    if args.input_len:
+        print(f"Input length: ~{args.input_len} tokens (synthetic, fixed across requests)")
     print(f"Mode: {'streaming (TTFT + decode)' if args.stream else 'non-streaming (e2e only)'}")
     print()
 
@@ -193,6 +203,9 @@ def main():
     parser.add_argument("--num-requests", "-n", type=int, default=8)
     parser.add_argument("--concurrency", "-c", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--input-len", type=int, default=None,
+                        help="Override the built-in prompts with a single synthetic prompt of "
+                             "approximately N tokens (whole-sentence repeats, fixed across requests).")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--stream", action="store_true", help="Use streaming to measure TTFT and decode latency")
     args = parser.parse_args()

@@ -216,11 +216,89 @@ class LLMEngine:
             if fast_path_result is not None:
                 return fast_path_result
 
-            with self._executor.session():
-                prefill_result = self._executor.run_prefill(
-                    runtime_model,
-                    prefill_batch,
-                )
+            # Greedy chunked prefill: when total prompt tokens exceed
+            # max_num_batched_tokens, split into chunks that each pack up
+            # to that many new tokens, filling requests in order.  Only
+            # requests with remaining tokens are included in each chunk.
+            total_budget = record.runtime.max_num_batched_tokens
+            total_tokens = sum(len(ids) for ids in prompt_token_ids)
+            if total_tokens > total_budget:
+                remaining = [[ri, len(ids)] for ri, ids in enumerate(prompt_token_ids)]
+                offsets = [0] * len(prompts)
+                prefill_result = None
+                with self._executor.session():
+                    while remaining:
+                        # greedily take up to total_budget tokens
+                        chunk_req: list[int] = []
+                        chunk_lens: list[int] = []
+                        budget = total_budget
+                        for ri, left in remaining:
+                            if budget <= 0:
+                                break
+                            take = min(left, budget)
+                            if take <= 0:
+                                continue
+                            chunk_req.append(ri)
+                            chunk_lens.append(take)
+                            budget -= take
+                            offsets[ri] += take
+                        n_sub = len(chunk_req)
+                        max_len = max_prompt_len  # fixed across chunks
+                        sub_tokens = torch.zeros(
+                            (n_sub, max_len), dtype=torch.long,
+                            device=runtime_model.runtime.device,
+                        )
+                        sub_emb = None
+                        if not self._executor.supports_device_embedding:
+                            sub_emb = torch.zeros(
+                                (n_sub, max_len, record.config.hidden_size),
+                                dtype=runtime_model.embed_tokens.dtype,
+                                device=runtime_model.runtime.device,
+                            )
+                        sub_seq_lens: list[int] = []
+                        for row, ri in enumerate(chunk_req):
+                            n = chunk_lens[row]
+                            start = offsets[ri] - n
+                            tids = prompt_token_ids[ri][start:offsets[ri]]
+                            sub_tokens[row, :n] = torch.tensor(
+                                tids, dtype=torch.long,
+                                device=runtime_model.runtime.device,
+                            )
+                            sub_seq_lens.append(offsets[ri])
+                            if sub_emb is not None:
+                                sub_emb[row, :n, :] = self._executor.lookup_embeddings(
+                                    runtime_model, sub_tokens[row, :n],
+                                )
+                        # remove completed requests from the pool
+                        for i in range(len(remaining) - 1, -1, -1):
+                            ri = remaining[i][0]
+                            if offsets[ri] >= len(prompt_token_ids[ri]):
+                                del remaining[i]
+                            else:
+                                remaining[i] = [ri, len(prompt_token_ids[ri]) - offsets[ri]]
+                        all_done = not remaining
+                        sub_batch = PrefillBatch(
+                            request_ids=[requests[ri].request_id for ri in chunk_req],
+                            token_ids=sub_tokens,
+                            input_embeddings=sub_emb,
+                            seq_lens=torch.tensor(
+                                sub_seq_lens, dtype=torch.int32,
+                                device=runtime_model.runtime.device,
+                            ),
+                            allow_device_greedy_sampling=(
+                                allow_device_greedy_sampling and all_done
+                            ),
+                            kv_allocations=[allocations[ri] for ri in chunk_req],
+                        )
+                        prefill_result = self._executor.run_prefill(
+                            runtime_model, sub_batch,
+                        )
+            else:
+                with self._executor.session():
+                    prefill_result = self._executor.run_prefill(
+                        runtime_model,
+                        prefill_batch,
+                    )
                 prefill_logits = prefill_result.logits
                 prefill_sampled_token_ids = (
                     prefill_result.sampled_token_ids

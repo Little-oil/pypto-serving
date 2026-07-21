@@ -354,14 +354,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Max batch size / concurrent requests.")
+    parser.add_argument("--num-prompts", type=int, default=1,
+                        help="Number of prompts to generate (replicates --prompt). When > 1 calls "
+                             "generate_batch for real batched inference. Default 1 = single request.")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache page size.")
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
         default=4096,
-        help="Total tokens per scheduling step (used by warmup). NOTE: the 40-layer "
-        "fused prefill deadlocks the single-die ring-heap above ~415 total tokens, "
-        "so set this low enough that the per-request count stays under the ceiling.",
+        help="Total tokens per scheduling step (used by warmup and chunked prefill).",
     )
     parser.add_argument(
         "--npu-memory-utilization",
@@ -395,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Implies --profile. Also dump per-layer prefill times and "
              "per-decode-step layer breakdowns.",
     )
+    parser.add_argument(
+        "--no-enable-prefix-caching",
+        action="store_true",
+        dest="no_enable_prefix_caching",
+        help="Disable prefix caching in the KV cache manager.",
+    )
     return parser
 
 
@@ -423,7 +430,9 @@ def main() -> None:
         )
     device_ids = parallel_config.replica_device_groups[0]
 
-    kv_cache_manager = KvCacheManager()
+    kv_cache_manager = KvCacheManager(
+        enable_prefix_cache=not args.no_enable_prefix_caching,
+    )
     executor = PyptoExecutor(
         kv_cache_manager,
         platform=args.platform,
@@ -454,10 +463,6 @@ def main() -> None:
                 weight_dtype=args.dtype,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
-                # Conservative default — the decode kernel is compiled
-                # with this baked-in shape and cannot be resized later.
-                # 200 pages x 128 tokens = 25 600 tokens total capacity.
-                total_kv_pages=200,
             ),
         )
         if collector is not None:
@@ -498,11 +503,21 @@ def main() -> None:
                 print()
                 num_tokens = len(text_parts)
             else:
-                result = engine.generate_result(args.model_id, args.prompt, config)
-                num_tokens = len(result.token_ids)
-                print(f"text: {result.text}")
-                print(f"token_ids: {result.token_ids}")
-                print(f"finish_reason: {result.finish_reason}")
+                if args.num_prompts > 1:
+                    prompts = [args.prompt] * args.num_prompts
+                    results = engine.generate_batch(args.model_id, prompts, config)
+                    num_tokens = sum(len(r.token_ids) for r in results)
+                    for i, r in enumerate(results):
+                        print(f"-- prompt {i+1}/{args.num_prompts} --")
+                        print(f"text: {r.text}")
+                        print(f"token_ids: {r.token_ids[:64]}{'...' if len(r.token_ids)>64 else ''}")
+                        print(f"finish_reason: {r.finish_reason}")
+                else:
+                    result = engine.generate_result(args.model_id, args.prompt, config)
+                    num_tokens = len(result.token_ids)
+                    print(f"text: {result.text}")
+                    print(f"token_ids: {result.token_ids}")
+                    print(f"finish_reason: {result.finish_reason}")
 
         gen_elapsed = time.perf_counter() - gen_t0
         PrintThroughput(num_tokens, gen_elapsed, meters)
