@@ -543,14 +543,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
         """Stage per-layer weights into pre-allocated stacked shm tensors,
-        writing each layer directly into its slice of the stacked tensors.
+        copying layers in parallel across worker threads.
 
         Same output as building every per-layer ``_KernelLayerWeights`` and then
-        ``torch.cat``-ing them (see ``_stack_decode_weights``), but ~1x peak host
-        memory instead of ~2x: only the stacked destination plus one transient
-        strided view are live at a time, never the full per-layer staging set and
-        the stacked copy together.
+        ``torch.cat``-ing them (see ``_stack_decode_weights``), and the same ~1x
+        peak host memory as the serial stream (only the stacked destination plus
+        the transient views live at once). The per-layer copies dominate startup
+        (~90s serially for a 14B), so they run on a thread pool: each layer owns a
+        disjoint row-slice of every stacked tensor, and ``copy_`` releases the GIL
+        for the memcpy + dtype cast, so the copies genuinely overlap.
         """
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
         layers = model.layers
         num_layers = len(layers)
         fields = (
@@ -604,9 +608,37 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 stacked[key][i * rows:(i + 1) * rows].copy_(_ready_view(layer, attr, kind))
             cls._release_layer_weights(layer)
 
-        for i in range(num_layers):
-            _stage_layer(i)
+        workers = cls._staging_worker_count(num_layers)
+        if workers <= 1:
+            for i in range(num_layers):
+                _stage_layer(i)
+        else:
+            # Pin torch intra-op parallelism to 1 for the duration of the pool:
+            # each copy_ would otherwise fan out to its own OpenMP/MKL threads,
+            # and N pool threads x that fan-out oversubscribes a many-core host
+            # (the >32-thread staging regression). One intra-op thread per copy
+            # keeps the coarse per-layer parallelism clean.
+            orig_threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_stage_layer, range(num_layers)))
+            finally:
+                torch.set_num_threads(orig_threads)
         return stacked
+
+    @staticmethod
+    def _staging_worker_count(num_layers: int) -> int:
+        """Thread count for parallel weight staging (env-tunable)."""
+        raw = os.environ.get("PYPTO_STAGING_THREADS")
+        if raw:
+            try:
+                return max(1, min(int(raw), num_layers))
+            except ValueError:
+                pass
+        # Staging is memory-bandwidth bound: it plateaus by ~16-32 threads and
+        # regresses beyond that, so cap the default even on many-core hosts.
+        return max(1, min(num_layers, os.cpu_count() or 8, 32))
 
     @staticmethod
     def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
