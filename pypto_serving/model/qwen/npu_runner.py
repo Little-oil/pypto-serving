@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from pypto.runtime import DeviceTensor
 
@@ -177,8 +178,16 @@ class Qwen314BModelRunner(ModelRunner):
         # changes (or when a different row-0 value must be used for padding).
         self._decode_block_table_row_pages: list[list[int] | None] = []
         self._decode_token_padding_initialized = False
+        self._prefill_metadata_arrays: tuple[Any, ...] = ()
+        self._prefill_slot_mapping_array: np.ndarray | None = None
         if compiled is not None:
             self._share_static_kernel_tensors()
+            self._prefill_metadata_arrays = (
+                compiled.prefill_seq_lens_buffer.numpy(),
+                compiled.prefill_chunk_lens_buffer.numpy(),
+                compiled.prefill_chunk_offsets_buffer.numpy(),
+            )
+            self._prefill_slot_mapping_array = compiled.prefill_slot_mapping_buffer.numpy()
             self._static_args = self._build_static_kernel_args()
 
     #: Scratch KV pages for the profile pass — slot=-1 means only page 0
@@ -498,31 +507,6 @@ class Qwen314BModelRunner(ModelRunner):
         ModelRunner.init_kv_cache(self, model.config.model_id, spec[0], spec[1])
         return self._kv_caches[model.config.model_id]
 
-    @staticmethod
-    def _validate_kv_cache_bounds(
-        model: RuntimeModel,
-        block_table: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        cache: Any,
-    ) -> None:
-        """Fail on host before an invalid KV page id reaches the NPU kernel."""
-        valid_blocks = block_table[block_table >= 0]
-        valid_slots = slot_mapping[slot_mapping >= 0]
-        if valid_blocks.numel() == 0 and valid_slots.numel() == 0:
-            return
-        max_block_id = int(valid_blocks.max().item()) if valid_blocks.numel() else -1
-        max_slot_block = int(valid_slots.max().item()) // model.runtime.page_size if valid_slots.numel() else -1
-        max_page_id = max(max_block_id, max_slot_block)
-        rows_per_layer = cache.shape[0] // model.config.num_hidden_layers
-        max_pages = rows_per_layer // (model.config.num_key_value_heads * model.runtime.page_size)
-        if max_page_id >= max_pages:
-            raise RuntimeError(
-                "KV cache page id exceeds runner device cache capacity: "
-                f"max_page_id={max_page_id}, max_pages={max_pages}, "
-                f"cache_shape={cache.shape}, block_table_shape={tuple(block_table.shape)}, "
-                f"slot_mapping_shape={tuple(slot_mapping.shape)}"
-            )
-
     def _share_static_kernel_tensors(self) -> None:
         """Move static kernel inputs to shared memory before worker creation."""
         for tensor in self._iter_static_host_tensors():
@@ -587,7 +571,6 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = self._materialize_kv_cache(model)
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
 
         self._run_distributed_program(
             compiled.prefill,
@@ -595,7 +578,7 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
-            seq_len = int(batch.seq_lens[batch_idx].item())
+            seq_len = batch.seq_lens[batch_idx]
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
         sampled_ids, next_hidden = self._maybe_run_sample_embed(
             logits_padded,
@@ -636,10 +619,6 @@ class Qwen314BModelRunner(ModelRunner):
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
-
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
 
         device_greedy = batch.allow_device_greedy_sampling
         self._run_distributed_program(
@@ -927,49 +906,25 @@ class Qwen314BModelRunner(ModelRunner):
         model: RuntimeModel,
         batch: PrefillBatch,
     ) -> _PrefillInputs:
-        """Pack variable-length prefill requests into kernel input tensors."""
+        """Copy packed prefill inputs into persistent kernel buffers."""
         compiled = self._compiled
-        batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
+        batch_count = len(batch.request_ids)
         actual_batch = self._validate_batch_size(model, batch_count)
+
         max_seq = model.runtime.max_seq_len
         page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
         kernel_batch = model.runtime.max_batch_size
 
-        seq_len_values = [int(batch.seq_lens[idx].item()) for idx in range(actual_batch)]
-        chunk_len_values: list[int] = []
-        chunk_start_values: list[int] = []
-        for batch_idx, seq_len in enumerate(seq_len_values):
-            if batch.positions is not None:
-                row_positions = batch.positions[batch_idx].detach().cpu()
-                valid_positions = row_positions[row_positions >= 0]
-                if valid_positions.numel() == 0:
-                    raise ValueError("prefill positions must include at least one chunk token")
-                chunk_start = int(valid_positions[0].item())
-                chunk_len = int(valid_positions.numel())
-                expected_positions = torch.arange(
-                    chunk_start,
-                    chunk_start + chunk_len,
-                    dtype=valid_positions.dtype,
-                )
-                if not torch.equal(valid_positions, expected_positions):
-                    raise ValueError(
-                        "prefill batch.positions must form one contiguous chunk: "
-                        f"chunk_start={chunk_start}, chunk_len={chunk_len}, seq_len={seq_len}"
-                    )
-            else:
-                chunk_len = seq_len
-                chunk_start = 0
-            if chunk_len <= 0:
-                raise ValueError("prefill chunk_lens must be positive")
-            if chunk_start + chunk_len != seq_len:
-                raise ValueError(
-                    "prefill chunk must end at seq_len: "
-                    f"chunk_start={chunk_start}, chunk_len={chunk_len}, seq_len={seq_len}"
-                )
-            chunk_len_values.append(chunk_len)
-            chunk_start_values.append(chunk_start)
-        total_tokens = sum(chunk_len_values)
+        seq_len_values = batch.seq_lens
+        chunk_len_values = batch.chunk_lens
+        chunk_offset_values = batch.chunk_offsets
+        chunk_start_values = batch.chunk_starts
+        for seq_len in seq_len_values:
+            if seq_len > max_seq:
+                raise ValueError(f"prefill seq_len {seq_len} exceeds max_seq_len {max_seq}")
+
+        total_tokens = int(batch.token_ids.numel())
         max_tokens = kernel_batch * max_seq
         if total_tokens > max_tokens:
             raise ValueError(f"prefill total tokens {total_tokens} exceeds kernel capacity {max_tokens}")
@@ -980,26 +935,26 @@ class Qwen314BModelRunner(ModelRunner):
         chunk_offsets = compiled.prefill_chunk_offsets_buffer
         block_table = compiled.prefill_block_table_buffer
         slot_mapping = compiled.prefill_slot_mapping_buffer[:total_tokens]
+        slot_mapping_array = self._prefill_slot_mapping_array
+        if slot_mapping_array is None:
+            raise RuntimeError("prefill slot-mapping buffer is not initialized")
         seq_lens.zero_()
         chunk_lens.zero_()
         chunk_offsets.zero_()
         block_table.fill_(-1)
 
-        token_offset = 0
+        token_ids.copy_(batch.token_ids)
+        for target, values in zip(
+            self._prefill_metadata_arrays,
+            (seq_len_values, chunk_len_values, chunk_offset_values),
+        ):
+            target[:actual_batch] = values
+
         for batch_idx in range(actual_batch):
             alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
-            seq_len = seq_len_values[batch_idx]
-            if seq_len <= 0:
-                raise ValueError("prefill seq_lens must be positive")
-            if seq_len > max_seq:
-                raise ValueError(f"prefill seq_len {seq_len} exceeds max_seq_len {max_seq}")
-            seq_lens[batch_idx] = seq_len
             chunk_len = chunk_len_values[batch_idx]
             chunk_start = chunk_start_values[batch_idx]
-            chunk_lens[batch_idx] = chunk_len
-            chunk_offsets[batch_idx] = token_offset
-            chunk_token_ids = batch.token_ids[batch_idx, :chunk_len].to(torch.int32).cpu()
-            token_ids[token_offset : token_offset + chunk_len] = chunk_token_ids
+            chunk_offset = chunk_offset_values[batch_idx]
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -1009,9 +964,13 @@ class Qwen314BModelRunner(ModelRunner):
                 page_ids = []
             self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
-            slot_row = self._compute_slot_mapping(page_ids, chunk_len, page_size, start_pos=chunk_start)
-            slot_mapping[token_offset : token_offset + chunk_len] = slot_row
-            token_offset += chunk_len
+            self._write_slot_mapping(
+                slot_mapping_array[chunk_offset : chunk_offset + chunk_len],
+                page_ids,
+                chunk_len,
+                page_size,
+                start_pos=chunk_start,
+            )
 
         return _PrefillInputs(
             actual_batch=actual_batch,
@@ -1083,7 +1042,6 @@ class Qwen314BModelRunner(ModelRunner):
             self._decode_block_table_row_pages = [None] * kernel_batch
 
         first_page_ids: list[int] | None = None
-
         for batch_idx in range(actual_batch):
             alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(seq_len_values[batch_idx])
@@ -1155,15 +1113,15 @@ class Qwen314BModelRunner(ModelRunner):
         self._decode_block_table_row_pages[batch_idx] = list(page_ids)
 
     @staticmethod
-    def _compute_slot_mapping(
+    def _write_slot_mapping(
+        target: np.ndarray,
         page_ids: list[int],
         num_tokens: int,
         page_size: int,
         *,
         start_pos: int = 0,
-    ) -> torch.Tensor:
-        """Return physical slot indices for token positions start_pos..start_pos+num_tokens-1."""
-        mapping = torch.empty((num_tokens,), dtype=torch.int32)
+    ) -> None:
+        """Write physical slots directly into a preallocated kernel-buffer view."""
         if num_tokens > 0:
             max_pos = start_pos + num_tokens - 1
             max_page_idx = max_pos // page_size
@@ -1172,12 +1130,21 @@ class Qwen314BModelRunner(ModelRunner):
                     f"page_ids list length {len(page_ids)} is too small for position {max_pos}; "
                     f"need at least {max_page_idx + 1} pages"
                 )
-        for offset_idx in range(num_tokens):
-            pos = start_pos + offset_idx
-            page_idx = pos // page_size
-            offset = pos % page_size
-            mapping[offset_idx] = page_ids[page_idx] * page_size + offset
-        return mapping
+
+        target_offset = 0
+        pos = start_pos
+        end_pos = start_pos + num_tokens
+        while pos < end_pos:
+            page_idx, page_offset = divmod(pos, page_size)
+            span = min(end_pos - pos, page_size - page_offset)
+            physical_start = page_ids[page_idx] * page_size + page_offset
+            target[target_offset : target_offset + span] = np.arange(
+                physical_start,
+                physical_start + span,
+                dtype=target.dtype,
+            )
+            target_offset += span
+            pos += span
 
     @staticmethod
     def _write_block_table_row(

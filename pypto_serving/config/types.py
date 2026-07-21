@@ -235,15 +235,17 @@ class KvAllocation:
 
 @dataclass
 class PrefillBatch:
-    """Inputs for a batched prompt prefill call."""
+    """Packed inputs for a batched prompt prefill call."""
 
     request_ids: list[str]
     token_ids: torch.Tensor
     input_embeddings: torch.Tensor | None
-    seq_lens: torch.Tensor
+    seq_lens: list[int]
+    chunk_lens: list[int]
+    chunk_offsets: list[int]
+    chunk_starts: list[int]
     allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
-    positions: torch.Tensor | None = None
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)

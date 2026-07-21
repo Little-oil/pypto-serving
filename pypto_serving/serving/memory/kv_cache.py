@@ -188,14 +188,29 @@ class KvCacheManager:
         for block in self.blocks:
             self.free_queue.append(block)
 
-    def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
-        """Register model metadata; host-side tensors are allocated lazily."""
-        if model_id in self._pools:
-            return
+    def register_model(
+        self,
+        model_id: str,
+        config: ModelConfig,
+        runtime: RuntimeConfig,
+        *,
+        num_pages: int | None = None,
+    ) -> None:
+        """Register model metadata using the device-reported page capacity when supplied."""
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
-        num_pages = runtime.total_kv_pages
         if num_pages is None:
-            num_pages = runtime.max_batch_size * max_blocks_per_seq
+            num_pages = runtime.total_kv_pages
+            if num_pages is None:
+                num_pages = runtime.max_batch_size * max_blocks_per_seq
+        if num_pages <= 0:
+            raise ValueError(f"KV cache page count must be positive, got {num_pages}")
+        if model_id in self._pools:
+            if self._pools[model_id].num_pages != num_pages:
+                raise ValueError(
+                    f"Model {model_id} is already registered with "
+                    f"{self._pools[model_id].num_pages} KV pages, not {num_pages}"
+                )
+            return
         self._init_blocks(num_pages, runtime.page_size)
         kv_dtype = getattr(torch, runtime.kv_dtype)
         self._pools[model_id] = _CachePool(

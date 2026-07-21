@@ -84,6 +84,14 @@ class _Tokenizer:
         return " ".join(str(token_id) for token_id in token_ids)
 
 
+class _VariableLengthTokenizer:
+    def encode(self, text: str) -> list[int]:
+        return list(range(1, len(text) + 1))
+
+    def decode(self, token_ids: list[int]) -> str:
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
 def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
     scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
@@ -469,6 +477,7 @@ def _model(
     max_seq_len: int = 128,
     page_size: int = 64,
     eos_token_id: int | None = None,
+    max_num_batched_tokens: int = 4096,
 ) -> RuntimeModel:
     config = ModelConfig(
         model_id="test-model",
@@ -493,6 +502,7 @@ def _model(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         device="cpu",
+        max_num_batched_tokens=max_num_batched_tokens,
     )
     return RuntimeModel(
         config=config,
@@ -582,24 +592,25 @@ def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
     model = _model(max_batch_size=15)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
+    compiled = _compiled_kernels(model)
     runner = ModelRunner(
-        compiled=_compiled_kernels(model),
+        compiled=compiled,
     )
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
         for idx in range(2)
     ]
-    seq_lens = torch.tensor(
-        [idx + 1 for idx in range(len(allocations))],
-        dtype=torch.int32,
-    )
+    seq_lens = [idx + 1 for idx in range(len(allocations))]
     prepared = runner._prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=[alloc.request_id for alloc in allocations],
-            token_ids=torch.tensor([[1, 0], [2, 3]], dtype=torch.long),
+            token_ids=torch.tensor([1, 2, 3], dtype=torch.long),
             input_embeddings=None,
             seq_lens=seq_lens,
+            chunk_lens=[1, 2],
+            chunk_offsets=[0, 1],
+            chunk_starts=[0, 0],
             kv_allocations=allocations,
         ),
     )
@@ -618,10 +629,11 @@ def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
     assert prepared.block_table[0].item() == allocations[0].page_ids[0]
     assert prepared.block_table[4:].tolist() == [-1] * (prepared.block_table.numel() - 4)
     assert prepared.slot_mapping.shape == (3,)
+    assert prepared.slot_mapping.data_ptr() == compiled.prefill_slot_mapping_buffer.data_ptr()
     assert prepared.slot_mapping[2].item() == manager.slot_mapping_for_request(allocations[1], 1)
 
 
-def test_prefill_inputs_pack_resumed_chunk_positions():
+def test_prefill_inputs_pack_resumed_chunk_metadata():
     model = _model(max_batch_size=1, max_seq_len=8, page_size=2)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
@@ -634,11 +646,13 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
         model,
         PrefillBatch(
             request_ids=[alloc.request_id],
-            token_ids=torch.tensor([[5, 6]], dtype=torch.long),
+            token_ids=torch.tensor([5, 6], dtype=torch.long),
             input_embeddings=None,
-            seq_lens=torch.tensor([4], dtype=torch.int32),
+            seq_lens=[4],
+            chunk_lens=[2],
+            chunk_offsets=[0],
+            chunk_starts=[2],
             kv_allocations=[alloc],
-            positions=torch.tensor([[2, 3]], dtype=torch.long),
         ),
     )
 
@@ -652,32 +666,18 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
     ]
 
 
-def test_prefill_inputs_reject_non_contiguous_chunk_positions():
-    model = _model(max_batch_size=1, max_seq_len=8, page_size=2)
-    manager = KvCacheManager()
-    manager.register_model(model.config.model_id, model.config, model.runtime)
-    runner = ModelRunner(
-        compiled=None,  # type: ignore[arg-type]
-    )
-    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
-
-    with pytest.raises(ValueError, match="contiguous chunk"):
-        runner._prepare_prefill_inputs(
-            model,
-            PrefillBatch(
-                request_ids=[alloc.request_id],
-                token_ids=torch.zeros(1, 3, dtype=torch.long),
-                input_embeddings=None,
-                seq_lens=torch.tensor([4], dtype=torch.int32),
-                kv_allocations=[alloc],
-                positions=torch.tensor([[1, 3, 4]], dtype=torch.long),
-            ),
-        )
-
-
-def test_compute_slot_mapping_rejects_insufficient_pages():
+def test_write_slot_mapping_rejects_insufficient_pages():
+    target = torch.empty(2, dtype=torch.int32).numpy()
     with pytest.raises(ValueError, match="too small"):
-        ModelRunner._compute_slot_mapping([0], 2, 2, start_pos=1)
+        ModelRunner._write_slot_mapping(target, [0], 2, 2, start_pos=1)
+
+
+def test_write_slot_mapping_fills_target_slice_across_physical_pages():
+    target = torch.full((6,), -1, dtype=torch.int32).numpy()
+
+    ModelRunner._write_slot_mapping(target[1:5], [7, 3], 4, 2)
+
+    assert target.tolist() == [-1, 14, 15, 6, 7, -1]
 
 
 def test_prepare_decode_inputs_writes_compiled_buffers_and_replicates_padding():
@@ -772,7 +772,7 @@ def test_engine_generate_batch_uses_batched_executor_results():
     engine._models[model.config.model_id] = ModelRecord(
         config=model.config,
         runtime=model.runtime,
-        tokenizer=_Tokenizer(),
+        tokenizer=_VariableLengthTokenizer(),
         layer_specs=[],
         runtime_model=model,
     )
@@ -785,6 +785,84 @@ def test_engine_generate_batch_uses_batched_executor_results():
 
     assert [result.token_ids for result in results] == [[0], [0]]
     assert [result.finish_reason for result in results] == ["eos", "eos"]
+    assert len(executor.prefill_batches) == 1
+    prefill_batch = executor.prefill_batches[0]
+    assert prefill_batch.token_ids.ndim == 1
+    assert prefill_batch.token_ids.tolist() == [1, 1, 2, 3, 4]
+    assert prefill_batch.chunk_lens == [1, 4]
+    assert prefill_batch.chunk_offsets == [0, 1]
+    assert prefill_batch.chunk_starts == [0, 0]
+    assert prefill_batch.token_ids.numel() == sum(prefill_batch.chunk_lens)
+    assert prefill_batch.input_embeddings is not None
+    assert prefill_batch.input_embeddings.shape == (5, model.config.hidden_size)
+    assert executor.embedding_lookup_shapes == [(5,)]
+
+
+def test_engine_chunked_prefill_packs_each_chunk_without_full_prompt_staging():
+    model = _model(
+        max_batch_size=2,
+        eos_token_id=0,
+        max_num_batched_tokens=3,
+    )
+    manager = KvCacheManager()
+    executor = _ImmediateEosExecutor(manager)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_VariableLengthTokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    results = engine.generate_batch(
+        model.config.model_id,
+        ["a", "abcd"],
+        GenerateConfig(max_new_tokens=1, temperature=0.0),
+    )
+
+    assert [result.token_ids for result in results] == [[0], [0]]
+    assert len(executor.prefill_batches) == 2
+    first_chunk, second_chunk = executor.prefill_batches
+    assert first_chunk.token_ids.tolist() == [1, 1, 2]
+    assert first_chunk.seq_lens == [1, 2]
+    assert first_chunk.chunk_lens == [1, 2]
+    assert first_chunk.chunk_offsets == [0, 1]
+    assert first_chunk.chunk_starts == [0, 0]
+    assert second_chunk.token_ids.tolist() == [3, 4]
+    assert second_chunk.seq_lens == [4]
+    assert second_chunk.chunk_lens == [2]
+    assert second_chunk.chunk_offsets == [0]
+    assert second_chunk.chunk_starts == [2]
+    assert executor.embedding_lookup_shapes == [(3,), (2,)]
+
+
+def test_engine_init_model_uses_executor_reported_kv_capacity():
+    model = _model(max_batch_size=2, max_seq_len=128, page_size=64)
+    loaded = SimpleNamespace(
+        config=model.config,
+        runtime_model=model,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+    )
+    loader = SimpleNamespace(load=lambda **_kwargs: loaded)
+    manager = KvCacheManager()
+    executor = _ImmediateEosExecutor(manager)
+    registered_records = []
+
+    def register_model(model_id, record):
+        registered_records.append((model_id, record))
+        return 3
+
+    executor.register_model = register_model
+    engine = LLMEngine(model_loader=loader, kv_cache_manager=manager, executor=executor)
+
+    engine.init_model(model.config.model_id, "/unused")
+
+    assert manager.num_blocks == 3
+    assert manager.num_free_blocks == 3
+    assert registered_records == [(model.config.model_id, engine._models[model.config.model_id])]
 
 
 def test_engine_uses_device_sampled_prefill_token_when_available():
@@ -1442,6 +1520,63 @@ def test_async_pipeline_drains_stale_result_after_error():
     assert core._discard_result_step_ids == set()
 
 
+def test_serving_worker_packs_variable_length_prefill_chunks():
+    model = _model(max_batch_size=2, eos_token_id=0)
+    manager = KvCacheManager()
+    executor = _ImmediateEosExecutor(manager)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = executor
+    worker.sampler = _FixedSampler(token_id=0)
+    worker.model_record = SimpleNamespace(config=model.config)
+    worker._req_cache = {
+        "long": NewRequestData(
+            request_id="long",
+            prompt_token_ids=[1, 2, 3, 4],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=None,
+        ),
+        "short": NewRequestData(
+            request_id="short",
+            prompt_token_ids=[5],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=None,
+        ),
+    }
+    scheduled = [
+        PrefillRequest(
+            request_id="long",
+            chunk_tokens=[2, 3, 4],
+            num_computed_tokens=1,
+            block_ids=[0],
+        ),
+        PrefillRequest(
+            request_id="short",
+            chunk_tokens=[5],
+            num_computed_tokens=0,
+            block_ids=[1],
+        ),
+    ]
+    new_tokens: dict[str, list[int]] = {}
+
+    worker._batch_prefill(scheduled, model, new_tokens)
+
+    assert new_tokens == {"long": [0], "short": [0]}
+    assert len(executor.prefill_batches) == 1
+    prefill_batch = executor.prefill_batches[0]
+    assert prefill_batch.token_ids.ndim == 1
+    assert prefill_batch.token_ids.tolist() == [2, 3, 4, 5]
+    assert prefill_batch.seq_lens == [4, 1]
+    assert prefill_batch.chunk_lens == [3, 1]
+    assert prefill_batch.chunk_offsets == [0, 3]
+    assert prefill_batch.chunk_starts == [1, 0]
+    assert prefill_batch.token_ids.numel() == sum(prefill_batch.chunk_lens)
+    assert prefill_batch.input_embeddings is not None
+    assert prefill_batch.input_embeddings.shape == (4, model.config.hidden_size)
+    assert executor.embedding_lookup_shapes == [(4,)]
+
+
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
     model = _model(max_batch_size=1, page_size=256)
     model.layers = [_layer(model.config.hidden_size, model.config.intermediate_size, model.config.head_dim)]
@@ -1487,9 +1622,12 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         model,
         PrefillBatch(
             request_ids=["prefill"],
-            token_ids=torch.zeros(1, 1, dtype=torch.long),
+            token_ids=torch.zeros(1, dtype=torch.long),
             input_embeddings=None,
-            seq_lens=torch.tensor([1], dtype=torch.int32),
+            seq_lens=[1],
+            chunk_lens=[1],
+            chunk_offsets=[0],
+            chunk_starts=[0],
             kv_allocations=[prefill_alloc],
         ),
     )
@@ -1569,7 +1707,7 @@ def test_prefill_host_inlines_embedding_and_keeps_sampling_standalone():
         pytest.skip("pypto-lib submodule is not checked out")
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
-    assert 'name_hint="token_embed"' in prefill_source
+    assert 'name_hint="token_embed' in prefill_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -1605,8 +1743,15 @@ class _CopyKernel:
 class _ImmediateEosExecutor(ModelExecutor):
     def __init__(self, kv_cache_manager: KvCacheManager) -> None:
         super().__init__(kv_cache_manager)
+        self.prefill_batches: list[PrefillBatch] = []
+        self.embedding_lookup_shapes: list[tuple[int, ...]] = []
+
+    def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
+        self.embedding_lookup_shapes.append(tuple(token_ids.shape))
+        return super().lookup_embeddings(model, token_ids)
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        self.prefill_batches.append(batch)
         logits = torch.full((len(batch.request_ids), model.config.vocab_size), -1.0)
         logits[:, 0] = 1.0
         hidden = torch.zeros(len(batch.request_ids), model.config.hidden_size)
