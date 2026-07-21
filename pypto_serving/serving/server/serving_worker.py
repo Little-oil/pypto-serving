@@ -168,13 +168,29 @@ class WorkerProcess:
             if isinstance(cmd, ShutdownCommand):
                 logger.info("Worker received shutdown command")
                 break
+            elif cmd.type == "release":
+                self._release_requests(cmd.finished_request_ids)
+            elif cmd.type == "step":
+                self._release_requests(cmd.finished_request_ids)
 
             self._handle_step_command(cmd)
 
         logger.info("Worker exiting")
 
-    def _handle_step_command(self, cmd: StepCommand) -> None:
-        """Handle a StepCommand and push an encoded StepResult.
+    def _release_requests(self, request_ids) -> None:
+        """Release executor-owned state for completed or aborted requests."""
+        if not request_ids:
+            return
+        release_finished = getattr(self.executor, "release_finished_requests", None)
+        if callable(release_finished):
+            release_finished(request_ids)
+
+    def close(self) -> None:
+        """Release executor-owned runtime and device resources."""
+        executor = self.executor
+        self.executor = None
+        if executor is None:
+            return
 
         The whole body is guarded: an exception during request registration or
         device-resource release (steps 1-2) would otherwise propagate out of the

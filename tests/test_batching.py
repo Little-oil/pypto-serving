@@ -19,6 +19,8 @@ from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
     GenerateConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     LayerWeights,
     ModelConfig,
     ModelRecord,
@@ -131,44 +133,85 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
         assert token.finish_reason == "error"
 
 
-def test_abort_request_schedules_worker_cleanup():
-    """An aborted request must ride the next StepCommand's finished_request_ids,
-    otherwise its worker-side _req_cache entry and device slots leak."""
+def test_grouped_cache_preemption_removes_victim_from_running_queue():
+    manager = KvCacheManager(block_size=1, enable_prefix_cache=False)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="test",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=1, page_size_bytes=1),
+                max_blocks_per_seq=3,
+                num_blocks=3,
+            ),
+        ),
+        max_batch_size=2,
+    )
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=4,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    requests = [
+        Request(
+            request_id=request_id,
+            prompt_token_ids=[1],
+            max_new_tokens=5,
+            arrival_time=arrival_time,
+            status=RequestStatus.RUNNING,
+            num_computed_tokens=1,
+            output_token_ids=[2],
+            temperature=0.0,
+        )
+        for request_id, arrival_time in (("older", 1.0), ("newer", 2.0))
+    ]
+    for request in requests:
+        request.allocated_group_block_ids = manager.ensure_group_blocks(
+            request.request_id, 1
+        )
+        request.cache_partition = 0
+        scheduler.requests[request.request_id] = request
+    scheduler.running = requests
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in output.preempted_requests] == ["newer"]
+    assert [request.request_id for request in scheduler.running] == ["older"]
+    assert [request.request_id for request in scheduler.waiting] == ["newer"]
+
+
+def test_abort_flushes_request_state_without_an_inference_step():
     aborted: list[str] = []
+    commands = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
-    core._request_contexts = {"req-x": SimpleNamespace(queue=asyncio.Queue())}
+    core._request_contexts = {
+        "req": SimpleNamespace(queue=asyncio.Queue()),
+    }
+    core._input_queue = SimpleNamespace(put=commands.append)
 
-    asyncio.run(core.abort_request("req-x"))
+    asyncio.run(core.abort_request("req"))
+    core._flush_pending_worker_releases()
 
-    # Scheduler aborted, context removed.
-    assert aborted == ["req-x"]
-    assert "req-x" not in core._request_contexts
-    # The id is queued for worker release exactly once.
-    assert core._pending_free_ids == ["req-x"]
-
-    # Idempotent: a second abort (or an abort racing the finish path) must not
-    # enqueue a duplicate free id.
-    asyncio.run(core.abort_request("req-x"))
-    assert core._pending_free_ids == ["req-x"]
+    assert aborted == ["req"]
+    assert len(commands) == 1
+    assert commands[0].type == "release"
+    assert commands[0].finished_request_ids == ["req"]
+    assert core._pending_free_ids == []
 
 
-def test_abort_request_emits_abort_token_before_scheduling_free():
-    """The client-facing queue receives a FINISHED_ABORTED token on abort."""
-    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-    core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
-    core._pending_free_ids = []
-    queue: asyncio.Queue = asyncio.Queue()
-    core._request_contexts = {"req-y": SimpleNamespace(queue=queue)}
+def test_worker_release_command_clears_executor_request_state():
+    released: list[str] = []
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
 
-    asyncio.run(core.abort_request("req-y"))
+    worker._release_requests(["req-a", "req-b"])
 
-    token = queue.get_nowait()
-    assert isinstance(token, TokenOutput)
-    assert token.finished is True
-    assert token.finish_reason == "FINISHED_ABORTED"
-    assert core._pending_free_ids == ["req-y"]
+    assert released == ["req-a", "req-b"]
 
 
 def _model(

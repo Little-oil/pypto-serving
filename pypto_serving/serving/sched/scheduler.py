@@ -209,6 +209,11 @@ class Scheduler:
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
         for request in self.running:
+            # A request later in this snapshot may have been preempted while
+            # scheduling an earlier request. Do not schedule it again from the
+            # stale iteration snapshot.
+            if request.status is RequestStatus.PREEMPTED:
+                continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
                 running_to_keep.append(request)
                 continue
@@ -273,7 +278,14 @@ class Scheduler:
             token_budget -= scheduled_tokens
             running_to_keep.append(request)
 
-        self.running = running_to_keep
+        # Victims that appeared earlier in the iteration may already be in
+        # running_to_keep. They now live in the waiting queue and must not be
+        # retained in both queues.
+        self.running = [
+            request
+            for request in running_to_keep
+            if request.status is not RequestStatus.PREEMPTED
+        ]
 
         # Fixed-shape DeepSeek decode rows use otherwise-free cache blocks as
         # scratch space. Do not admit a new prefill wave while a decode wave is
