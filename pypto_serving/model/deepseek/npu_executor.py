@@ -221,11 +221,11 @@ def _deepseek_v4_import_context(
     *,
     pypto_root: Path,
     ep: int,
-    tp: int | None = None,
+    lm_head_tp: int | None = None,
     moe_shape: str | None = None,
     num_layers: int | None = None,
 ):
-    """Temporarily import DeepSeekV4 pypto-lib modules with a fixed EP argv."""
+    """Import DeepSeekV4 kernels with fixed EP and LM-head TP arguments."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
     missing = object()
@@ -239,8 +239,10 @@ def _deepseek_v4_import_context(
         if module_file is not None and _is_deepseek_v4_module_file(Path(module_file), kernel_dir):
             sys.modules.pop(module_name, None)
     sys.argv = ["pypto-serving-deepseek-v4", "--ep", str(int(ep))]
-    if tp is not None:
-        sys.argv.extend(["--tp", str(int(tp))])
+    if lm_head_tp is not None:
+        # pypto-lib names this kernel-local LM-head sharding argument ``--tp``;
+        # it is independent of pypto-serving's model-level CLI TP setting.
+        sys.argv.extend(["--tp", str(int(lm_head_tp))])
     if moe_shape is not None:
         sys.argv.extend(["--moe-shape", moe_shape])
     if num_layers is not None:
@@ -462,7 +464,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             self._kernel_dir,
             pypto_root=pypto_root,
             ep=ranks,
-            tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="prefill",
             num_layers=fwd_layers,
         ):
@@ -473,7 +475,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             self._kernel_dir,
             pypto_root=pypto_root,
             ep=ranks,
-            tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="decode",
         ):
             config = importlib.import_module("config")
