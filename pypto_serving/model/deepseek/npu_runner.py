@@ -96,7 +96,6 @@ _MAIN_STATIC_RESIDENT_POLICY = {
     "hc_head_scale": False,
     "hc_head_base": False,
     "final_norm_w": False,
-    "lm_head_weight": False,
 }
 _MAIN_CACHE_RESIDENT_POLICY = {
     "kv_cache": True,
