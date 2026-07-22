@@ -134,7 +134,7 @@ jobs:
         run: |
           source activate.sh
           pip install nanobind
-          pip install torch transformers safetensors numpy fastapi uvicorn pytest
+          pip install torch transformers safetensors numpy fastapi uvicorn pytest msgspec
           pip install --no-deps -e .
 
       - name: Show ccache stats (after)

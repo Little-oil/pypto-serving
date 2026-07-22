@@ -20,14 +20,24 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
-from pypto_serving.config.types import RuntimeConfig, StepOutput, WorkerCommand
+from pypto_serving.config.types import RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
     Scheduler,
     SchedulerConfig,
     SchedulerOutput,
+)
+from pypto_serving.serving.server.ipc import (
+    DecodeRequest,
+    NewRequestData,
+    PrefillRequest,
+    ShutdownCommand,
+    StepCommand,
+    decode_result,
+    encode_command,
 )
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from pypto_serving.tools.profile import profile_instant, profile_span
@@ -111,6 +121,17 @@ class EngineConfig:
 class _RequestContext:
     request: Request
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # When False (non-streaming), intermediate TokenOutputs are suppressed and
+    # only the final one is enqueued — one queue push / one HTTP wake-up per
+    # request instead of one per token. Stop-string detection still runs every
+    # step; only publishing is deferred (cf. vLLM's FINAL_ONLY output kind).
+    stream: bool = True
+    # Incremental-detokenization state (avoids re-decoding the full output each
+    # step, which would be O(N^2) over a generation). detok_text is the running
+    # cumulative text; the offsets bound the per-step decode window.
+    detok_text: str = ""
+    detok_prefix_offset: int = 0
+    detok_read_offset: int = 0
 
 
 @dataclass
@@ -173,6 +194,9 @@ class ReplicaEngineCore:
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
+        # Tracks which request_ids the worker has already received via
+        # NewRequestData — prompt tokens are sent exactly once per request.
+        self._worker_known_req_ids: set[str] = set()
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -204,6 +228,12 @@ class ReplicaEngineCore:
                 actual_num_pages,
                 self._runtime.page_size,
             )
+
+        # The KV-cache block pool, scheduler tables and tokenizer are now
+        # resident. Freeze the engine-process heap so the GC won't rescan them
+        # during serving (see gc_utils). Per-process: the worker freezes its
+        # own heap separately.
+        freeze_gc_heap()
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())
@@ -270,7 +300,7 @@ class ReplicaEngineCore:
                 top_k=config.top_k,
             )
 
-            ctx = _RequestContext(request=request)
+            ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
             logger.info(
@@ -285,11 +315,13 @@ class ReplicaEngineCore:
                 args={"request_id": request_id, "prompt_tokens": len(prompt_token_ids)},
             )
 
+        finished_normally = False
         try:
             while True:
                 output: TokenOutput = await ctx.queue.get()
                 yield output
                 if output.finished:
+                    finished_normally = True
                     e2e = time.time() - request.arrival_time
                     n_out = len(request.output_token_ids)
                     logger.info(
@@ -299,29 +331,59 @@ class ReplicaEngineCore:
                     )
                     break
         finally:
-            if request_id in self._request_contexts:
+            # Only cancellation/disconnect needs cleanup here. On normal
+            # completion the request already finished in the scheduler and
+            # _process_step_output already scheduled the worker free, so
+            # re-scheduling would double-release: the id may have been drained
+            # into a StepCommand before this finally runs, defeating a plain
+            # membership check and freeing the same request on the worker twice.
+            if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
                 self.scheduler.abort_request(request_id)
+                # Aborted/cancelled ids must ride the next StepCommand's
+                # finished_request_ids, otherwise they leak in _req_cache /
+                # _worker_known_req_ids and pin device resources.
+                self._schedule_worker_free(request_id)
 
     async def abort_request(self, request_id: str) -> None:
-        self.scheduler.abort_request(request_id)
         ctx = self._request_contexts.pop(request_id, None)
-        if ctx is not None:
-            await ctx.queue.put(
-                TokenOutput(finished=True, finish_reason="FINISHED_ABORTED")
-            )
+        if ctx is None:
+            # Already finished/cleaned up: nothing pinned to release, and the
+            # scheduler no longer tracks it. Avoid scheduling a duplicate free.
+            return
+        self.scheduler.abort_request(request_id)
+        await ctx.queue.put(
+            TokenOutput(finished=True, finish_reason="FINISHED_ABORTED")
+        )
+        # See note in add_request's finally block: schedule worker-side cleanup.
+        self._schedule_worker_free(request_id)
+
+    def _schedule_worker_free(self, request_id: str) -> None:
+        """Queue a request id for worker-side release on the next StepCommand.
+
+        Idempotent against ids still queued; combined with the single-owner
+        cleanup paths (normal completion vs. abort/cancel) this guarantees each
+        request is released on the worker exactly once.
+        """
+        if request_id not in self._pending_free_ids:
+            self._pending_free_ids.append(request_id)
 
     async def _engine_loop(self) -> None:
         """Main loop: schedule -> send to worker -> receive results -> dispatch."""
         logger.info("Engine loop started")
         while self._running:
             if not self.scheduler.has_work():
+                # No schedulable work, but a just-aborted request may still be
+                # pinned on the worker. Flush pending frees now instead of
+                # waiting for unrelated future work to carry them.
+                await self._flush_pending_frees()
                 await asyncio.sleep(self.config.engine_loop_interval)
                 continue
 
             with profile_span("scheduler.schedule", cat="scheduler"):
                 scheduler_output = self.scheduler.schedule()
             if scheduler_output.is_empty:
+                await self._flush_pending_frees()
                 await asyncio.sleep(self.config.engine_loop_interval)
                 continue
 
@@ -332,18 +394,13 @@ class ReplicaEngineCore:
                 cat="scheduler",
                 args={"scheduled": len(scheduler_output.scheduled_requests)},
             ):
-                self._input_queue.put(
-                    WorkerCommand(
-                        type="step",
-                        scheduler_output=scheduler_output,
-                        finished_request_ids=finished_ids or None,
-                    )
-                )
+                step_cmd = self._build_step_command(scheduler_output, finished_ids)
+                self._input_queue.put(encode_command(step_cmd))
 
             try:
                 with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                     step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
-                    step_output: StepOutput = await asyncio.to_thread(
+                    raw_output = await asyncio.to_thread(
                         self._output_queue.get, timeout=step_timeout
                     )
             except queue.Empty:
@@ -351,36 +408,160 @@ class ReplicaEngineCore:
                 self._handle_step_error(scheduler_output)
                 continue
 
-            if step_output.error:
-                logger.error(f"Worker returned error: {step_output.error}")
+            step_result = decode_result(raw_output)
+            error = step_result.error
+            # Unwrap list[int] values back to int | list[int] for update_from_output.
+            new_tokens: dict[str, int | list[int]] = {
+                req_id: (tokens[0] if len(tokens) == 1 else tokens)
+                for req_id, tokens in step_result.new_tokens.items()
+            }
+
+            if error:
+                logger.error(f"Worker returned error: {error}")
                 self._handle_step_error(scheduler_output)
                 continue
 
             with profile_span(
                 "scheduler.process_step_output",
                 cat="scheduler",
-                args={"new_tokens": len(step_output.new_tokens)},
+                args={"new_tokens": len(new_tokens)},
             ):
-                self._process_step_output(scheduler_output, step_output)
+                self._process_step_output(scheduler_output, new_tokens)
 
         logger.info("Engine loop stopped")
 
+    def _build_step_command(
+        self,
+        scheduler_output: SchedulerOutput,
+        finished_ids: list[str],
+    ) -> StepCommand:
+        """Build a lightweight StepCommand from the scheduler output.
+
+        Prompt tokens for requests that the worker has not yet seen are shipped
+        as ``NewRequestData`` entries exactly once; subsequent steps carry only
+        per-request deltas (~1 KB total at batch 16).
+        """
+        new_requests: list[NewRequestData] = []
+        prefill_requests: list[PrefillRequest] = []
+        decode_requests: list[DecodeRequest] = []
+
+        for sr in scheduler_output.scheduled_requests:
+            req = sr.request
+            req_id = req.request_id
+
+            # Register with worker the first time this request is scheduled.
+            if req_id not in self._worker_known_req_ids:
+                new_requests.append(NewRequestData(
+                    request_id=req_id,
+                    prompt_token_ids=list(req.prompt_token_ids),
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                ))
+                self._worker_known_req_ids.add(req_id)
+
+            if sr.is_prefill:
+                num_computed = sr.num_computed_tokens
+                num_new = sr.num_new_tokens
+                chunk_tokens = req.prompt_token_ids[num_computed: num_computed + num_new]
+                prefill_requests.append(PrefillRequest(
+                    request_id=req_id,
+                    chunk_tokens=list(chunk_tokens),
+                    num_computed_tokens=num_computed,
+                    block_ids=list(sr.block_ids),
+                ))
+            else:
+                output_ids = req.output_token_ids
+                prompt_ids = req.prompt_token_ids
+                last_token = output_ids[-1] if output_ids else prompt_ids[-1]
+                if len(output_ids) >= 2:
+                    prev_token = output_ids[-2]
+                elif output_ids and prompt_ids:
+                    prev_token = prompt_ids[-1]
+                else:
+                    prev_token = last_token
+                decode_requests.append(DecodeRequest(
+                    request_id=req_id,
+                    last_token=last_token,
+                    prev_token=prev_token,
+                    seq_len=req.num_tokens,
+                    block_ids=list(sr.block_ids),
+                ))
+
+        # Remove finished requests from the known-set so they are re-registered
+        # if the same request_id is ever reused (unlikely but correct).
+        for req_id in finished_ids:
+            self._worker_known_req_ids.discard(req_id)
+
+        return StepCommand(
+            new_requests=new_requests,
+            prefill_requests=prefill_requests,
+            decode_requests=decode_requests,
+            finished_request_ids=finished_ids,
+        )
+
+    async def _flush_pending_frees(self) -> None:
+        """Send a cleanup-only StepCommand when frees are pending but no work is
+        schedulable, so an aborted request's worker cache / device slot is not
+        pinned until unrelated future work happens to carry the free along.
+
+        The worker tolerates empty prefill/decode batches and replies with an
+        empty StepResult, which we drain to keep the request/response queues in
+        lock-step with the normal loop.
+        """
+        if not self._pending_free_ids:
+            return
+
+        finished_ids = self._pending_free_ids.copy()
+        self._pending_free_ids.clear()
+        for req_id in finished_ids:
+            self._worker_known_req_ids.discard(req_id)
+
+        cleanup_cmd = StepCommand(
+            new_requests=[],
+            prefill_requests=[],
+            decode_requests=[],
+            finished_request_ids=finished_ids,
+        )
+        self._input_queue.put(encode_command(cleanup_cmd))
+        try:
+            step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
+            raw_output = await asyncio.to_thread(
+                self._output_queue.get, timeout=step_timeout
+            )
+        except queue.Empty:
+            logger.error(f"Worker cleanup-step timed out ({step_timeout:g}s)")
+            return
+        step_result = decode_result(raw_output)
+        if step_result.error:
+            logger.error(f"Worker cleanup-step returned error: {step_result.error}")
+
+    def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
+        """On worker error, abort all requests in the failed batch."""
+        for sr in scheduler_output.scheduled_requests:
+            request_id = sr.request.request_id
+            ctx = self._request_contexts.get(request_id)
+            if ctx is not None:
+                ctx.queue.put_nowait(
+                    TokenOutput(finished=True, finish_reason="error")
+                )
+            self._schedule_worker_free(request_id)
+            self.scheduler.abort_request(request_id)
+
     def _process_step_output(
-        self, scheduler_output: SchedulerOutput, step_output: StepOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        new_tokens: dict[str, int | list[int]],
     ) -> None:
         """Process worker results: update scheduler state, push tokens to request queues."""
-        request_outputs = self.scheduler.update_from_output(
-            scheduler_output, step_output.new_tokens
-        )
+        request_outputs = self.scheduler.update_from_output(scheduler_output, new_tokens)
 
         for req_output in request_outputs:
             ctx = self._request_contexts.get(req_output.request_id)
             if ctx is None:
                 continue
 
-            text = ""
-            if ctx.request.output_token_ids:
-                text = self.tokenizer.decode(ctx.request.output_token_ids)
+            text = self._detokenize_incrementally(ctx)
 
             if not req_output.finished and ctx.request.stop_strings:
                 for stop in ctx.request.stop_strings:
@@ -393,7 +574,20 @@ class ReplicaEngineCore:
                         break
 
             if req_output.finished:
-                self._pending_free_ids.append(req_output.request_id)
+                # Flush the authoritative full decode: if generation ends while a
+                # multi-token character is incomplete (or a token legitimately
+                # decodes to U+FFFD), the incremental path withholds that tail
+                # forever. A one-shot full decode at finish guarantees the final
+                # text matches the offline baseline instead of being truncated.
+                text = self._finalize_detokenization(ctx)
+                self._schedule_worker_free(req_output.request_id)
+
+            # Non-streaming requests only need the final output: suppress
+            # intermediate ones to save a queue push and HTTP-coroutine wake-up
+            # per token. Detok + stop detection above still ran this step, so the
+            # final text is complete.
+            if not ctx.stream and not req_output.finished:
+                continue
 
             token_output = TokenOutput(
                 token_id=req_output.new_token_id,
@@ -403,18 +597,57 @@ class ReplicaEngineCore:
             )
             ctx.queue.put_nowait(token_output)
 
-    def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
-        """On worker error, abort all requests in the failed batch."""
-        for sr in scheduler_output.scheduled_requests:
-            request_id = sr.request.request_id
-            ctx = self._request_contexts.get(request_id)
-            if ctx is not None:
-                ctx.queue.put_nowait(
-                    TokenOutput(finished=True, finish_reason="error")
-                )
-            if request_id not in self._pending_free_ids:
-                self._pending_free_ids.append(request_id)
-            self.scheduler.abort_request(request_id)
+    def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
+        """Decode only the newly-completed text and append it to the running text.
+
+        O(1) amortized per step (bounded decode window) instead of re-decoding
+        the full output_token_ids every step (O(N^2) over a generation).
+        Returns the cumulative decoded text so far.
+        """
+        output_ids = ctx.request.output_token_ids
+        if not output_ids:
+            return ctx.detok_text
+
+        # Decode a short window: [prefix_offset:] gives context so the delta is
+        # rendered identically to a full decode; the delta is the tail beyond
+        # what [prefix_offset:read_offset] already covered.
+        prefix_ids = output_ids[ctx.detok_prefix_offset: ctx.detok_read_offset]
+        new_ids = output_ids[ctx.detok_prefix_offset:]
+
+        prefix_text = self.tokenizer.decode(prefix_ids) if prefix_ids else ""
+        new_text = self.tokenizer.decode(new_ids)
+
+        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+            # No new complete text yet (e.g. mid multi-token character); wait for
+            # more tokens without advancing offsets.
+            return ctx.detok_text
+
+        delta = new_text[len(prefix_text):]
+        ctx.detok_text += delta
+        # Keep a small sliding context window (last few tokens) rather than
+        # collapsing the prefix onto the read offset. A 1-2 token prefix loses
+        # boundary context and can corrupt spacing / multi-token characters for
+        # SentencePiece / byte-level BPE tokenizers.
+        ctx.detok_read_offset = len(output_ids)
+        ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
+        return ctx.detok_text
+
+    def _finalize_detokenization(self, ctx: _RequestContext) -> str:
+        """Return the authoritative final text for a finished request.
+
+        The incremental path withholds a trailing U+FFFD (an incomplete
+        multi-token character) waiting for a token that never arrives once
+        generation stops. A single full decode of the whole output at finish
+        matches the offline baseline; O(N) once per request is negligible.
+        """
+        output_ids = ctx.request.output_token_ids
+        if not output_ids:
+            return ctx.detok_text
+        final_text = self.tokenizer.decode(output_ids)
+        ctx.detok_text = final_text
+        ctx.detok_read_offset = len(output_ids)
+        ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
+        return final_text
 
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue
@@ -422,7 +655,8 @@ class ReplicaEngineCore:
 
         if input_q is not None:
             with contextlib.suppress(Exception):
-                input_q.put(WorkerCommand(type="shutdown"))
+                # New protocol: send encoded ShutdownCommand bytes.
+                input_q.put(encode_command(ShutdownCommand()))
 
         if process is not None:
             with contextlib.suppress(Exception):

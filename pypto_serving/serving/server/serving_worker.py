@@ -22,8 +22,17 @@ from pypto_serving.config.types import (
     DecodeBatch,
     PrefillBatch,
     SamplingParams,
-    StepOutput,
-    WorkerCommand,
+)
+from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
+from pypto_serving.serving.server.ipc import (
+    DecodeRequest,
+    NewRequestData,
+    PrefillRequest,
+    ShutdownCommand,
+    StepCommand,
+    StepResult,
+    decode_command,
+    encode_result,
 )
 from pypto_serving.tools.profile import get_profiler, profile_span
 
@@ -54,6 +63,9 @@ class WorkerProcess:
         self.sampler = None
         self.model_record = None
         self._page_size: int = 64
+        # Request cache: prompt tokens + sampling params registered once per request.
+        # Populated by StepCommand.new_requests; entries removed when the request finishes.
+        self._req_cache: dict[str, NewRequestData] = {}
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -141,104 +153,91 @@ class WorkerProcess:
         logger.info("Worker entering busy loop")
         while True:
             try:
-                cmd: WorkerCommand = self.input_queue.get()
+                raw: bytes = self.input_queue.get()
             except Exception:
                 break
 
-            if cmd.type == "shutdown":
+            try:
+                cmd = decode_command(raw)
+            except Exception as e:
+                logger.error(f"Worker failed to decode command: {e}", exc_info=True)
+                self.output_queue.put(encode_result(StepResult(new_tokens={}, error=str(e))))
+                continue
+
+            if isinstance(cmd, ShutdownCommand):
                 logger.info("Worker received shutdown command")
                 break
-            elif cmd.type == "step":
-                if cmd.finished_request_ids:
-                    release_finished = getattr(self.executor, "release_finished_requests", None)
-                    if callable(release_finished):
-                        release_finished(cmd.finished_request_ids)
 
-                try:
-                    result = self._execute_step(cmd.scheduler_output)
-                    self.output_queue.put(result)
-                except Exception as e:
-                    logger.error(f"Worker step failed: {e}", exc_info=True)
-                    self.output_queue.put(StepOutput(new_tokens={}, error=str(e)))
-            else:
-                logger.warning(f"Worker received unknown command: {cmd.type}")
+            self._handle_step_command(cmd)
 
         logger.info("Worker exiting")
 
-    def close(self) -> None:
-        """Release executor-owned runtime and device resources."""
-        executor = self.executor
-        self.executor = None
-        if executor is None:
-            return
+    def _handle_step_command(self, cmd: StepCommand) -> None:
+        """Handle a StepCommand and push an encoded StepResult.
 
-        close = getattr(executor, "close", None)
-        if callable(close):
-            close()
+        The whole body is guarded: an exception during request registration or
+        device-resource release (steps 1-2) would otherwise propagate out of the
+        busy loop and crash the worker. Any failure is reported back to the
+        engine as an error result so the loop keeps serving.
+        """
+        try:
+            # 1. Register new requests into the cache.
+            for nr in cmd.new_requests:
+                self._req_cache[nr.request_id] = nr
 
-    def _execute_step(self, scheduler_output) -> StepOutput:
-        """Execute one batch step (may contain prefill + decode requests)."""
+            # 2. Release finished requests from device and cache.
+            if cmd.finished_request_ids:
+                release_finished = getattr(self.executor, "release_finished_requests", None)
+                if callable(release_finished):
+                    release_finished(cmd.finished_request_ids)
+                for req_id in cmd.finished_request_ids:
+                    self._req_cache.pop(req_id, None)
+
+            # 3. Execute the step and return the encoded result.
+            result = self._execute_step(cmd)
+            self.output_queue.put(encode_result(result))
+        except Exception as e:
+            logger.error(f"Worker step failed: {e}", exc_info=True)
+            self.output_queue.put(encode_result(StepResult(new_tokens={}, error=str(e))))
+
+    def _execute_step(self, cmd: StepCommand) -> StepResult:
+        """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
-        new_tokens: dict[str, int | list[int]] = {}
-
-        prefill_requests = [
-            sr for sr in scheduler_output.scheduled_requests if sr.is_prefill
-        ]
-        decode_requests = [
-            sr for sr in scheduler_output.scheduled_requests if not sr.is_prefill
-        ]
+        new_tokens: dict[str, list[int]] = {}
 
         with profile_span(
             "WorkerProcess.execute_step",
             cat="worker",
-            args={"prefill": len(prefill_requests), "decode": len(decode_requests)},
+            args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
             with self.executor.session():
-                if prefill_requests:
-                    self._batch_prefill(prefill_requests, runtime_model, new_tokens)
-                if decode_requests:
-                    self._batch_decode(decode_requests, runtime_model, new_tokens)
+                if cmd.prefill_requests:
+                    self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
+                if cmd.decode_requests:
+                    self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
 
-        return StepOutput(new_tokens=new_tokens)
+        return StepResult(new_tokens=new_tokens)
 
     def _batch_prefill(
-        self, scheduled: list, runtime_model, new_tokens: dict[str, int | list[int]]
+        self,
+        scheduled: list[PrefillRequest],
+        runtime_model,
+        new_tokens: dict[str, list[int]],
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_prefill",
             cat="worker",
-            args={
-                "batch_size": len(scheduled),
-                "request_ids": [sr.request.request_id for sr in scheduled],
-            },
+            args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             device = runtime_model.runtime.device
             batch_size = len(scheduled)
+            max_chunk = max(len(pr.chunk_tokens) for pr in scheduled)
 
-            chunk_tokens_list = []
-            positions_list = []
-            seq_lens = []
-            block_ids_list = []
-
-            for sr in scheduled:
-                request = sr.request
-                num_computed = sr.num_computed_tokens
-                num_new = sr.num_new_tokens
-
-                chunk_tokens = request.prompt_token_ids[num_computed:num_computed + num_new]
-                chunk_tokens_list.append(chunk_tokens)
-
-                positions = range(num_computed, num_computed + num_new)
-                positions_list.append(positions)
-
-                seq_lens.append(num_computed + num_new)
-                block_ids_list.append(sr.block_ids)
-
-            max_chunk = max(len(t) for t in chunk_tokens_list)
             allow_device_greedy_sampling = (
                 self.executor.supports_device_sampling
-                and all(sr.request.temperature <= 0.0 for sr in scheduled)
+                and all(self._req_cache[pr.request_id].temperature <= 0.0 for pr in scheduled)
             )
+
             token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
             embeddings = None
             if not self.executor.supports_device_embedding:
@@ -249,21 +248,26 @@ class WorkerProcess:
                 )
             positions_tensor = torch.full((batch_size, max_chunk), -1, dtype=torch.long, device=device)
 
-            for i, tokens in enumerate(chunk_tokens_list):
-                row = torch.tensor(tokens, dtype=torch.long, device=device)
-                token_tensor[i, : len(tokens)] = row
+            seq_lens = []
+            block_ids_list = []
+            for i, pr in enumerate(scheduled):
+                row = torch.tensor(pr.chunk_tokens, dtype=torch.long, device=device)
+                token_tensor[i, : len(pr.chunk_tokens)] = row
                 if embeddings is not None:
-                    embeddings[i, : len(tokens), :] = self.executor.lookup_embeddings(
+                    embeddings[i, : len(pr.chunk_tokens), :] = self.executor.lookup_embeddings(
                         runtime_model, row
                     )
-                positions_tensor[i, : len(tokens)] = torch.tensor(
-                    list(positions_list[i]), dtype=torch.long, device=device
+                positions = range(pr.num_computed_tokens, pr.num_computed_tokens + len(pr.chunk_tokens))
+                positions_tensor[i, : len(pr.chunk_tokens)] = torch.tensor(
+                    list(positions), dtype=torch.long, device=device
                 )
+                seq_lens.append(pr.num_computed_tokens + len(pr.chunk_tokens))
+                block_ids_list.append(pr.block_ids)
 
             prefill_result = self.executor.run_prefill(
                 runtime_model,
                 PrefillBatch(
-                    request_ids=[sr.request.request_id for sr in scheduled],
+                    request_ids=[pr.request_id for pr in scheduled],
                     token_ids=token_tensor,
                     input_embeddings=embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
@@ -273,71 +277,54 @@ class WorkerProcess:
                 ),
             )
 
-            for i, sr in enumerate(scheduled):
-                request = sr.request
-                will_be_computed = sr.num_computed_tokens + sr.num_new_tokens
-                if will_be_computed >= request.num_prompt_tokens:
+            # Sample only for requests whose prefill chunk completes the prompt.
+            for i, pr in enumerate(scheduled):
+                cached = self._req_cache[pr.request_id]
+                # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
+                will_be_computed = pr.num_computed_tokens + len(pr.chunk_tokens)
+                if will_be_computed >= len(cached.prompt_token_ids):
                     logits = (
                         prefill_result.logits[i]
                         if prefill_result.logits.dim() > 1
                         else prefill_result.logits
                     )
                     params = SamplingParams(
-                        temperature=request.temperature,
-                        top_p=request.top_p,
-                        top_k=request.top_k,
+                        temperature=cached.temperature,
+                        top_p=cached.top_p,
+                        top_k=cached.top_k,
                     )
                     token_id = self._sample_result_row(
-                        prefill_result,
-                        logits,
-                        params,
-                        i,
-                        allow_device_greedy_sampling,
+                        prefill_result, logits, params, i, allow_device_greedy_sampling
                     )
-                    new_tokens[request.request_id] = token_id
+                    new_tokens[pr.request_id] = [token_id]
 
     def _batch_decode(
-        self, scheduled: list, runtime_model, new_tokens: dict[str, int | list[int]]
+        self,
+        scheduled: list[DecodeRequest],
+        runtime_model,
+        new_tokens: dict[str, list[int]],
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
-            args={
-                "batch_size": len(scheduled),
-                "request_ids": [sr.request.request_id for sr in scheduled],
-            },
+            args={"batch_size": len(scheduled), "request_ids": [dr.request_id for dr in scheduled]},
         ):
             device = runtime_model.runtime.device
 
-            decode_tokens = []
-            prev_tokens = []
-            block_ids_list = []
-            seq_lens = []
             allow_device_greedy_sampling = (
                 self.executor.supports_device_sampling
-                and all(sr.request.temperature <= 0.0 for sr in scheduled)
+                and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
             )
 
-            for sr in scheduled:
-                request = sr.request
-                output_ids = request.output_token_ids
-                prompt_ids = request.prompt_token_ids
-                last_token = output_ids[-1] if output_ids else prompt_ids[-1]
-                # Token at absolute position ``seq_len-2``; guard the single-token
-                # edge so we never index out of range.
-                if len(output_ids) >= 2:
-                    prev_token = output_ids[-2]
-                elif output_ids and prompt_ids:
-                    prev_token = prompt_ids[-1]
-                else:
-                    prev_token = last_token
-                decode_tokens.append(last_token)
-                prev_tokens.append(prev_token)
-                block_ids_list.append(sr.block_ids)
-                seq_lens.append(request.num_tokens)
+            decode_tokens = [dr.last_token for dr in scheduled]
+            prev_tokens = [dr.prev_token for dr in scheduled]
+            block_ids_list = [dr.block_ids for dr in scheduled]
+            seq_lens = [dr.seq_len for dr in scheduled]
 
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
             if self.executor.supports_device_embedding:
+                # Device kernel embeds directly from token ids — do not build
+                # host-side embedding tensors.
                 decode_embeddings = None
                 prev_embeddings = None
             else:
@@ -351,7 +338,7 @@ class WorkerProcess:
             decode_result = self.executor.run_decode(
                 runtime_model,
                 DecodeBatch(
-                    request_ids=[sr.request.request_id for sr in scheduled],
+                    request_ids=[dr.request_id for dr in scheduled],
                     token_ids=decode_token_tensor.unsqueeze(1),
                     hidden_states=decode_embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
@@ -362,13 +349,11 @@ class WorkerProcess:
                 ),
             )
 
-            for i, sr in enumerate(scheduled):
-                request = sr.request
+            for i, dr in enumerate(scheduled):
+                cached = self._req_cache[dr.request_id]
                 if decode_result.accepted_token_ids is not None:
-                    new_tokens[request.request_id] = decode_result.accepted_token_ids[i]
+                    new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
                     continue
-                # logits is None on the device-greedy path (the row is taken from
-                # sampled_token_ids in _sample_result_row); only index it otherwise.
                 logits = None
                 if decode_result.logits is not None:
                     logits = (
@@ -377,18 +362,25 @@ class WorkerProcess:
                         else decode_result.logits
                     )
                 params = SamplingParams(
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
+                    temperature=cached.temperature,
+                    top_p=cached.top_p,
+                    top_k=cached.top_k,
                 )
                 token_id = self._sample_result_row(
-                    decode_result,
-                    logits,
-                    params,
-                    i,
-                    allow_device_greedy_sampling,
+                    decode_result, logits, params, i, allow_device_greedy_sampling
                 )
-                new_tokens[request.request_id] = token_id
+                new_tokens[dr.request_id] = [token_id]
+
+    def close(self) -> None:
+        """Release executor-owned runtime and device resources."""
+        executor = self.executor
+        self.executor = None
+        if executor is None:
+            return
+
+        close = getattr(executor, "close", None)
+        if callable(close):
+            close()
 
     def _sample_result_row(
         self,
@@ -427,6 +419,11 @@ def _worker_entry(
     try:
         num_pages = worker.init_device_and_model()
         num_pages_value.value = num_pages
+        # Model weights, compiled kernels and KV-cache objects are now resident.
+        # Freeze them so the GC won't rescan them during decode (avoids
+        # multi-ms gen2 pauses landing mid-step). Must happen in this process:
+        # gc.freeze() does not cross the spawn boundary.
+        freeze_gc_heap()
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
