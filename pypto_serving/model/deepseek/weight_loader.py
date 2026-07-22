@@ -180,10 +180,6 @@ DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES = (
     "hca_cmp_ape",
     "hca_cmp_norm_w",
 )
-_DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE = 4
-_DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE = 128
-
-
 @dataclass(frozen=True)
 class DeepSeekV4StackedLayerWeights:
     """All hidden-layer weights stacked on the layer axis for ``l3_decode_fwd``.
@@ -606,8 +602,13 @@ class DeepSeekV4WeightStore:
         compress_ratio: int = 0,
         include_tid2eid: bool = False,
         include_gate_bias: bool = False,
+        destinations: Mapping[str, torch.Tensor] | None = None,
     ) -> DeepSeekV4PackedLayerWeights:
-        """Load and pack one layer into the tensor names expected by pypto-lib kernels."""
+        """Load and pack one layer into the tensor names expected by pypto-lib kernels.
+
+        When ``destinations`` is provided, packing writes directly into those
+        final-layout tensor views instead of allocating rank-expanded outputs.
+        """
         all_experts = range(n_routed_experts)
         raw = self.load_layer_weights(
             layer_id,
@@ -625,6 +626,7 @@ class DeepSeekV4WeightStore:
             compress_ratio=compress_ratio,
             include_tid2eid=include_tid2eid,
             include_gate_bias=include_gate_bias,
+            destinations=destinations,
         )
 
     def load_stacked_layer_weights(
@@ -645,19 +647,43 @@ class DeepSeekV4WeightStore:
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
-        per_layer: list[DeepSeekV4PackedLayerWeights] = []
+        first = self.load_packed_layer_weights(
+            0,
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=int(compress_ratios[0]),
+            include_tid2eid=num_hash_layers > 0,
+            include_gate_bias=num_hash_layers <= 0,
+        )
+        stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
+        csa_order = 0
+        hca_order = 0
         for layer_id in range(num_hidden_layers):
-            per_layer.append(
+            compress_ratio = int(compress_ratios[layer_id])
+            destinations = _stacked_layer_destinations(
+                stacked,
+                first,
+                fwd_names=fwd_names,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                csa_order=csa_order,
+                hca_order=hca_order,
+            )
+            if layer_id == 0:
+                _copy_packed_layer(first, destinations)
+            else:
                 self.load_packed_layer_weights(
                     layer_id,
                     ranks=ranks,
                     n_routed_experts=n_routed_experts,
-                    compress_ratio=int(compress_ratios[layer_id]),
+                    compress_ratio=compress_ratio,
                     include_tid2eid=layer_id < num_hash_layers,
                     include_gate_bias=layer_id >= num_hash_layers,
+                    destinations=destinations,
                 )
-            )
-        return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
+            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
+            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
+        return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
     def load_mtp_weights(
         self,
@@ -724,44 +750,101 @@ class DeepSeekV4WeightStore:
         return DeepSeekV4MtpWeights(tensors=tensors)
 
 
-def stack_deepseek_v4_layer_weights(
-    per_layer: Sequence[DeepSeekV4PackedLayerWeights],
+def _allocate_stacked_layer_weights(
+    template: DeepSeekV4PackedLayerWeights,
     *,
     compress_ratios: Sequence[int],
-) -> DeepSeekV4StackedLayerWeights:
-    """Concatenate per-layer packed weights into the layer-stacked decode_fwd groups."""
-    num_hidden_layers = len(per_layer)
-    if num_hidden_layers != len(compress_ratios):
-        raise ValueError("per_layer count must match compress_ratios length")
-    if num_hidden_layers <= 0:
-        raise ValueError("per_layer must include at least one layer")
-
-    csa_layers = [i for i in range(num_hidden_layers) if int(compress_ratios[i]) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE]
-    hca_layers = [i for i in range(num_hidden_layers) if int(compress_ratios[i]) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE]
-
-    csa_grouped = set(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES)
-    hca_grouped = set(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES)
-    fwd_names = [
-        name
-        for name in per_layer[0].tensors
-        if name not in csa_grouped and name not in hca_grouped
-    ]
-
-    def cat(names: Sequence[str], layer_ids: Sequence[int]) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        for name in names:
-            tensors = []
-            for layer_id in layer_ids:
-                tensor = per_layer[layer_id].tensors[name]
-                tensors.append(tensor.contiguous().cpu())
-            out[name] = torch.cat(tensors, dim=1).contiguous()
-        return out
-
+) -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
+    csa_names = set(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES)
+    hca_names = set(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES)
+    fwd_names = tuple(name for name in template.tensors if name not in csa_names and name not in hca_names)
+    group_counts = (
+        (fwd_names, len(compress_ratios)),
+        (
+            DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES,
+            sum(int(ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO for ratio in compress_ratios),
+        ),
+        (
+            DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
+            sum(int(ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO for ratio in compress_ratios),
+        ),
+    )
     stacked: dict[str, torch.Tensor] = {}
-    stacked.update(cat(fwd_names, range(num_hidden_layers)))
-    stacked.update(cat(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES, csa_layers))
-    stacked.update(cat(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES, hca_layers))
-    return DeepSeekV4StackedLayerWeights(tensors=stacked)
+    for names, count in group_counts:
+        if count == 0:
+            continue
+        for name in names:
+            source = template.tensors[name]
+            if source.ndim < 2:
+                raise ValueError(f"packed DeepSeekV4 weight {name} must have rank >= 2, got {source.ndim}")
+            shape = (int(source.shape[0]), count * int(source.shape[1]), *source.shape[2:])
+            stacked[name] = torch.empty(shape, dtype=source.dtype, device="cpu")
+    return stacked, fwd_names
+
+
+def _stacked_layer_destinations(
+    stacked: Mapping[str, torch.Tensor],
+    template: DeepSeekV4PackedLayerWeights,
+    *,
+    fwd_names: Sequence[str],
+    layer_id: int,
+    compress_ratio: int,
+    csa_order: int,
+    hca_order: int,
+) -> dict[str, torch.Tensor]:
+    destinations: dict[str, torch.Tensor] = {}
+
+    def add(names: Sequence[str], order: int) -> None:
+        for name in names:
+            width = int(template.tensors[name].shape[1])
+            destinations[name] = stacked[name][:, order * width : (order + 1) * width]
+
+    add(fwd_names, layer_id)
+    if compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO:
+        add(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES, csa_order)
+    elif compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO:
+        add(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES, hca_order)
+    return destinations
+
+
+def _copy_packed_layer(
+    packed: DeepSeekV4PackedLayerWeights,
+    destinations: Mapping[str, torch.Tensor],
+) -> None:
+    for name, destination in destinations.items():
+        source = packed.tensors[name]
+        if tuple(source.shape) != tuple(destination.shape) or source.dtype != destination.dtype:
+            raise ValueError(
+                f"packed DeepSeekV4 weight {name} shape/dtype mismatch: "
+                f"source={tuple(source.shape)}/{source.dtype}, "
+                f"destination={tuple(destination.shape)}/{destination.dtype}"
+            )
+        destination.copy_(source)
+
+
+def _replicate_weight(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    ranks: int,
+    dtype: torch.dtype | None,
+    destination: torch.Tensor | None,
+) -> torch.Tensor:
+    source = tensor.cpu() if tensor.device.type != "cpu" else tensor
+    output_dtype = source.dtype if dtype is None else dtype
+    expected_shape = (ranks, *source.shape)
+    if destination is not None:
+        if tuple(destination.shape) != expected_shape or destination.dtype != output_dtype:
+            raise ValueError(
+                f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
+                f"expected={expected_shape}/{output_dtype}, "
+                f"got={tuple(destination.shape)}/{destination.dtype}"
+            )
+        destination.copy_(source.unsqueeze(0))
+        return destination
+    if dtype is not None:
+        source = source.to(dtype=dtype)
+    return source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
 
 
 def pack_deepseek_v4_layer_weights(
@@ -773,9 +856,10 @@ def pack_deepseek_v4_layer_weights(
     compress_ratio: int,
     include_tid2eid: bool,
     include_gate_bias: bool,
+    destinations: Mapping[str, torch.Tensor] | None = None,
     prefix: str | None = None,
 ) -> DeepSeekV4PackedLayerWeights:
-    """Pack raw checkpoint tensors for one layer into rank-stacked kernel tensors."""
+    """Pack raw checkpoint tensors into new buffers or final-layout destinations."""
     prefix = f"layers.{int(layer_id)}" if prefix is None else prefix
 
     def get(suffix: str) -> torch.Tensor:
@@ -785,51 +869,72 @@ def pack_deepseek_v4_layer_weights(
         except KeyError as exc:
             raise KeyError(f"missing raw DeepSeekV4 layer tensor: {name}") from exc
 
-    def maybe(suffix: str) -> torch.Tensor | None:
-        return raw.get(f"{prefix}.{suffix}")
+    def replicated(
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        destination = None if destinations is None else destinations[name]
+        return _replicate_weight(
+            name,
+            tensor,
+            ranks=ranks,
+            dtype=dtype,
+            destination=destination,
+        )
 
-    def replicated(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
-        tensor = tensor.contiguous().cpu()
-        return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
-
-    def transposed(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        out = tensor.transpose(0, 1).contiguous().cpu()
-        return out.to(dtype=dtype) if dtype is not None else out
-
-    def replicated_transposed(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        return replicated(transposed(tensor, dtype=dtype))
+    def replicated_transposed(
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return replicated(name, tensor.transpose(0, 1), dtype=dtype)
 
     tensors: dict[str, torch.Tensor] = {
-        "hc_attn_fn": replicated(get("hc_attn_fn"), dtype=torch.float32),
-        "hc_attn_scale": replicated(get("hc_attn_scale"), dtype=torch.float32),
-        "hc_attn_base": replicated(get("hc_attn_base"), dtype=torch.float32),
-        "attn_norm_w": replicated(get("attn_norm.weight"), dtype=torch.bfloat16),
-        "wq_a": replicated_transposed(get("attn.wq_a.weight"), dtype=torch.bfloat16),
-        "wq_b": replicated_transposed(get("attn.wq_b.weight"), dtype=torch.int8),
-        "wq_b_scale": replicated(get("attn.wq_b.scale"), dtype=torch.float32),
-        "wkv": replicated_transposed(get("attn.wkv.weight"), dtype=torch.bfloat16),
-        "gamma_cq": replicated(get("attn.q_norm.weight"), dtype=torch.bfloat16),
-        "gamma_ckv": replicated(get("attn.kv_norm.weight"), dtype=torch.bfloat16),
-        "attn_sink": replicated(get("attn.attn_sink"), dtype=torch.float32),
-        "wo_a": replicated(_pack_wo_a(get("attn.wo_a.weight")), dtype=torch.bfloat16),
-        "wo_b": replicated(get("attn.wo_b.weight"), dtype=torch.int8),
-        "wo_b_scale": replicated(get("attn.wo_b.scale"), dtype=torch.float32),
-        "hc_ffn_fn": replicated(get("hc_ffn_fn"), dtype=torch.float32),
-        "hc_ffn_scale": replicated(get("hc_ffn_scale"), dtype=torch.float32),
-        "hc_ffn_base": replicated(get("hc_ffn_base"), dtype=torch.float32),
-        "norm_w": replicated(get("ffn_norm.weight"), dtype=torch.bfloat16),
-        "gate_w": replicated(get("ffn.gate.weight"), dtype=torch.float32),
-        "shared_w1": replicated(get("ffn.shared_experts.w1.weight"), dtype=torch.int8),
-        "shared_w1_scale": replicated(get("ffn.shared_experts.w1.scale"), dtype=torch.float32),
-        "shared_w3": replicated(get("ffn.shared_experts.w3.weight"), dtype=torch.int8),
-        "shared_w3_scale": replicated(get("ffn.shared_experts.w3.scale"), dtype=torch.float32),
-        "shared_w2": replicated(get("ffn.shared_experts.w2.weight"), dtype=torch.int8),
-        "shared_w2_scale": replicated(get("ffn.shared_experts.w2.scale"), dtype=torch.float32),
+        "hc_attn_fn": replicated("hc_attn_fn", get("hc_attn_fn"), dtype=torch.float32),
+        "hc_attn_scale": replicated("hc_attn_scale", get("hc_attn_scale"), dtype=torch.float32),
+        "hc_attn_base": replicated("hc_attn_base", get("hc_attn_base"), dtype=torch.float32),
+        "attn_norm_w": replicated("attn_norm_w", get("attn_norm.weight"), dtype=torch.bfloat16),
+        "wq_a": replicated_transposed("wq_a", get("attn.wq_a.weight"), dtype=torch.bfloat16),
+        "wq_b": replicated_transposed("wq_b", get("attn.wq_b.weight"), dtype=torch.int8),
+        "wq_b_scale": replicated("wq_b_scale", get("attn.wq_b.scale"), dtype=torch.float32),
+        "wkv": replicated_transposed("wkv", get("attn.wkv.weight"), dtype=torch.bfloat16),
+        "gamma_cq": replicated("gamma_cq", get("attn.q_norm.weight"), dtype=torch.bfloat16),
+        "gamma_ckv": replicated("gamma_ckv", get("attn.kv_norm.weight"), dtype=torch.bfloat16),
+        "attn_sink": replicated("attn_sink", get("attn.attn_sink"), dtype=torch.float32),
+        "wo_a": replicated("wo_a", _pack_wo_a(get("attn.wo_a.weight")), dtype=torch.bfloat16),
+        "wo_b": replicated("wo_b", get("attn.wo_b.weight"), dtype=torch.int8),
+        "wo_b_scale": replicated("wo_b_scale", get("attn.wo_b.scale"), dtype=torch.float32),
+        "hc_ffn_fn": replicated("hc_ffn_fn", get("hc_ffn_fn"), dtype=torch.float32),
+        "hc_ffn_scale": replicated("hc_ffn_scale", get("hc_ffn_scale"), dtype=torch.float32),
+        "hc_ffn_base": replicated("hc_ffn_base", get("hc_ffn_base"), dtype=torch.float32),
+        "norm_w": replicated("norm_w", get("ffn_norm.weight"), dtype=torch.bfloat16),
+        "gate_w": replicated("gate_w", get("ffn.gate.weight"), dtype=torch.float32),
+        "shared_w1": replicated("shared_w1", get("ffn.shared_experts.w1.weight"), dtype=torch.int8),
+        "shared_w1_scale": replicated(
+            "shared_w1_scale", get("ffn.shared_experts.w1.scale"), dtype=torch.float32
+        ),
+        "shared_w3": replicated("shared_w3", get("ffn.shared_experts.w3.weight"), dtype=torch.int8),
+        "shared_w3_scale": replicated(
+            "shared_w3_scale", get("ffn.shared_experts.w3.scale"), dtype=torch.float32
+        ),
+        "shared_w2": replicated("shared_w2", get("ffn.shared_experts.w2.weight"), dtype=torch.int8),
+        "shared_w2_scale": replicated(
+            "shared_w2_scale", get("ffn.shared_experts.w2.scale"), dtype=torch.float32
+        ),
     }
 
-    tensors.update(_pack_deepseek_v4_optional_attention(prefix, raw, ranks, compress_ratio=compress_ratio))
+    tensors.update(
+        _pack_deepseek_v4_optional_attention(
+            prefix,
+            raw,
+            ranks,
+            compress_ratio=compress_ratio,
+            destinations=destinations,
+        )
+    )
     tensors.update(
         _pack_deepseek_v4_router(
             prefix,
@@ -838,6 +943,7 @@ def pack_deepseek_v4_layer_weights(
             n_routed_experts=n_routed_experts,
             include_tid2eid=include_tid2eid,
             include_gate_bias=include_gate_bias,
+            destinations=destinations,
         )
     )
     tensors.update(
@@ -846,6 +952,7 @@ def pack_deepseek_v4_layer_weights(
             raw,
             ranks=ranks,
             n_routed_experts=n_routed_experts,
+            destinations=destinations,
         )
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
@@ -859,7 +966,9 @@ def _pack_wo_a(weight: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"wo_a first dimension {int(weight.shape[0])} must divide by {_DEEPSEEK_V4_O_GROUPS}"
         )
-    return weight.reshape(_DEEPSEEK_V4_O_GROUPS, int(weight.shape[0]) // _DEEPSEEK_V4_O_GROUPS, int(weight.shape[1]))
+    return weight.reshape(
+        _DEEPSEEK_V4_O_GROUPS, int(weight.shape[0]) // _DEEPSEEK_V4_O_GROUPS, int(weight.shape[1])
+    )
 
 
 def _pack_deepseek_v4_optional_attention(
@@ -868,140 +977,175 @@ def _pack_deepseek_v4_optional_attention(
     ranks: int,
     *,
     compress_ratio: int,
+    destinations: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Pack compressor/indexer tensors, filling inactive branch placeholders."""
 
     def raw_tensor(suffix: str) -> torch.Tensor | None:
         return raw.get(f"{prefix}.{suffix}")
 
-    def zeros(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        return torch.zeros((ranks, *shape), dtype=dtype)
+    packed: dict[str, torch.Tensor] = {}
 
-    def replicated(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
-        tensor = tensor.contiguous().cpu()
-        return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
-
-    def replicated_transposed(
+    def add(
+        name: str,
         suffix: str,
         shape: tuple[int, ...],
         dtype: torch.dtype,
         *,
         enabled: bool,
-    ) -> torch.Tensor:
+        transpose: bool = False,
+    ) -> None:
+        if destinations is not None and name not in destinations:
+            return
         tensor = raw_tensor(suffix) if enabled else None
         if tensor is None:
-            return zeros(shape, dtype)
-        return replicated(tensor.transpose(0, 1).contiguous(), dtype=dtype)
+            destination = None if destinations is None else destinations[name]
+            expected_shape = (ranks, *shape)
+            if destination is not None:
+                if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
+                    raise ValueError(
+                        f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
+                        f"expected={expected_shape}/{dtype}, "
+                        f"got={tuple(destination.shape)}/{destination.dtype}"
+                    )
+                destination.zero_()
+                packed[name] = destination
+            else:
+                packed[name] = torch.zeros(expected_shape, dtype=dtype)
+            return
+        source = tensor.transpose(0, 1) if transpose else tensor
+        destination = None if destinations is None else destinations[name]
+        packed[name] = _replicate_weight(
+            name,
+            source,
+            ranks=ranks,
+            dtype=dtype,
+            destination=destination,
+        )
 
-    def replicated_plain(
-        suffix: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        *,
-        enabled: bool,
-    ) -> torch.Tensor:
-        tensor = raw_tensor(suffix) if enabled else None
-        if tensor is None:
-            return zeros(shape, dtype)
-        return replicated(tensor, dtype=dtype)
+    def add_tensor(name: str, tensor: torch.Tensor, *, dtype: torch.dtype) -> None:
+        if destinations is not None and name not in destinations:
+            return
+        destination = None if destinations is None else destinations[name]
+        packed[name] = _replicate_weight(
+            name,
+            tensor,
+            ranks=ranks,
+            dtype=dtype,
+            destination=destination,
+        )
 
     is_hca = int(compress_ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO
     is_csa = int(compress_ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO
-    return {
-        "hca_cmp_wkv": replicated_plain(
-            "attn.compressor.wkv.weight",
-            (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_hca,
-        ),
-        "hca_cmp_wgate": replicated_plain(
-            "attn.compressor.wgate.weight",
-            (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_hca,
-        ),
-        "hca_cmp_ape": replicated_plain(
-            "attn.compressor.ape",
-            (_DEEPSEEK_V4_HCA_COMPRESS_RATIO, _DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
-            torch.float32,
-            enabled=is_hca,
-        ),
-        "hca_cmp_norm_w": replicated_plain(
-            "attn.compressor.norm.weight",
-            (_DEEPSEEK_V4_HEAD_DIM,),
-            torch.bfloat16,
-            enabled=is_hca,
-        ),
-        "csa_cmp_wkv": replicated_plain(
-            "attn.compressor.wkv.weight",
-            (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_cmp_wgate": replicated_plain(
-            "attn.compressor.wgate.weight",
-            (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_cmp_ape": replicated_plain(
-            "attn.compressor.ape",
-            (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
-            torch.float32,
-            enabled=is_csa,
-        ),
-        "csa_cmp_norm_w": replicated_plain(
-            "attn.compressor.norm.weight",
-            (_DEEPSEEK_V4_HEAD_DIM,),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_idx_wq_b": replicated_transposed(
-            "attn.indexer.wq_b.weight",
-            (_DEEPSEEK_V4_Q_LORA, _DEEPSEEK_V4_ATTENTION_OUT // 4),
-            torch.int8,
-            enabled=is_csa,
-        ),
-        "csa_idx_wq_b_scale": replicated_plain(
-            "attn.indexer.wq_b.scale",
-            (_DEEPSEEK_V4_ATTENTION_OUT // 4,),
-            torch.float32,
-            enabled=is_csa,
-        ),
-        "csa_weights_proj": replicated_transposed(
-            "attn.indexer.weights_proj.weight",
-            (_DEEPSEEK_V4_HIDDEN_SIZE, 64),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_hadamard_idx": replicated(deepseek_v4_hadamard_idx(), dtype=torch.bfloat16),
-        "csa_inner_wkv": replicated_plain(
-            "attn.indexer.compressor.wkv.weight",
-            (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_inner_wgate": replicated_plain(
-            "attn.indexer.compressor.wgate.weight",
-            (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-        "csa_inner_ape": replicated_plain(
-            "attn.indexer.compressor.ape",
-            (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_INNER_OUT_DIM),
-            torch.float32,
-            enabled=is_csa,
-        ),
-        "csa_inner_norm_w": replicated_plain(
-            "attn.indexer.compressor.norm.weight",
-            (_DEEPSEEK_V4_HADAMARD_IDX_DIM,),
-            torch.bfloat16,
-            enabled=is_csa,
-        ),
-    }
+    add(
+        "hca_cmp_wkv",
+        "attn.compressor.wkv.weight",
+        (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_hca,
+    )
+    add(
+        "hca_cmp_wgate",
+        "attn.compressor.wgate.weight",
+        (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_hca,
+    )
+    add(
+        "hca_cmp_ape",
+        "attn.compressor.ape",
+        (_DEEPSEEK_V4_HCA_COMPRESS_RATIO, _DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
+        torch.float32,
+        enabled=is_hca,
+    )
+    add(
+        "hca_cmp_norm_w",
+        "attn.compressor.norm.weight",
+        (_DEEPSEEK_V4_HEAD_DIM,),
+        torch.bfloat16,
+        enabled=is_hca,
+    )
+    add(
+        "csa_cmp_wkv",
+        "attn.compressor.wkv.weight",
+        (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    add(
+        "csa_cmp_wgate",
+        "attn.compressor.wgate.weight",
+        (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    add(
+        "csa_cmp_ape",
+        "attn.compressor.ape",
+        (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
+        torch.float32,
+        enabled=is_csa,
+    )
+    add(
+        "csa_cmp_norm_w",
+        "attn.compressor.norm.weight",
+        (_DEEPSEEK_V4_HEAD_DIM,),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    add(
+        "csa_idx_wq_b",
+        "attn.indexer.wq_b.weight",
+        (_DEEPSEEK_V4_Q_LORA, _DEEPSEEK_V4_ATTENTION_OUT // 4),
+        torch.int8,
+        enabled=is_csa,
+        transpose=True,
+    )
+    add(
+        "csa_idx_wq_b_scale",
+        "attn.indexer.wq_b.scale",
+        (_DEEPSEEK_V4_ATTENTION_OUT // 4,),
+        torch.float32,
+        enabled=is_csa,
+    )
+    add(
+        "csa_weights_proj",
+        "attn.indexer.weights_proj.weight",
+        (_DEEPSEEK_V4_HIDDEN_SIZE, 64),
+        torch.bfloat16,
+        enabled=is_csa,
+        transpose=True,
+    )
+    add_tensor("csa_hadamard_idx", deepseek_v4_hadamard_idx(), dtype=torch.bfloat16)
+    add(
+        "csa_inner_wkv",
+        "attn.indexer.compressor.wkv.weight",
+        (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    add(
+        "csa_inner_wgate",
+        "attn.indexer.compressor.wgate.weight",
+        (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    add(
+        "csa_inner_ape",
+        "attn.indexer.compressor.ape",
+        (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_INNER_OUT_DIM),
+        torch.float32,
+        enabled=is_csa,
+    )
+    add(
+        "csa_inner_norm_w",
+        "attn.indexer.compressor.norm.weight",
+        (_DEEPSEEK_V4_HADAMARD_IDX_DIM,),
+        torch.bfloat16,
+        enabled=is_csa,
+    )
+    return packed
 
 
 def _pack_deepseek_v4_router(
@@ -1012,6 +1156,7 @@ def _pack_deepseek_v4_router(
     n_routed_experts: int,
     include_tid2eid: bool,
     include_gate_bias: bool,
+    destinations: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Pack router-only tensors and placeholders for inactive router modes."""
     gate_bias = raw.get(f"{prefix}.ffn.gate.bias")
@@ -1025,8 +1170,20 @@ def _pack_deepseek_v4_router(
             raise KeyError(f"missing raw DeepSeekV4 layer tensor: {prefix}.ffn.gate.tid2eid")
         tid2eid = torch.zeros((_DEEPSEEK_V4_VOCAB_SIZE, _DEEPSEEK_V4_TOPK), dtype=torch.int32)
     return {
-        "gate_bias": gate_bias.to(torch.float32).contiguous().cpu().unsqueeze(0).expand(ranks, -1).contiguous(),
-        "tid2eid": tid2eid.to(torch.int32).contiguous().cpu().unsqueeze(0).expand(ranks, *tid2eid.shape).contiguous(),
+        "gate_bias": _replicate_weight(
+            "gate_bias",
+            gate_bias,
+            ranks=ranks,
+            dtype=torch.float32,
+            destination=None if destinations is None else destinations["gate_bias"],
+        ),
+        "tid2eid": _replicate_weight(
+            "tid2eid",
+            tid2eid,
+            ranks=ranks,
+            dtype=torch.int32,
+            destination=None if destinations is None else destinations["tid2eid"],
+        ),
     }
 
 
@@ -1036,17 +1193,39 @@ def _pack_deepseek_v4_routed_experts(
     *,
     ranks: int,
     n_routed_experts: int,
+    destinations: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Stack rank-local routed experts into EP-rank-major tensors."""
 
     def expert(expert_id: int, suffix: str) -> torch.Tensor:
         name = f"{prefix}.ffn.experts.{expert_id}.{suffix}"
         try:
-            return raw[name].contiguous().cpu()
+            return raw[name]
         except KeyError as exc:
             raise KeyError(f"missing raw DeepSeekV4 expert tensor: {name}") from exc
 
-    def stack(suffix: str, dtype: torch.dtype) -> torch.Tensor:
+    def stack(name: str, suffix: str, dtype: torch.dtype) -> torch.Tensor:
+        if destinations is not None:
+            destination = destinations[name]
+            local_experts = n_routed_experts // ranks
+            first = expert(0, suffix)
+            expected_shape = (ranks, local_experts, *first.shape)
+            if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
+                raise ValueError(
+                    f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
+                    f"expected={expected_shape}/{dtype}, "
+                    f"got={tuple(destination.shape)}/{destination.dtype}"
+                )
+            for rank in range(ranks):
+                ids = deepseek_v4_local_expert_ids(
+                    rank=rank,
+                    ranks=ranks,
+                    n_routed_experts=n_routed_experts,
+                )
+                for local_index, expert_id in enumerate(ids):
+                    destination[rank, local_index].copy_(expert(expert_id, suffix))
+            return destination
+
         per_rank = []
         for rank in range(ranks):
             ids = deepseek_v4_local_expert_ids(
@@ -1054,14 +1233,19 @@ def _pack_deepseek_v4_routed_experts(
                 ranks=ranks,
                 n_routed_experts=n_routed_experts,
             )
-            per_rank.append(torch.stack([expert(expert_id, suffix).to(dtype=dtype) for expert_id in ids], dim=0))
+            per_rank.append(
+                torch.stack(
+                    [expert(expert_id, suffix).to(dtype=dtype).contiguous().cpu() for expert_id in ids],
+                    dim=0,
+                )
+            )
         return torch.stack(per_rank, dim=0).contiguous()
 
     return {
-        "routed_w1": stack("w1.weight", torch.int8),
-        "routed_w1_scale": stack("w1.scale", torch.float32),
-        "routed_w3": stack("w3.weight", torch.int8),
-        "routed_w3_scale": stack("w3.scale", torch.float32),
-        "routed_w2": stack("w2.weight", torch.int8),
-        "routed_w2_scale": stack("w2.scale", torch.float32),
+        "routed_w1": stack("routed_w1", "w1.weight", torch.int8),
+        "routed_w1_scale": stack("routed_w1_scale", "w1.scale", torch.float32),
+        "routed_w3": stack("routed_w3", "w3.weight", torch.int8),
+        "routed_w3_scale": stack("routed_w3_scale", "w3.scale", torch.float32),
+        "routed_w2": stack("routed_w2", "w2.weight", torch.int8),
+        "routed_w2_scale": stack("routed_w2_scale", "w2.scale", torch.float32),
     }

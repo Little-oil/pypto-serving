@@ -1028,7 +1028,7 @@ class _DeepSeekV4PrefillFwdSharedBuffers:
     the CSA (x21) and HCA (x20) groups. The per-step metadata, RoPE tables and
     compress-state block tables are shared single per-rank copies (the kernel
     slices them per layer). ``tensors`` is keyed by ``_PREFILL_FWD_TENSOR_ORDER``
-    name (excluding the stacked weights, which live in ``_stacked_weight_buffers``,
+    name (excluding the stacked weights, which live in ``_stacked_host_weights``,
     and ``freqs_*``/``x_hc`` which are tracked explicitly). The final normalized
     hidden output is held separately in ``_prefill_output_buffer``.
     """
@@ -1153,7 +1153,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
         self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
-        self._stacked_weight_buffers: dict[str, torch.Tensor] | None = None
+        self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
@@ -1764,10 +1764,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _ensure_l3_shared_buffers(self, model: RuntimeModel) -> None:
         """Allocate every CPU tensor visible to the L3 worker before it forks.
 
-        ``DistributedWorker`` creates per-chip children on first use. Any CPU
-        tensor argument those children access must already live in shared memory
-        at that point, so this method stages all packed prefill/decode input and
-        output buffers before the first ``_run_l3`` call.
+        ``DistributedWorker`` creates per-chip children on first use. Mutable CPU
+        arguments must already live in shared memory at that point; immutable
+        weights are registered for fork inheritance. This method prepares both
+        groups before the first ``_run_l3`` call.
         """
         self.load_packed_global_weights()
         self._static_freqs_cos_tensor()
@@ -1778,9 +1778,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._require_prefill_output_buffer(model.config.hidden_size)
         self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
         self._static_final_norm_weight_tensor()
-        if self._stacked_weight_buffers is None:
+        if self._stacked_host_weights is None:
             if self._stacked_device_weights is None:
-                self._stage_stacked_weights(self.load_stacked_layer_weights())
+                self._retain_stacked_host_weights(self.load_stacked_layer_weights())
         self._hc_head_tensors()
         self._ensure_prefill_fwd_buffers(model.config.hidden_size)
         self._assert_l3_shared_buffers_preallocated()
@@ -1803,7 +1803,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "prefill_fwd_buffers": self._prefill_fwd_buffers,
             "decode_buffers": self._decode_buffers,
             "decode_work_cache": self._decode_work_cache,
-            "stacked_weights": self._stacked_weight_buffers or self._stacked_device_weights,
+            "stacked_weights": self._stacked_host_weights or self._stacked_device_weights,
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
             "prefill_pre_hc_output": self._prefill_pre_hc_output_buffer,
@@ -1813,7 +1813,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         for name, value in expected.items():
             if value is None:
                 missing.append(name)
-        if self._stacked_weight_buffers is not None and not self._stacked_weight_buffers:
+        if self._stacked_host_weights is not None and not self._stacked_host_weights:
             missing.append("stacked_weights")
         if self._hc_head_buffers is not None and not self._hc_head_buffers:
             missing.append("hc_head_buffers")
@@ -2162,9 +2162,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_tail_position = mtp_positions[-1:].clone()
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
-        tensors = self._stacked_device_weights or self._stacked_weight_buffers
+        tensors = self._stacked_device_weights or self._stacked_host_weights
         if tensors is None:
-            raise RuntimeError("DeepSeekV4 stacked decode weights were not staged")
+            raise RuntimeError("DeepSeekV4 stacked decode weights are not available")
         return DeepSeekV4StackedLayerWeights(tensors=tensors)
 
     def _ordered_layer_args(self, values: dict[str, Any], names: Sequence[str]) -> tuple[Any, ...]:
@@ -2458,7 +2458,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return buffers
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
-        """Allocate and stage all MTP-owned shared tensors before worker fork."""
+        """Load immutable MTP weights and allocate mutable shared buffers before worker fork."""
         if self._compiled.mtp_prefill is None or self._compiled.mtp_decode is None:
             return None
         if self._mtp_buffers is not None:
@@ -2469,12 +2469,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         tokens = layout.decode_tokens
         hidden = int(hidden_size)
         loaded = self.load_mtp_weights()
-        weights = {
-            name: self._new_shared_like(tensor, name=f"mtp_weight[{name}]")
-            for name, tensor in loaded.tensors.items()
-        }
-        for name, tensor in loaded.tensors.items():
-            self._copy_shared(weights[name], tensor, name=f"mtp_weight[{name}]")
+        weights = dict(loaded.tensors)
         mtp_kv_cache = self._shared_empty(
             (ranks, layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
             torch.bfloat16,
@@ -2718,24 +2713,22 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
         return self._rank_stack(self._compiled.freqs_sin)
 
-    def _stage_stacked_weights(self, weights: DeepSeekV4StackedLayerWeights) -> DeepSeekV4StackedLayerWeights:
-        """Copy the layer-stacked decode_fwd weights into shared buffers once."""
-        buffers = self._stacked_weight_buffers
-        if buffers is None:
+    def _retain_stacked_host_weights(
+        self,
+        weights: DeepSeekV4StackedLayerWeights,
+    ) -> DeepSeekV4StackedLayerWeights:
+        """Retain immutable layer-stacked weights for fork inheritance and resident upload."""
+        host_weights = self._stacked_host_weights
+        if host_weights is None:
             self._ensure_shared_host_allocation_before_worker("stacked layer weights")
-            buffers = {
-                name: self._new_shared_like(tensor, name=f"stacked_weight[{name}]")
-                for name, tensor in weights.tensors.items()
-            }
-            self._stacked_weight_buffers = buffers
+            host_weights = dict(weights.tensors)
+            self._stacked_host_weights = host_weights
 
-        missing = sorted(set(weights.tensors) - set(buffers))
+        missing = sorted(set(weights.tensors) - set(host_weights))
         if missing:
-            raise KeyError(f"DeepSeekV4 shared stacked-weight buffers are missing: {', '.join(missing)}")
+            raise KeyError(f"DeepSeekV4 stacked Host weights are missing: {', '.join(missing)}")
 
-        for name, tensor in weights.tensors.items():
-            self._copy_shared(buffers[name], tensor, name=f"stacked_weight[{name}]")
-        return DeepSeekV4StackedLayerWeights(tensors=buffers)
+        return DeepSeekV4StackedLayerWeights(tensors=host_weights)
 
     def _hc_head_tensors(self) -> dict[str, torch.Tensor]:
         """Return rank-replicated hc_head weights for the decode_fwd output collapse."""
@@ -2997,12 +2990,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype).share_memory_()
 
     @staticmethod
-    def _new_shared_like(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
-        if tensor.device.type != "cpu":
-            raise ValueError(f"{name} must be a CPU tensor")
-        return torch.empty_like(tensor.contiguous(), memory_format=torch.contiguous_format).share_memory_()
-
-    @staticmethod
     def _copy_shared(dst: torch.Tensor, src: torch.Tensor, *, name: str) -> None:
         if src.device.type != "cpu":
             src = src.cpu()
@@ -3119,31 +3106,32 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return device_weights
 
     def _materialize_resident_weights(self) -> None:
-        """Upload main/MTP weights once and release their shared Host backing."""
+        """Upload inherited weights once and release their parent-process Host references."""
         worker = self._shared_l3_worker()
         if self._stacked_device_weights is None:
-            host_weights = self._stacked_weight_buffers
+            host_weights = self._stacked_host_weights
             if not host_weights:
-                raise RuntimeError("DeepSeekV4 stacked Host weights are not staged")
-            host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
+                raise RuntimeError("DeepSeekV4 stacked Host weights are not retained")
+            parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
             self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
-            self._stacked_weight_buffers = None
+            self._stacked_host_weights = None
             logger.info(
-                "DeepSeekV4 resident main weights uploaded; released_host_bytes=%d",
-                host_bytes,
+                "DeepSeekV4 resident main weights uploaded; released_parent_host_bytes=%d",
+                parent_host_bytes,
             )
 
         buffers = self._mtp_buffers
         if buffers is not None and self._mtp_device_weights is None:
             if not buffers.weights:
                 raise RuntimeError("DeepSeekV4 MTP Host weights are not staged")
-            host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in buffers.weights.values())
+            parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in buffers.weights.values())
             self._mtp_device_weights = self._upload_weight_group(worker, buffers.weights)
             buffers.weights.clear()
             logger.info(
-                "DeepSeekV4 resident MTP weights uploaded; released_host_bytes=%d",
-                host_bytes,
+                "DeepSeekV4 resident MTP weights uploaded; released_parent_host_bytes=%d",
+                parent_host_bytes,
             )
+        worker.release_inherited_host_tensor_refs()
 
     def _invalidate_resident_cache_tensors(self) -> None:
         """Free resident KV/compressor state so the next request starts clean."""
@@ -3166,9 +3154,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([callable_spec.compiled for callable_spec in compiled_callables])
+            compiled = [callable_spec.compiled for callable_spec in compiled_callables]
+            worker = DistributedWorker(compiled, inherited_host_tensors=self._inherited_host_weights())
             self._l3_worker = worker
         return worker
+
+    def _inherited_host_weights(self) -> list[torch.Tensor]:
+        """Return immutable main and MTP weights that must be visible at worker fork."""
+        tensors = list(self._stacked_host_weights.values()) if self._stacked_host_weights else []
+        if self._mtp_buffers is not None:
+            tensors.extend(self._mtp_buffers.weights.values())
+        return tensors
 
     def _ensure_decode_work_cache(self) -> DeepSeekV4LayerCache:
         cache = self._decode_work_cache
@@ -3290,7 +3286,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         finally:
             self._l3_worker = None
             self._decode_work_cache = None
-            self._stacked_weight_buffers = None
+            self._stacked_host_weights = None
             self._stacked_device_weights = None
             self._mtp_device_weights = None
             self._mtp_buffers = None
