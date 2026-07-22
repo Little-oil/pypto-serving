@@ -140,6 +140,10 @@ class TokenOutput:
     text: str = ""
     finished: bool = False
     finish_reason: str = ""
+    # Authoritative token counts from the engine, so the HTTP layer can report
+    # OpenAI-style usage without re-tokenizing the prompt or counting deltas.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class ReplicaEngineCore:
@@ -594,6 +598,8 @@ class ReplicaEngineCore:
                 text=text,
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
+                prompt_tokens=ctx.request.num_prompt_tokens,
+                completion_tokens=len(ctx.request.output_token_ids),
             )
             ctx.queue.put_nowait(token_output)
 
