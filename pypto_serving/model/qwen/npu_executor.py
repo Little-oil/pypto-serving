@@ -274,15 +274,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             )
             embed_weight = torch.cat([embed_weight, padding], dim=0)
         padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
-        layers = []
-        for layer in model.layers:
-            layers.append(self._kernel_layer_weights(layer))
-            self._release_layer_weights(layer)
         final_norm_weight = self._shared_tensor(model.final_norm_weight.view(1, -1).float().cpu())
-        decode_weights = {
-            name: self._shared_tensor(tensor)
-            for name, tensor in self._stack_decode_weights(layers).items()
-        }
+        decode_weights = self._stage_stacked_decode_weights(model)
         prefill_token_ids_buffer = torch.empty(
             (kernel_batch * model.runtime.max_seq_len,),
             dtype=torch.int32,
@@ -546,6 +539,106 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return dict(getattr(module, "RUNTIME_CONFIG", {}))
+
+    @classmethod
+    def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
+        """Stage per-layer weights into pre-allocated stacked shm tensors,
+        copying layers in parallel across worker threads.
+
+        Same output as building every per-layer ``_KernelLayerWeights`` and then
+        ``torch.cat``-ing them (see ``_stack_decode_weights``), and the same ~1x
+        peak host memory as the serial stream (only the stacked destination plus
+        the transient views live at once). The per-layer copies dominate startup
+        (~90s serially for a 14B), so they run on a thread pool: each layer owns a
+        disjoint row-slice of every stacked tensor, and ``copy_`` releases the GIL
+        for the memcpy + dtype cast, so the copies genuinely overlap.
+        """
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        layers = model.layers
+        num_layers = len(layers)
+        fields = (
+            ("input_rms_weight", "decode_input_rms_weight", "norm"),
+            ("wq", "decode_wq", "proj"),
+            ("wk", "decode_wk", "proj"),
+            ("wv", "decode_wv", "proj"),
+            ("q_norm_weight", "decode_q_norm_weight", "norm"),
+            ("k_norm_weight", "decode_k_norm_weight", "norm"),
+            ("wo", "decode_wo", "proj"),
+            ("post_rms_weight", "decode_post_rms_weight", "norm"),
+            ("w_gate", "decode_w_gate", "proj"),
+            ("w_up", "decode_w_up", "proj"),
+            ("w_down", "decode_w_down", "proj"),
+        )
+
+        def _ready_view(layer, attr: str, kind: str):
+            t = getattr(layer, attr).cpu()
+            # reshape (not view): norm gammas are 1-D contiguous today, but
+            # reshape also handles a non-contiguous source without raising.
+            return t.transpose(0, 1) if kind == "proj" else t.reshape(1, -1)
+
+        # Pre-allocate every stacked shm tensor once (shapes taken from layer 0,
+        # uniform across a transformer) so the parallel loop only writes into
+        # already-sized, disjoint slices -- no dict mutation or allocation race.
+        # Sizes come straight from tensor metadata: a "proj" weight [out, in]
+        # stacks its transpose to [num_layers*in, out]; a "norm" gamma [dim]
+        # stacks to [num_layers, dim]. Reading only .shape/.dtype avoids a
+        # redundant .cpu()/transpose of layer 0 (which _stage_layer(0) redoes).
+        stacked: dict[str, torch.Tensor] = {}
+        rows_by_key: dict[str, int] = {}
+        first = layers[0]
+        for attr, key, kind in fields:
+            t = getattr(first, attr)
+            if kind == "proj":
+                rows = t.shape[1]
+                shape = (num_layers * rows, t.shape[0])
+                dtype = torch.bfloat16
+            else:
+                rows = 1
+                shape = (num_layers, t.shape[0])
+                dtype = torch.float32
+            rows_by_key[key] = rows
+            stacked[key] = torch.empty(shape, dtype=dtype).share_memory_()
+
+        def _stage_layer(i: int) -> None:
+            layer = layers[i]
+            for attr, key, kind in fields:
+                rows = rows_by_key[key]
+                # Disjoint per-layer slice -> safe to write concurrently.
+                stacked[key][i * rows:(i + 1) * rows].copy_(_ready_view(layer, attr, kind))
+            cls._release_layer_weights(layer)
+
+        workers = cls._staging_worker_count(num_layers)
+        if workers <= 1:
+            for i in range(num_layers):
+                _stage_layer(i)
+        else:
+            # Pin torch intra-op parallelism to 1 for the duration of the pool:
+            # each copy_ would otherwise fan out to its own OpenMP/MKL threads,
+            # and N pool threads x that fan-out oversubscribes a many-core host
+            # (the >32-thread staging regression). One intra-op thread per copy
+            # keeps the coarse per-layer parallelism clean.
+            orig_threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_stage_layer, range(num_layers)))
+            finally:
+                torch.set_num_threads(orig_threads)
+        return stacked
+
+    @staticmethod
+    def _staging_worker_count(num_layers: int) -> int:
+        """Thread count for parallel weight staging (env-tunable)."""
+        raw = os.environ.get("PYPTO_STAGING_THREADS")
+        if raw:
+            try:
+                return max(1, min(int(raw), num_layers))
+            except ValueError:
+                pass
+        # Staging is memory-bandwidth bound: it plateaus by ~16-32 threads and
+        # regresses beyond that, so cap the default even on many-core hosts.
+        return max(1, min(num_layers, os.cpu_count() or 8, 32))
 
     @staticmethod
     def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
