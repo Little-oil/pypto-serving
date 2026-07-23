@@ -66,12 +66,19 @@ class CompletionChoice(BaseModel):
     finish_reason: str | None = None
 
 
+class ResponseUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 class CompletionResponse(BaseModel):
     id: str
     object: str = "text_completion"
     created: int
     model: str
     choices: list[CompletionChoice]
+    usage: ResponseUsage | None = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -87,6 +94,7 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChoice]
+    usage: ResponseUsage | None = None
 
 
 # --- Server ---
@@ -148,17 +156,24 @@ class ServingServer:
 
             full_text = ""
             finish_reason = ""
+            usage = None
             async for output in self.engine.add_request(request_id, request.prompt, config):
                 if output.text:
                     full_text = output.text
                 if output.finished:
                     finish_reason = self._map_finish_reason(output.finish_reason)
+                    usage = ResponseUsage(
+                        prompt_tokens=output.prompt_tokens,
+                        completion_tokens=output.completion_tokens,
+                        total_tokens=output.prompt_tokens + output.completion_tokens,
+                    )
 
             response = CompletionResponse(
                 id=request_id,
                 created=int(time.time()),
                 model=request.model or self.model_id,
                 choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
+                usage=usage,
             )
             return JSONResponse(response.model_dump())
 
@@ -187,11 +202,17 @@ class ServingServer:
 
             full_text = ""
             finish_reason = ""
+            usage = None
             async for output in self.engine.add_request(request_id, prompt, config):
                 if output.text:
                     full_text = output.text
                 if output.finished:
                     finish_reason = self._map_finish_reason(output.finish_reason)
+                    usage = ResponseUsage(
+                        prompt_tokens=output.prompt_tokens,
+                        completion_tokens=output.completion_tokens,
+                        total_tokens=output.prompt_tokens + output.completion_tokens,
+                    )
 
             response = ChatCompletionResponse(
                 id=request_id,
@@ -202,6 +223,7 @@ class ServingServer:
                     message=ChatMessage(role="assistant", content=full_text),
                     finish_reason=finish_reason,
                 )],
+                usage=usage,
             )
             return JSONResponse(response.model_dump())
 
@@ -224,6 +246,21 @@ class ServingServer:
                 yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
                 if output.finished:
+                    # Terminal usage chunk (OpenAI stream_options.include_usage
+                    # shape): empty choices, authoritative counts from the engine.
+                    usage_chunk = CompletionResponse(
+                        id=request_id,
+                        created=int(time.time()),
+                        model=model,
+                        choices=[],
+                        usage=ResponseUsage(
+                            prompt_tokens=output.prompt_tokens,
+                            completion_tokens=output.completion_tokens,
+                            total_tokens=output.prompt_tokens + output.completion_tokens,
+                        ),
+                    )
+                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+
                     profile_instant(
                         "http.stream_completion.finished",
                         cat="request",
@@ -255,6 +292,22 @@ class ServingServer:
                 yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
                 if output.finished:
+                    # Terminal usage chunk (OpenAI stream_options.include_usage
+                    # shape): empty choices, authoritative counts from the engine.
+                    usage_chunk = ChatCompletionResponse(
+                        id=request_id,
+                        object="chat.completion.chunk",
+                        created=int(time.time()),
+                        model=model,
+                        choices=[],
+                        usage=ResponseUsage(
+                            prompt_tokens=output.prompt_tokens,
+                            completion_tokens=output.completion_tokens,
+                            total_tokens=output.prompt_tokens + output.completion_tokens,
+                        ),
+                    )
+                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+
                     profile_instant(
                         "http.stream_chat.finished",
                         cat="request",
