@@ -1281,6 +1281,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._prefill_output_buffer: torch.Tensor | None = None
         self._prefill_pre_hc_output_buffer: torch.Tensor | None = None
         self._prefill_logits_buffer: torch.Tensor | None = None
+        self._decode_logits_buffer: torch.Tensor | None = None
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
