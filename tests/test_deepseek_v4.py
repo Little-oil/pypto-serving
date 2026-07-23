@@ -851,6 +851,9 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
         20,
         -1,
     ]
+    assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
+    assert prepared.num_logit_rows.tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
 
 
 def test_deepseek_prepare_decode_inputs_requires_hidden_states():
@@ -905,6 +908,9 @@ def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
     assert prepared.window_swa_lens[0, 1].item() == 128
     assert prepared.window_swa_lens[1, 1].item() == 5
     assert prepared.window_swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
+    assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
+    assert prepared.num_logit_rows.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
+    assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
 
 
 def test_deepseek_prepare_mtp_decode_inputs_feeds_two_real_tokens():
@@ -997,16 +1003,11 @@ def test_deepseek_run_decode_dispatches_active_token_count():
 
     def fake_decode_fwd_args(inputs, x_hc, pre_hc_hidden_out, hidden_out, logits):
         captured["x_hc_shape"] = tuple(x_hc.shape)
+        captured["num_tokens_per_owner"] = inputs.num_tokens_per_owner
         return (x_hc, pre_hc_hidden_out, hidden_out, logits)
 
     def fake_run_l3(_callable, *args):
-        captured["num_tokens"] = args[-1]
-        args[-2].fill_(1)
-
-    def fake_logits(_hidden, *, owner_rows, label):
-        captured["owner_rows"] = owner_rows
-        captured["label"] = label
-        return torch.zeros((len(owner_rows), model.config.vocab_size), dtype=torch.float32)
+        args[-1].fill_(1)
 
     hidden_out = torch.empty(
         runner._compiled.layout.ranks,
@@ -1049,9 +1050,7 @@ def test_deepseek_run_decode_dispatches_active_token_count():
         ),
     )
 
-    assert captured["num_tokens"] == 1
-    assert captured["owner_rows"] == ((0, 0),)
-    assert captured["label"] == "decode"
+    assert captured["num_tokens_per_owner"].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
     assert captured["x_hc_shape"] == (
         runner._compiled.layout.ranks,
         runner._compiled.layout.decode_tokens,
