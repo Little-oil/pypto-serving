@@ -86,6 +86,7 @@ _DECODE_FWD_SHARED_COMMON_NAMES = frozenset({"freqs_cos", "freqs_sin", "input_id
 # single per-rank copy (the kernel slices them per layer internally), not stacked
 # across the 43 forward layers.
 _PREFILL_FWD_SHARED_COMMON_NAMES = frozenset({"freqs_cos", "freqs_sin", "input_ids"})
+_DEEPSEEK_V4_KERNEL_DIRNAME = "v4-flash"
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
@@ -128,7 +129,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
         pypto_root = os.environ.get("PYPTO_ROOT")
     if pypto_root:
         root = Path(pypto_root)
-        candidate = root / "models" / "deepseek" / "v4"
+        candidate = root / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
         raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_ROOT={pypto_root!r}")
@@ -136,7 +137,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
         pypto_lib_dir = directory / "pypto-lib"
-        candidate = pypto_lib_dir / "models" / "deepseek" / "v4"
+        candidate = pypto_lib_dir / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
 
@@ -204,7 +205,11 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     if resolved.is_relative_to(kernel_dir):
         return True
     parts = resolved.parts
-    return len(parts) >= 4 and parts[-4:-1] == ("models", "deepseek", "v4")
+    return len(parts) >= 4 and parts[-4:-1] == (
+        "models",
+        "deepseek",
+        _DEEPSEEK_V4_KERNEL_DIRNAME,
+    )
 
 
 @contextlib.contextmanager

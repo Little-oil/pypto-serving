@@ -44,6 +44,14 @@ from pypto_serving.model.deepseek.weight_loader import (
 from pypto_serving.model.model_loader import ModelLoader
 
 
+def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
+    kernel_dir = tmp_path / "models" / "deepseek" / "v4-flash"
+    kernel_dir.mkdir(parents=True)
+
+    assert npu_executor._find_pypto_lib_deepseek_v4_dir(str(tmp_path)) == kernel_dir
+    assert npu_executor._is_deepseek_v4_module_file(kernel_dir / "decode_fwd.py", kernel_dir)
+
+
 def test_accept_mtp_tokens_commits_second_main_token_only_on_draft_match():
     accepted = accept_mtp_tokens(
         torch.tensor([[11, 12], [21, 22]], dtype=torch.long),
