@@ -168,29 +168,13 @@ class WorkerProcess:
             if isinstance(cmd, ShutdownCommand):
                 logger.info("Worker received shutdown command")
                 break
-            elif cmd.type == "release":
-                self._release_requests(cmd.finished_request_ids)
-            elif cmd.type == "step":
-                self._release_requests(cmd.finished_request_ids)
 
             self._handle_step_command(cmd)
 
         logger.info("Worker exiting")
 
-    def _release_requests(self, request_ids) -> None:
-        """Release executor-owned state for completed or aborted requests."""
-        if not request_ids:
-            return
-        release_finished = getattr(self.executor, "release_finished_requests", None)
-        if callable(release_finished):
-            release_finished(request_ids)
-
-    def close(self) -> None:
-        """Release executor-owned runtime and device resources."""
-        executor = self.executor
-        self.executor = None
-        if executor is None:
-            return
+    def _handle_step_command(self, cmd: StepCommand) -> None:
+        """Handle a StepCommand and push an encoded StepResult.
 
         The whole body is guarded: an exception during request registration or
         device-resource release (steps 1-2) would otherwise propagate out of the
@@ -198,17 +182,19 @@ class WorkerProcess:
         engine as an error result so the loop keeps serving.
         """
         try:
-            # 1. Register new requests into the cache.
-            for nr in cmd.new_requests:
-                self._req_cache[nr.request_id] = nr
-
-            # 2. Release finished requests from device and cache.
+            # 1. Release finished or preempted requests. Release precedes
+            # registration because a preempted request can restart in this
+            # same command with fresh NewRequestData.
             if cmd.finished_request_ids:
                 release_finished = getattr(self.executor, "release_finished_requests", None)
                 if callable(release_finished):
                     release_finished(cmd.finished_request_ids)
                 for req_id in cmd.finished_request_ids:
                     self._req_cache.pop(req_id, None)
+
+            # 2. Register new and restarted requests into the cache.
+            for nr in cmd.new_requests:
+                self._req_cache[nr.request_id] = nr
 
             # 3. Execute the step and return the encoded result.
             result = self._execute_step(cmd)
@@ -220,22 +206,7 @@ class WorkerProcess:
     def _execute_step(self, cmd: StepCommand) -> StepResult:
         """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
-        new_tokens: dict[str, int | list[int]] = {}
-
-        preempted_request_ids = [
-            request.request_id for request in scheduler_output.preempted_requests
-        ]
-        if preempted_request_ids:
-            release_preempted = getattr(self.executor, "release_finished_requests", None)
-            if callable(release_preempted):
-                release_preempted(preempted_request_ids)
-
-        prefill_requests = [
-            sr for sr in scheduler_output.scheduled_requests if sr.is_prefill
-        ]
-        decode_requests = [
-            sr for sr in scheduler_output.scheduled_requests if not sr.is_prefill
-        ]
+        new_tokens: dict[str, list[int]] = {}
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -243,20 +214,20 @@ class WorkerProcess:
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
             with self.executor.session():
-                if prefill_requests:
+                if cmd.prefill_requests:
                     max_prefill_batch = self.executor.max_prefill_batch_size
                     if max_prefill_batch is None:
-                        self._batch_prefill(prefill_requests, runtime_model, new_tokens)
+                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
                     else:
                         if max_prefill_batch <= 0:
                             raise ValueError("executor max_prefill_batch_size must be positive")
                         for chunk in self._partitioned_prefill_chunks(
-                            prefill_requests,
+                            cmd.prefill_requests,
                             max_prefill_batch,
                         ):
                             self._batch_prefill(chunk, runtime_model, new_tokens)
-                if decode_requests:
-                    self._batch_decode(decode_requests, runtime_model, new_tokens)
+                if cmd.decode_requests:
+                    self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
 
         return StepResult(new_tokens=new_tokens)
 
@@ -342,8 +313,8 @@ class WorkerProcess:
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
                     positions=positions_tensor,
                     block_ids=block_ids_list,
-                    block_ids_by_group=[sr.block_ids_by_group for sr in scheduled],
-                    cache_partitions=[sr.cache_partition for sr in scheduled],
+                    block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
+                    cache_partitions=[pr.cache_partition for pr in scheduled],
                 ),
             )
 
@@ -414,8 +385,8 @@ class WorkerProcess:
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
                     block_ids=block_ids_list,
-                    block_ids_by_group=[sr.block_ids_by_group for sr in scheduled],
-                    cache_partitions=[sr.cache_partition for sr in scheduled],
+                    block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
+                    cache_partitions=[dr.cache_partition for dr in scheduled],
                     prev_token_ids=prev_token_tensor,
                     prev_hidden_states=prev_embeddings,
                 ),
@@ -473,6 +444,7 @@ class WorkerProcess:
             return int(flat[row_idx].item())
         return self.sampler.sample(logits, params)
 
+
 def _worker_entry(
     config: EngineConfig,
     input_queue: mp.Queue,
@@ -483,9 +455,6 @@ def _worker_entry(
     """Entry point for the worker subprocess."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    for _n in ("simpler_setup", "pypto", "simpler"):
-        logging.getLogger(_n).setLevel(logging.WARNING)
 
     # Spawned workers do not inherit the parent's logging config; configure a
     # stderr handler so per-stage progress logs (weight load, preflight) are
@@ -497,6 +466,8 @@ def _worker_entry(
         stream=sys.stderr,
         force=True,
     )
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
 
     worker = WorkerProcess(config, input_queue, output_queue)
     try:

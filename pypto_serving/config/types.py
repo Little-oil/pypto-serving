@@ -245,7 +245,7 @@ class PrefillBatch:
     positions: torch.Tensor | None = None
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
-    cache_partitions: list[int] = field(default_factory=list)
+    cache_partitions: list[int | None] = field(default_factory=list)
 
 
 @dataclass
@@ -273,7 +273,7 @@ class DecodeBatch:
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
-    cache_partitions: list[int] = field(default_factory=list)
+    cache_partitions: list[int | None] = field(default_factory=list)
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``
@@ -302,18 +302,3 @@ class GenerateResult:
     text: str
     token_ids: list[int]
     finish_reason: str
-
-
-@dataclass
-class WorkerCommand:
-    """Command sent from main process to worker process."""
-    type: str  # "step" | "release" | "shutdown"
-    scheduler_output: object | None = None
-    finished_request_ids: list | None = None
-
-
-@dataclass
-class StepOutput:
-    """Result returned from worker process after executing a batch step."""
-    new_tokens: dict[str, int | list[int]]
-    error: str | None = None

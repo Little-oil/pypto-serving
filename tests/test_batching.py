@@ -58,8 +58,11 @@ from pypto_serving.serving.sched.scheduler import (
 from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
+    PrefillRequest,
+    StepCommand,
     StepResult,
     decode_command,
+    encode_command,
     encode_result,
 )
 from pypto_serving.serving.server.serving_worker import WorkerProcess
@@ -183,35 +186,119 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
 
 
-def test_abort_flushes_request_state_without_an_inference_step():
+def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._worker_known_req_ids = {"req"}
+    request = Request(
+        request_id="req",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    scheduled = ScheduledRequest(
+        request=request,
+        num_new_tokens=2,
+        is_prefill=True,
+        block_ids_by_group={"ori": [3, 4], "state": [5]},
+        cache_partition=2,
+    )
+    output = SchedulerOutput(scheduled_requests=[scheduled])
+
+    command = core._build_step_command(output, finished_ids=["req"])
+    decoded = decode_command(encode_command(command))
+
+    assert [item.request_id for item in decoded.new_requests] == ["req"]
+    assert decoded.finished_request_ids == ["req"]
+    assert decoded.prefill_requests[0].block_ids_by_group == {
+        "ori": [3, 4],
+        "state": [5],
+    }
+    assert decoded.prefill_requests[0].cache_partition == 2
+
+
+def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
+    requests = [
+        PrefillRequest(
+            request_id=request_id,
+            chunk_tokens=[1],
+            num_computed_tokens=0,
+            block_ids=[],
+            cache_partition=partition,
+        )
+        for request_id, partition in (("a", 0), ("b", 0), ("c", 1))
+    ]
+
+    chunks = WorkerProcess._partitioned_prefill_chunks(requests, max_batch=2)
+
+    assert [[request.request_id for request in chunk] for chunk in chunks] == [
+        ["a", "c"],
+        ["b"],
+    ]
+
+
+def test_worker_releases_preempted_state_before_same_command_reregistration():
+    released: list[str] = []
+    results: list[bytes] = []
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    worker._req_cache = {
+        "req": NewRequestData("req", [0], 0.0, 1.0, None),
+    }
+    worker.output_queue = SimpleNamespace(put=results.append)
+    worker._execute_step = lambda _cmd: StepResult(new_tokens={})
+    replacement = NewRequestData("req", [1, 2], 0.0, 1.0, None)
+    command = StepCommand(
+        new_requests=[replacement],
+        prefill_requests=[],
+        decode_requests=[],
+        finished_request_ids=["req"],
+    )
+
+    worker._handle_step_command(command)
+
+    assert released == ["req"]
+    assert worker._req_cache["req"] == replacement
+    assert len(results) == 1
+
+
+def test_abort_request_schedules_worker_cleanup():
+    """An aborted request must ride the next StepCommand's finished_request_ids,
+    otherwise its worker-side _req_cache entry and device slots leak."""
     aborted: list[str] = []
-    commands = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
-    core._request_contexts = {
-        "req": SimpleNamespace(queue=asyncio.Queue()),
-    }
-    core._input_queue = SimpleNamespace(put=commands.append)
+    core._request_contexts = {"req-x": SimpleNamespace(queue=asyncio.Queue())}
 
-    asyncio.run(core.abort_request("req"))
-    core._flush_pending_worker_releases()
+    asyncio.run(core.abort_request("req-x"))
 
-    assert aborted == ["req"]
-    assert len(commands) == 1
-    assert commands[0].type == "release"
-    assert commands[0].finished_request_ids == ["req"]
-    assert core._pending_free_ids == []
+    # Scheduler aborted, context removed.
+    assert aborted == ["req-x"]
+    assert "req-x" not in core._request_contexts
+    # The id is queued for worker release exactly once.
+    assert core._pending_free_ids == ["req-x"]
+
+    # Idempotent: a second abort (or an abort racing the finish path) must not
+    # enqueue a duplicate free id.
+    asyncio.run(core.abort_request("req-x"))
+    assert core._pending_free_ids == ["req-x"]
 
 
-def test_worker_release_command_clears_executor_request_state():
-    released: list[str] = []
-    worker = WorkerProcess.__new__(WorkerProcess)
-    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+def test_abort_request_emits_abort_token_before_scheduling_free():
+    """The client-facing queue receives a FINISHED_ABORTED token on abort."""
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
+    core._pending_free_ids = []
+    queue: asyncio.Queue = asyncio.Queue()
+    core._request_contexts = {"req-y": SimpleNamespace(queue=queue)}
 
-    worker._release_requests(["req-a", "req-b"])
+    asyncio.run(core.abort_request("req-y"))
 
-    assert released == ["req-a", "req-b"]
+    token = queue.get_nowait()
+    assert isinstance(token, TokenOutput)
+    assert token.finished is True
+    assert token.finish_reason == "FINISHED_ABORTED"
+    assert core._pending_free_ids == ["req-y"]
 
 
 def _model(

@@ -57,6 +57,9 @@ class PrefillRequest(msgspec.Struct):
     num_computed_tokens: int
     # KV-cache block table for this request (may grow step-over-step).
     block_ids: list[int]
+    # Model-specific grouped cache tables and their stable rank partition.
+    block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
+    cache_partition: int | None = None
 
 
 class DecodeRequest(msgspec.Struct):
@@ -71,6 +74,9 @@ class DecodeRequest(msgspec.Struct):
     seq_len: int
     # Full KV block table for this request.
     block_ids: list[int]
+    # Model-specific grouped cache tables and their stable rank partition.
+    block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
+    cache_partition: int | None = None
 
 
 # ---------------------------------------------------------------------------

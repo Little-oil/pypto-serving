@@ -658,11 +658,17 @@ class DeepSeekV4WeightStore:
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
-
-        per_layer: list[DeepSeekV4PackedLayerWeights] = []
-        import time
-
-        pack_t0 = time.perf_counter()
+        first = self.load_packed_layer_weights(
+            0,
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=int(compress_ratios[0]),
+            include_tid2eid=num_hash_layers > 0,
+            include_gate_bias=num_hash_layers <= 0,
+        )
+        stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
+        csa_order = 0
+        hca_order = 0
         for layer_id in range(num_hidden_layers):
             compress_ratio = int(compress_ratios[layer_id])
             destinations = _stacked_layer_destinations(
@@ -686,14 +692,15 @@ class DeepSeekV4WeightStore:
                     include_gate_bias=layer_id >= num_hash_layers,
                     destinations=destinations,
                 )
-            )
             if layer_id % 5 == 0 or layer_id == num_hidden_layers - 1:
                 logger.info(
                     "DeepSeekV4 weight load progress: layer %d/%d",
                     layer_id + 1,
                     num_hidden_layers,
                 )
-        return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
+            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
+            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
+        return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
     def load_mtp_weights(
         self,
