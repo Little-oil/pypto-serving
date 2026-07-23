@@ -234,7 +234,7 @@ def build_deepseek_v4_cache_group_specs(
 # mirrors pypto-lib prefill_fwd.py ``l3_prefill_fwd`` host signature: every
 # layer-stacked weight/state tensor in core-parameter order, followed by the
 # ``hc_head`` collapse weights, final RMSNorm input, device LM-head weights, and
-# hidden/logit outputs. A trailing ``num_tokens`` scalar is appended at dispatch.
+# hidden/logit outputs and owner-major execution metadata.
 # The cache pools are ``pl.InOut`` tensors shared by prefill and decode; mutable
 # block tables, slot mappings and token metadata remain shared host inputs.
 _PREFILL_FWD_TENSOR_ORDER = (
@@ -1609,6 +1609,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             model,
             batch,
             assignment=assignment,
+            active_seq=1,
             positions=positions,
             token_rows=self._autoregressive_decode_token_rows(batch.token_ids, actual_batch),
             x_hc=builder.decode_x_hc(
@@ -1637,6 +1638,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             model,
             batch,
             assignment=assignment,
+            active_seq=self._compiled.layout.decode_seq,
             positions=positions,
             token_rows=self._mtp_decode_token_rows(
                 batch.token_ids,
@@ -1657,6 +1659,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         batch: DecodeBatch,
         *,
         assignment: _DeepSeekV4DecodeAssignment,
+        active_seq: int,
         positions: tuple[tuple[int, ...], ...],
         token_rows: torch.Tensor,
         x_hc: torch.Tensor,
@@ -1856,9 +1859,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 ).reshape(-1)
             )
 
-        seq_width = len(positions[0])
         num_tokens_per_owner = torch.tensor(
-            tuple(count * seq_width for count in per_rank_counts),
+            tuple(count * active_seq for count in per_rank_counts),
             dtype=torch.int32,
         )
         logit_row_indices = torch.full(
@@ -1868,7 +1870,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         num_logit_rows = num_tokens_per_owner.clone()
         for rank, count in enumerate(per_rank_counts):
-            row_count = count * seq_width
+            row_count = count * active_seq
             if row_count > DEEPSEEK_V4_MAX_LOGIT_ROWS:
                 raise ValueError(
                     f"rank {rank} requires {row_count} logit rows, "

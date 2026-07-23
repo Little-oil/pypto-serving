@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import sys
 from pathlib import Path
@@ -310,12 +309,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
 
     assert compiled_names == ["deepseek_v4_prefill", "deepseek_v4_decode"]
     # Both packed FWD kernels emit normalized hidden rows and device LM-head
-    # logits, followed by a trailing num_tokens scalar.
-    assert len(compiled_args["deepseek_v4_prefill"]) == len(npu_executor._PREFILL_FWD_TENSOR_ORDER) + 1
-    assert len(compiled_args["deepseek_v4_decode"]) == len(npu_executor._DECODE_FWD_TENSOR_ORDER) + 1
-    # Both packed kernels carry a trailing num_tokens scalar.
-    assert isinstance(compiled_args["deepseek_v4_prefill"][-1], ctypes.c_int32)
-    assert isinstance(compiled_args["deepseek_v4_decode"][-1], ctypes.c_int32)
+    # logits; active-token and row-selection metadata are regular tensor args.
+    assert len(compiled_args["deepseek_v4_prefill"]) == len(npu_executor._PREFILL_FWD_TENSOR_ORDER)
+    assert len(compiled_args["deepseek_v4_decode"]) == len(npu_executor._DECODE_FWD_TENSOR_ORDER)
     assert compiled_args["deepseek_v4_prefill"][0].shape == (8, 128, 4, 4096)
     assert compiled_args["deepseek_v4_decode"][0].shape == (8, 8, 4, 4096)
     assert compiled_args["deepseek_v4_prefill"][0].dtype == torch.float32
@@ -356,7 +352,10 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert prefill_args[prefill_order.index("pre_hc_hidden_out")].shape == (8, 128, 4, 4096)
     assert prefill_args[prefill_order.index("lm_head_weight")].shape == (4, 32320, 4096)
     assert prefill_args[prefill_order.index("hidden_out")].shape == (8, 128, 4096)
-    assert prefill_args[prefill_order.index("logits")].shape == (8, 1, 129280)
+    assert prefill_args[prefill_order.index("logits")].shape == (8, 8, 129280)
+    assert prefill_args[prefill_order.index("num_tokens_per_owner")].shape == (8,)
+    assert prefill_args[prefill_order.index("logit_row_indices")].shape == (8, 8)
+    assert prefill_args[prefill_order.index("num_logit_rows")].shape == (8,)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
     # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
     # groups, each layer holding decode_batch (4) x state_max_blocks rows.
@@ -382,6 +381,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (4, 32320, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hidden_out")].shape == (8, 8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
