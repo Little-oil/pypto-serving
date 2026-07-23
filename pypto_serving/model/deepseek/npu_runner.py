@@ -38,9 +38,33 @@ from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4StackedLayerWeights,
     DeepSeekV4WeightStore,
 )
+from pypto_serving.tools.profile import profile_span
 
 
 logger = logging.getLogger(__name__)
+
+
+def _kernel_trace_name(kernel_name: str) -> str:
+    """Map model-specific L3 callable names to stable profiling lanes."""
+    if "prefill" in kernel_name:
+        return "kernel.prefill_fwd"
+    if "decode" in kernel_name:
+        return "kernel.decode_fwd"
+    return f"kernel.{kernel_name}"
+
+
+def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
+    """Attach runtime host/device timings to a profiling event when available."""
+    if timing is None:
+        return
+    host_wall_us = getattr(timing, "host_wall_us", None)
+    device_wall_us = getattr(timing, "device_wall_us", None)
+    if host_wall_us is not None:
+        args["host_wall_us"] = float(host_wall_us)
+        args["host_wall_ms"] = float(host_wall_us) / 1000.0
+    if device_wall_us is not None:
+        args["device_wall_us"] = float(device_wall_us)
+        args["device_wall_ms"] = float(device_wall_us) / 1000.0
 
 
 DEEPSEEK_V4_RANKS = 8
@@ -933,6 +957,8 @@ class DeepSeekV4L3Callable:
 
     compiled: object
     name: str
+    block_dim: int | None = None
+    aicpu_thread_num: int = 4
 
 
 @dataclass
@@ -2005,8 +2031,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run all DeepSeekV4 hidden layers for one prefill chunk in a single packed call."""
         if self._compiled.prefill is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
-        self._ensure_l3_shared_buffers(model)
-        inputs = self.prepare_prefill_inputs(model, batch)
+        with profile_span("DeepSeekV4ModelRunner.prefill.prepare", cat="executor"):
+            with profile_span("DeepSeekV4ModelRunner.prefill.ensure_l3_shared_buffers", cat="executor"):
+                self._ensure_l3_shared_buffers(model)
+            with profile_span("DeepSeekV4ModelRunner.prefill.prepare_inputs", cat="executor"):
+                inputs = self.prepare_prefill_inputs(model, batch)
         group_rows = self._normalize_group_block_ids(
             batch.block_ids_by_group,
             actual_batch=len(inputs.request_ids),
@@ -2016,20 +2045,30 @@ class DeepSeekV4ModelRunner(ModelRunner):
             inputs.ranks,
             group_rows,
         )
-        self._stage_prefill_fwd_inputs(inputs)
-        hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
-        pre_hc_hidden_buffer = self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
-        logits_buffer = self._require_prefill_logits_buffer(model.config.vocab_size)
-        hidden_buffer.zero_()
-        pre_hc_hidden_buffer.zero_()
-        logits_buffer.zero_()
-        args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
+        with profile_span(
+            "DeepSeekV4ModelRunner.prefill.prepare_fwd_args",
+            cat="executor",
+            args={"actual_tokens": max(inputs.actual_tokens)},
+        ):
+            self._stage_prefill_fwd_inputs(inputs)
+            hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
+            pre_hc_hidden_buffer = self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
+            logits_buffer = self._require_prefill_logits_buffer(model.config.vocab_size)
+            hidden_buffer.zero_()
+            pre_hc_hidden_buffer.zero_()
+            logits_buffer.zero_()
+            args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
         self._debug_prefill_dispatch(inputs, args)
         try:
-            self._run_l3(
-                self._require_prefill_callable(),
-                *args,
-            )
+            with profile_span(
+                "DeepSeekV4ModelRunner.prefill.l3_dispatch",
+                cat="executor",
+                args={"actual_tokens": max(inputs.actual_tokens)},
+            ):
+                self._run_l3(
+                    self._require_prefill_callable(),
+                    *args,
+                )
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 packed prefill dispatch failed "
@@ -2051,7 +2090,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Dispatch to the decode flow selected when the model was compiled."""
         if self._compiled.decode is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
-        self._ensure_l3_shared_buffers(model)
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare", cat="executor"):
+            self._ensure_l3_shared_buffers(model)
         return self._decode_flow(model, batch)
 
     def _run_autoregressive_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -2116,12 +2156,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         # Match the reference accepted_num flow: update the MTP window from
         # committed main-model outputs immediately, even after rejection.
-        self._advance_mtp_drafts(
-            inputs,
-            main_ids,
-            output.pre_hc_hidden,
-            accepted_counts=tuple(len(tokens) for tokens in accepted),
-        )
+        with profile_span(
+            "DeepSeekV4ModelRunner.decode.mtp_advance",
+            cat="executor",
+            args={"accepted_counts": tuple(len(tokens) for tokens in accepted)},
+        ):
+            self._advance_mtp_drafts(
+                inputs,
+                main_ids,
+                output.pre_hc_hidden,
+                accepted_counts=tuple(len(tokens) for tokens in accepted),
+            )
         return DecodeResult(
             hidden_states=None,
             logits=pair_logits[::decode_seq],
@@ -2136,7 +2181,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         active_seq: int,
     ) -> _DeepSeekV4MainDecodeOutput:
         """Run the mode-independent packed main-model decode kernel."""
-        inputs = self._stage_decode_inputs(prepared)
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
+            inputs = self._stage_decode_inputs(prepared)
         self._seed_decode_work_cache_from_group_ids(
             inputs.request_ids,
             inputs.ranks,
@@ -2152,14 +2198,31 @@ class DeepSeekV4ModelRunner(ModelRunner):
         logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
         hidden_buffer.zero_()
         pre_hc_hidden_buffer.zero_()
-        logits_buffer.zero_()
-        args = self._decode_fwd_args(inputs, x_hc, pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
+        num_tokens = active_decode_tokens
+        with profile_span(
+            "DeepSeekV4ModelRunner.decode.prepare_fwd_args",
+            cat="executor",
+            args={"actual_tokens": num_tokens},
+        ):
+            logits_buffer.zero_()
+            args = self._decode_fwd_args(
+                inputs,
+                x_hc,
+                pre_hc_hidden_buffer,
+                hidden_buffer,
+                logits_buffer,
+            )
         self._debug_decode_dispatch(inputs, args)
         try:
-            self._run_l3(
-                self._require_decode_callable(),
-                *args,
-            )
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.l3_dispatch",
+                cat="executor",
+                args={"actual_tokens": num_tokens},
+            ):
+                self._run_l3(
+                    self._require_decode_callable(),
+                    *args,
+                )
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 packed decode dispatch failed "
@@ -2228,25 +2291,43 @@ class DeepSeekV4ModelRunner(ModelRunner):
         weights are registered for fork inheritance. This method prepares both
         groups before the first ``_run_l3`` call.
         """
-        self.load_packed_global_weights()
-        self._static_freqs_cos_tensor()
-        self._static_freqs_sin_tensor()
-        self._ensure_decode_buffers(model.config.hidden_size)
-        self._ensure_mtp_buffers(model.config.hidden_size)
-        self._ensure_decode_work_cache()
-        self._require_prefill_output_buffer(model.config.hidden_size)
-        self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
-        self._require_prefill_logits_buffer(model.config.vocab_size)
-        self._static_final_norm_weight_tensor()
-        self._static_lm_head_weight_tensor()
-        self._require_decode_logits_buffer(model.config.vocab_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.load_global_weights", cat="executor"):
+            self.load_packed_global_weights()
+        with profile_span("DeepSeekV4ModelRunner.prepare.prepare_rope_tables", cat="executor"):
+            self._static_freqs_cos_tensor()
+            self._static_freqs_sin_tensor()
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_buffers", cat="executor"):
+            self._ensure_decode_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
+            self._ensure_mtp_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_work_cache", cat="executor"):
+            self._ensure_decode_work_cache()
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_outputs", cat="executor"):
+            self._require_prefill_output_buffer(model.config.hidden_size)
+            self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
+            self._require_prefill_logits_buffer(model.config.vocab_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.prepare_final_norm", cat="executor"):
+            self._static_final_norm_weight_tensor()
+        with profile_span("DeepSeekV4ModelRunner.prepare.prepare_lm_head", cat="executor"):
+            self._static_lm_head_weight_tensor()
+            self._require_decode_logits_buffer(model.config.vocab_size)
         if self._stacked_host_weights is None:
             if self._stacked_device_weights is None:
-                self._retain_stacked_host_weights(self.load_stacked_layer_weights())
-        self._hc_head_tensors()
-        self._ensure_prefill_fwd_buffers(model.config.hidden_size)
-        self._assert_l3_shared_buffers_preallocated()
-        self._materialize_resident_weights()
+                with profile_span(
+                    "DeepSeekV4ModelRunner.prepare.load_and_pack_layer_weights",
+                    cat="executor",
+                ):
+                    stacked_weights = self.load_stacked_layer_weights()
+                with profile_span("DeepSeekV4ModelRunner.prepare.retain_layer_weights", cat="executor"):
+                    self._retain_stacked_host_weights(stacked_weights)
+        with profile_span("DeepSeekV4ModelRunner.prepare.prepare_hc_head", cat="executor"):
+            self._hc_head_tensors()
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_fwd_buffers", cat="executor"):
+            self._ensure_prefill_fwd_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.validate_shared_buffers", cat="executor"):
+            self._assert_l3_shared_buffers_preallocated()
+        with profile_span("DeepSeekV4ModelRunner.upload_resident_weights", cat="executor"):
+            self._materialize_resident_weights()
 
     def _assert_l3_shared_buffers_preallocated(self) -> None:
         missing = self._missing_l3_shared_buffers()
@@ -2550,16 +2631,22 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers.prefill_slot_mapping[owner_rank].copy_(context.slot_mapping)
         buffers.prefill_hidden_out.zero_()
         buffers.prefill_pre_hc_out.zero_()
-        self._run_l3(
-            self._require_mtp_prefill_callable(),
-            *self._mtp_prefill_args(),
-            self._int32_scalar(n),
-        )
-        draft_logits = self._logits_for_hidden(
-            buffers.prefill_hidden_out,
-            owner_rows=((owner_rank, n - 1),),
-            label="mtp.prefill",
-        )
+        with profile_span(
+            "DeepSeekV4ModelRunner.mtp.prefill.l3_dispatch",
+            cat="executor",
+            args={"actual_tokens": n},
+        ):
+            self._run_l3(
+                self._require_mtp_prefill_callable(),
+                *self._mtp_prefill_args(),
+                self._int32_scalar(n),
+            )
+        with profile_span("DeepSeekV4ModelRunner.mtp.prefill.lm_head", cat="executor"):
+            draft_logits = self._logits_for_hidden(
+                buffers.prefill_hidden_out,
+                owner_rows=((owner_rank, n - 1),),
+                label="mtp.prefill",
+            )
         state.draft_token_id = int(draft_logits.argmax(dim=-1)[0].item())
         state.tail_token_id = int(first_token[0].item())
         state.tail_pre_hc_hidden = context.prev_hidden_states[n - 1].clone()
@@ -2720,20 +2807,26 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers.decode_hidden_out.zero_()
         buffers.decode_pre_hc_out.zero_()
         active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
-        self._run_l3(
-            self._require_mtp_decode_callable(),
-            *self._mtp_decode_args(),
-            self._int32_scalar(active_tokens),
-        )
+        with profile_span(
+            "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
+            cat="executor",
+            args={"actual_tokens": active_tokens},
+        ):
+            self._run_l3(
+                self._require_mtp_decode_callable(),
+                *self._mtp_decode_args(),
+                self._int32_scalar(active_tokens),
+            )
         draft_owner_rows = tuple(
             (rank, local_row * layout.decode_seq + layout.decode_seq - 1)
             for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
         )
-        draft_ids = self._logits_for_hidden(
-            buffers.decode_hidden_out,
-            owner_rows=draft_owner_rows,
-            label="mtp.decode",
-        ).argmax(dim=-1)
+        with profile_span("DeepSeekV4ModelRunner.mtp.decode.lm_head", cat="executor"):
+            draft_ids = self._logits_for_hidden(
+                buffers.decode_hidden_out,
+                owner_rows=draft_owner_rows,
+                label="mtp.decode",
+            ).argmax(dim=-1)
         for request_index, request_id in enumerate(inputs.request_ids):
             state = self._require_mtp_request_state(request_id)
             _, committed_hidden, committed_positions = committed[request_index]
@@ -3706,19 +3799,38 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
 
     def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
+        """Dispatch one DeepSeek L3 program and emit Qwen-compatible timing traces."""
         if self._l3_worker is None:
             self._assert_l3_args_shared_before_worker(callable_spec, args)
-        worker = self._shared_l3_worker()
-        run_config = self._scope_stats_run_config()
-        uploaded: list[DeviceTensor] = []
-        try:
-            l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
-            if run_config is not None:
-                return worker.run(callable_spec.compiled, *l3_args, config=run_config)
-            return worker.run(callable_spec.compiled, *l3_args)
-        finally:
-            for tensor in uploaded:
-                worker.free_tensor(tensor)
+        trace_name = _kernel_trace_name(callable_spec.name)
+        span_args = {
+            "kernel": callable_spec.name,
+            "block_dim": callable_spec.block_dim,
+            "aicpu_thread_num": callable_spec.aicpu_thread_num,
+        }
+        with profile_span(trace_name, cat="kernel", level="kernel", args=span_args):
+            worker = self._shared_l3_worker()
+            run_config = self._scope_stats_run_config()
+            uploaded: list[DeviceTensor] = []
+            try:
+                l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
+                worker_run_args = dict(span_args)
+                with profile_span(
+                    f"{trace_name}.worker_run",
+                    cat="kernel",
+                    level="kernel",
+                    args=worker_run_args,
+                ):
+                    if run_config is not None:
+                        timing = worker.run(callable_spec.compiled, *l3_args, config=run_config)
+                    else:
+                        timing = worker.run(callable_spec.compiled, *l3_args)
+                    _add_run_timing_args(worker_run_args, timing)
+                _add_run_timing_args(span_args, timing)
+                return timing
+            finally:
+                for tensor in uploaded:
+                    worker.free_tensor(tensor)
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -3857,7 +3969,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if not host_weights:
                 raise RuntimeError("DeepSeekV4 stacked Host weights are not retained")
             parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
-            self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
+            with profile_span("DeepSeekV4ModelRunner.upload_resident_main_weights", cat="executor"):
+                self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
             self._stacked_host_weights = None
             logger.info(
                 "DeepSeekV4 resident main weights uploaded; released_parent_host_bytes=%d",
@@ -3869,7 +3982,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if not buffers.weights:
                 raise RuntimeError("DeepSeekV4 MTP Host weights are not staged")
             parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in buffers.weights.values())
-            self._mtp_device_weights = self._upload_weight_group(worker, buffers.weights)
+            with profile_span("DeepSeekV4ModelRunner.upload_resident_mtp_weights", cat="executor"):
+                self._mtp_device_weights = self._upload_weight_group(worker, buffers.weights)
             buffers.weights.clear()
             logger.info(
                 "DeepSeekV4 resident MTP weights uploaded; released_parent_host_bytes=%d",
@@ -3899,7 +4013,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
             compiled = [callable_spec.compiled for callable_spec in compiled_callables]
-            worker = DistributedWorker(compiled, inherited_host_tensors=self._inherited_host_weights())
+            with profile_span(
+                "DeepSeekV4ModelRunner.create_persistent_l3_worker",
+                cat="executor",
+                args={"callable_count": len(compiled)},
+            ):
+                worker = DistributedWorker(
+                    compiled,
+                    persistent=True,
+                    inherited_host_tensors=self._inherited_host_weights(),
+                )
             self._l3_worker = worker
         return worker
 

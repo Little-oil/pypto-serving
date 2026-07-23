@@ -181,35 +181,50 @@ def _request_completion(process: subprocess.Popen, port: int, deadline: float) -
 
 
 def _stop_process_group(process: subprocess.Popen) -> None:
+    """Gracefully stop the server, then force-kill its process group if needed."""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        # Signal only the uvicorn parent first. Its shutdown hook stops the
+        # serving worker through the normal ShutdownCommand protocol, which
+        # releases the persistent L3 worker and merges profiling fragments.
+        os.kill(process.pid, signal.SIGINT)
     except ProcessLookupError:
         return
     except OSError as exc:
-        print(f"WARNING: failed to terminate process group {process.pid}: {exc}", flush=True)
+        print(f"WARNING: failed to request graceful server shutdown {process.pid}: {exc}", flush=True)
         return
 
     try:
-        process.wait(timeout=20)
+        process.wait(timeout=60)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            # SIGTERM is still sent to the parent only; this gives uvicorn a
+            # second chance to run its shutdown lifecycle before escalation.
+            os.kill(process.pid, signal.SIGTERM)
         except OSError:
             pass
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            print(f"WARNING: process group {process.pid} still alive after SIGKILL", flush=True)
-        except Exception as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(f"WARNING: process group {process.pid} still alive after SIGKILL", flush=True)
+            except OSError as exc:
+                print(f"WARNING: failed to reap process group {process.pid}: {exc}", flush=True)
+        except OSError as exc:
             print(f"WARNING: failed to reap process group {process.pid}: {exc}", flush=True)
         return
-    except Exception as exc:
+    except OSError as exc:
         print(f"WARNING: failed to wait for process group {process.pid}: {exc}", flush=True)
         return
 
-    # The server parent may exit before a worker child. Give the process group a
-    # short grace period, then kill any remaining descendants.
-    shutdown_deadline = time.monotonic() + 2
+    # The server parent may exit before a worker child. Give the normal worker
+    # shutdown command a short grace period, then kill remaining descendants.
+    shutdown_deadline = time.monotonic() + 5
     while time.monotonic() < shutdown_deadline:
         try:
             os.killpg(process.pid, 0)
@@ -306,6 +321,7 @@ def test_stop_process_group_suppresses_final_wait_timeout(monkeypatch, capsys) -
             raise subprocess.TimeoutExpired("server", timeout)
 
     monkeypatch.setattr(os, "killpg", lambda *_args: None)
+    monkeypatch.setattr(os, "kill", lambda *_args: None)
 
     _stop_process_group(StuckProcess())
 

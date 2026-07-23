@@ -48,6 +48,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_HCA_NUM_LAYERS,
 )
 from pypto_serving.model.deepseek.weight_loader import DeepSeekV4WeightStore
+from pypto_serving.tools.profile import profile_span
 
 
 _AST_INT_OPERATORS = {
@@ -550,7 +551,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             enable_scope_stats=True,
             distributed_config=distributed_config,
         )
-        compiled = jit_fn.compile(*dummy_args, config=run_config)
+        with profile_span(f"DeepSeekV4PyptoExecutor.compile.{name}", cat="executor"):
+            compiled = jit_fn.compile(*dummy_args, config=run_config)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}")
         return DeepSeekV4L3Callable(compiled=compiled, name=name)

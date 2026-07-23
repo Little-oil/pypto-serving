@@ -704,8 +704,9 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     captured = {}
 
     class FakeDistributedWorker:
-        def __init__(self, compiled, *, inherited_host_tensors):
+        def __init__(self, compiled, *, persistent, inherited_host_tensors):
             captured["compiled"] = compiled
+            captured["persistent"] = persistent
             captured["inherited"] = inherited_host_tensors
 
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
@@ -724,6 +725,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
 
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
+    assert captured["persistent"] is True
     assert captured["inherited"] == [main_weight, mtp_weight]
 
 
