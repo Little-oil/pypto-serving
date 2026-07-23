@@ -43,7 +43,7 @@ from pypto_serving.serving.server.serving_worker import spawn_worker
 from pypto_serving.tools.profile import profile_instant, profile_span
 
 logger = logging.getLogger(__name__)
-_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 300.0
 _DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
 
@@ -174,6 +174,10 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self.kv_cache_manager.init_groups(
+            runtime.kv_cache_groups,
+            max_batch_size=runtime.max_batch_size,
+        )
 
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -182,6 +186,7 @@ class ReplicaEngineCore:
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
+            num_speculative_tokens=runtime.num_speculative_tokens,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
@@ -208,9 +213,13 @@ class ReplicaEngineCore:
 
             logger.info("Waiting for worker to initialize model...")
             try:
-                ready = await asyncio.to_thread(ready_event.wait, timeout=600)
+                init_timeout = _worker_init_timeout_seconds()
+                ready = await asyncio.to_thread(ready_event.wait, timeout=init_timeout)
                 if not ready:
-                    raise RuntimeError("Worker failed to initialize within timeout")
+                    raise RuntimeError(
+                        f"Worker failed to initialize within {init_timeout:g}s timeout; "
+                        "set PYPTO_WORKER_INIT_TIMEOUT to allow more time for large checkpoints"
+                    )
             except BaseException:
                 await asyncio.to_thread(self._shutdown_worker, timeout=5)
                 raise
@@ -222,12 +231,21 @@ class ReplicaEngineCore:
                 raise RuntimeError(
                     f"Worker reported invalid KV cache page count: {actual_num_pages}"
                 )
-            self.kv_cache_manager._init_blocks(actual_num_pages, self._runtime.page_size)
-            logger.info(
-                "KV cache block pool initialised: num_blocks=%d, block_size=%d",
-                actual_num_pages,
-                self._runtime.page_size,
-            )
+            if self.kv_cache_manager.has_groups:
+                logger.info(
+                    "Grouped KV cache pools initialised: %s",
+                    ", ".join(
+                        f"{name}={self.kv_cache_manager.group_num_blocks(name)}"
+                        for name in self.kv_cache_manager.group_names
+                    ),
+                )
+            else:
+                self.kv_cache_manager._init_blocks(actual_num_pages, self._runtime.page_size)
+                logger.info(
+                    "KV cache block pool initialised: num_blocks=%d, block_size=%d",
+                    actual_num_pages,
+                    self._runtime.page_size,
+                )
 
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
@@ -382,6 +400,8 @@ class ReplicaEngineCore:
 
             with profile_span("scheduler.schedule", cat="scheduler"):
                 scheduler_output = self.scheduler.schedule()
+            for request in scheduler_output.preempted_requests:
+                self._schedule_worker_free(request.request_id)
             if scheduler_output.is_empty:
                 await self._flush_pending_frees()
                 await asyncio.sleep(self.config.engine_loop_interval)
@@ -445,6 +465,12 @@ class ReplicaEngineCore:
         prefill_requests: list[PrefillRequest] = []
         decode_requests: list[DecodeRequest] = []
 
+        # A preempted request may be restarted in this same scheduler pass.
+        # Forget released IDs before building deltas so such a request carries
+        # a fresh NewRequestData record for the worker cache.
+        for req_id in finished_ids:
+            self._worker_known_req_ids.discard(req_id)
+
         for sr in scheduler_output.scheduled_requests:
             req = sr.request
             req_id = req.request_id
@@ -469,6 +495,11 @@ class ReplicaEngineCore:
                     chunk_tokens=list(chunk_tokens),
                     num_computed_tokens=num_computed,
                     block_ids=list(sr.block_ids),
+                    block_ids_by_group={
+                        name: list(block_ids)
+                        for name, block_ids in sr.block_ids_by_group.items()
+                    },
+                    cache_partition=sr.cache_partition,
                 ))
             else:
                 output_ids = req.output_token_ids
@@ -486,12 +517,12 @@ class ReplicaEngineCore:
                     prev_token=prev_token,
                     seq_len=req.num_tokens,
                     block_ids=list(sr.block_ids),
+                    block_ids_by_group={
+                        name: list(block_ids)
+                        for name, block_ids in sr.block_ids_by_group.items()
+                    },
+                    cache_partition=sr.cache_partition,
                 ))
-
-        # Remove finished requests from the known-set so they are re-registered
-        # if the same request_id is ever reused (unlikely but correct).
-        for req_id in finished_ids:
-            self._worker_known_req_ids.discard(req_id)
 
         return StepCommand(
             new_requests=new_requests,
@@ -676,9 +707,9 @@ class AsyncLLMEngine:
 
     The engine owns one or more ``ReplicaEngineCore`` instances and exposes the
     server-facing async API: ``start``, ``stop``, ``add_request``,
-    ``abort_request``, and ``generate_request_id``. For ``data_parallel_size=1``
-    it wraps a single core. For DP>1 it selects a core for each request and
-    records request placement so aborts are sent to the correct replica.
+    ``abort_request``, and ``generate_request_id``. With one serving replica it
+    wraps a single core. With multiple replicas it selects a core for each
+    request and records request placement so aborts reach the correct replica.
     """
 
     def __init__(

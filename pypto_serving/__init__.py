@@ -9,7 +9,7 @@
 """Public API for PyPTO Serving."""
 
 from pypto_serving.config.parallel import ParallelConfig
-from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
 from pypto_serving.model.model_loader import ModelLoader
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.engine.engine import LLMEngine
@@ -18,6 +18,8 @@ __all__ = [
     "AsyncLLMEngine",
     "EngineConfig",
     "GenerateConfig",
+    "KVCacheGroupSpec",
+    "KVCacheSpec",
     "LLMEngine",
     "ModelLoader",
     "ParallelConfig",

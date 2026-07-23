@@ -61,6 +61,14 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
                 "transformers is required for the current local Hugging Face tokenizer adapter."
             ) from exc
 
+        fallback_errors: tuple[type[BaseException], ...] = (OSError, ValueError, TypeError, AttributeError)
+        try:
+            from huggingface_hub.errors import StrictDataclassFieldValidationError
+        except ImportError:
+            pass
+        else:
+            fallback_errors += (StrictDataclassFieldValidationError,)
+
         model_path = Path(model_dir)
         try:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -69,10 +77,8 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
                 trust_remote_code=trust_remote_code,
                 use_fast=True,
             )
-        except Exception as exc:
-            if not isinstance(exc, (OSError, ValueError, AttributeError)) and (
-                type(exc).__name__ != "StrictDataclassFieldValidationError"
-            ):
+        except fallback_errors as exc:
+            if not (model_path / "tokenizer.json").exists():
                 raise
             logger.warning(
                 "AutoTokenizer.from_pretrained failed for %s: %s; falling back to local tokenizer.json",
@@ -116,6 +122,17 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
     def pad_token_id(self) -> int | None:
         """Return the wrapped tokenizer PAD token ID."""
         return self.tokenizer.pad_token_id
+
+
+def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
+    """Load a local tokenizer without parsing model config when ``tokenizer.json`` is available."""
+    model_path = Path(model_dir)
+    if (model_path / "tokenizer.json").exists():
+        return TransformersTokenizerAdapter.from_tokenizer_file(str(model_path))
+    return TransformersTokenizerAdapter.from_pretrained(
+        str(model_path),
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _token_content(value: object) -> str | None:

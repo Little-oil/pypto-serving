@@ -34,9 +34,10 @@ PROMPT = "Huawei is"
 MAX_NEW_TOKENS = 10
 EXPECTED_TEXT = " a leading global information and communications technology (ICT)"
 
-STARTUP_TIMEOUT_SECONDS = 600
-OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "1650"))
+STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
+OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "2400"))
 HEARTBEAT_SECONDS = 30
+LOCAL_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _task_devices() -> tuple[int, ...]:
@@ -74,8 +75,8 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
         "--devices",
         ",".join(str(device) for device in devices),
         "--dp",
-        "1",
-        "--tp",
+        "8",
+        "--ep",
         "8",
         "--block-size",
         "128",
@@ -106,7 +107,7 @@ def _wait_for_health(process: subprocess.Popen, port: int, deadline: float) -> N
         if return_code is not None:
             raise RuntimeError(f"DeepSeek server exited before becoming healthy (code={return_code})")
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with LOCAL_URL_OPENER.open(url, timeout=5) as response:
                 payload = json.loads(response.read())
             if response.status == 200 and payload == {"status": "ok"}:
                 print("DeepSeek server is healthy", flush=True)
@@ -143,7 +144,7 @@ def _request_completion(process: subprocess.Popen, port: int, deadline: float) -
     def send_request() -> None:
         try:
             timeout = max(1.0, deadline - time.monotonic())
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with LOCAL_URL_OPENER.open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8")
                 results.put((True, json.loads(body)))
         except urllib.error.HTTPError as exc:
@@ -285,7 +286,7 @@ def test_completion_http_error_includes_response_body(monkeypatch) -> None:
     def raise_http_error(*_args, **_kwargs):
         raise error
 
-    monkeypatch.setattr(urllib.request, "urlopen", raise_http_error)
+    monkeypatch.setattr(LOCAL_URL_OPENER, "open", raise_http_error)
 
     class RunningProcess:
         @staticmethod

@@ -86,6 +86,7 @@ _DECODE_FWD_SHARED_COMMON_NAMES = frozenset({"freqs_cos", "freqs_sin", "input_id
 # single per-rank copy (the kernel slices them per layer internally), not stacked
 # across the 43 forward layers.
 _PREFILL_FWD_SHARED_COMMON_NAMES = frozenset({"freqs_cos", "freqs_sin", "input_ids"})
+_DEEPSEEK_V4_KERNEL_DIRNAME = "v4-flash"
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
@@ -128,7 +129,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
         pypto_root = os.environ.get("PYPTO_ROOT")
     if pypto_root:
         root = Path(pypto_root)
-        candidate = root / "models" / "deepseek" / "v4"
+        candidate = root / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
         raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_ROOT={pypto_root!r}")
@@ -136,7 +137,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
         pypto_lib_dir = directory / "pypto-lib"
-        candidate = pypto_lib_dir / "models" / "deepseek" / "v4"
+        candidate = pypto_lib_dir / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
 
@@ -204,7 +205,11 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     if resolved.is_relative_to(kernel_dir):
         return True
     parts = resolved.parts
-    return len(parts) >= 4 and parts[-4:-1] == ("models", "deepseek", "v4")
+    return len(parts) >= 4 and parts[-4:-1] == (
+        "models",
+        "deepseek",
+        _DEEPSEEK_V4_KERNEL_DIRNAME,
+    )
 
 
 @contextlib.contextmanager
@@ -288,6 +293,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         return self._l3_trace
 
     @property
+    def max_prefill_batch_size(self) -> int:
+        """Return the global DP width: one local prefill request per EP rank."""
+        return DeepSeekV4CacheLayout().ranks
+
+    @property
     def supports_device_sampling(self) -> bool:
         """Enable executor-provided greedy token acceptance for MTP only."""
         return self._enable_mtp
@@ -322,7 +332,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         return embeddings.reshape(*token_ids.shape, model.config.hidden_size).to(device=token_ids.device)
 
     def release_finished_requests(self, request_ids: Iterable[str]) -> None:
-        """Release runner-owned DeepSeekV4 cache slots for finished requests."""
+        """Release runner-local DeepSeekV4 cache ownership metadata."""
         for runner in self._runners.values():
             release = getattr(runner, "release_finished_requests", None)
             if callable(release):
@@ -347,7 +357,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if metadata.get("checkpoint_format") != "w8a8-compressed-tensors":
             raise ValueError("DeepSeekV4PyptoExecutor requires the W8A8 compressed-tensors checkpoint")
 
-        layout = DeepSeekV4CacheLayout()
+        # The main-model decode program has two valid specializations with the
+        # same eight-token tile. Normal autoregressive serving must use S=1 so
+        # compressor boundaries advance once per generated token; MTP verifies
+        # a [previous, current] pair and therefore uses S=2.
+        layout = DeepSeekV4CacheLayout(
+            decode_batch=4 if self._enable_mtp else 8,
+            decode_seq=2 if self._enable_mtp else 1,
+            decode_tokens=8,
+        )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         self._validate_kernel_contract(layout)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
@@ -426,6 +444,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             device_id=self._device_ids[0],
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
+            enable_mtp=self._enable_mtp,
         )
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
@@ -444,10 +463,23 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             prefill_fwd = importlib.import_module("prefill_fwd")
             prefill_mtp = importlib.import_module("prefill_mtp")
         with _deepseek_v4_import_context(self._kernel_dir, pypto_root=pypto_root, ep=ranks, moe_shape="decode"):
-            modules = {
-                name: importlib.import_module(name)
-                for name in ("config", "decode_layer", "decode_fwd", "decode_mtp", "rope_tables")
-            }
+            config = importlib.import_module("config")
+            # pypto-lib freezes B/S into module-level shapes at import. Override
+            # the deployment preset before importing any decode program while
+            # keeping the common T=8 tile and all physical cache capacities.
+            config.DECODE_BATCH = layout.decode_batch
+            config.DECODE_SEQ = layout.decode_seq
+            config.DECODE_TOKENS = layout.decode_tokens
+            config.MOE_TOKENS = layout.decode_tokens
+            config.DECODE_RECV_MAX = ranks * layout.decode_tokens
+            config.RECV_MAX = config.DECODE_RECV_MAX
+            modules = {"config": config}
+            modules.update(
+                {
+                    name: importlib.import_module(name)
+                    for name in ("decode_layer", "decode_fwd", "decode_mtp", "rope_tables")
+                }
+            )
         modules["prefill_layer"] = prefill_layer
         modules["prefill_fwd"] = prefill_fwd
         modules["prefill_mtp"] = prefill_mtp
@@ -966,8 +998,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         config_path = self._kernel_dir / "config.py"
         expected_config = {
             "BLOCK_SIZE": layout.block_size,
-            "DECODE_BATCH": layout.decode_batch,
-            "DECODE_SEQ": layout.decode_seq,
+            # B/S are serving-selected specializations (B8/S1 for normal
+            # decode, B4/S2 for MTP) and are overridden before module import.
+            # The checked-in source must retain the common eight-token tile.
             "DECODE_TOKENS": layout.decode_tokens,
             "PREFILL_BATCH": layout.prefill_batch,
             "PREFILL_SEQ": layout.prefill_seq,

@@ -1,10 +1,14 @@
 # Parallel Serving Dev Notes
 
-Serving supports a v1 `DP x TP` device topology. Data parallelism creates one
-independent serving engine per replica, and tensor parallelism passes one device
-group to the PyPTO L3 distributed worker for that replica. Single-device serving
-remains the default. Pipeline parallelism and expert parallelism are not
-supported yet.
+For standard models, serving supports a v1 `DP x TP` device topology. Data
+parallelism creates one independent serving engine per replica, and tensor
+parallelism passes one device group to the PyPTO L3 distributed worker for that
+replica. Single-device serving remains the default.
+
+DeepSeekV4 additionally supports model-local overlapped DP/EP placement. Its
+attention DP ranks and MoE EP ranks reuse the same eight-device worker group;
+see [DeepSeek V4 NPU Serving Dev Notes](model/deepseek-v4.md). Pipeline
+parallelism and general-purpose expert-parallel placement are not supported yet.
 
 Install the checkout before running the commands below:
 

@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,11 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    num_speculative_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_speculative_tokens < 0:
+            raise ValueError("num_speculative_tokens must be non-negative")
 
 
 @dataclass
@@ -66,6 +71,8 @@ class Request:
     top_k: int | None = None
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
+    allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
+    cache_partition: int | None = None
     block_hashes: list[int] = field(default_factory=list)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
 
@@ -97,6 +104,8 @@ class ScheduledRequest:
     is_prefill: bool
     num_computed_tokens: int = 0
     block_ids: list[int] = field(default_factory=list)
+    block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
+    cache_partition: int | None = None
     resumed_from_preemption: bool = False
 
 
@@ -126,6 +135,8 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
+        if self.kv_cache_manager.has_groups and self.config.enable_prefix_cache:
+            raise ValueError("Prefix caching is not supported with grouped KV caches")
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
@@ -191,12 +202,21 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         output = SchedulerOutput()
         token_budget = self.config.max_num_scheduled_tokens
+        grouped_phase = self._grouped_cache_phase()
 
         # Phase 1: schedule RUNNING requests (decode or resumed prefill)
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
         for request in self.running:
+            # A request later in this snapshot may have been preempted while
+            # scheduling an earlier request. Do not schedule it again from the
+            # stale iteration snapshot.
+            if request.status is RequestStatus.PREEMPTED:
+                continue
+            if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
+                running_to_keep.append(request)
+                continue
             num_new = request.num_new_tokens_needed
             if num_new <= 0:
                 running_to_keep.append(request)
@@ -210,8 +230,18 @@ class Scheduler:
                 running_to_keep.append(request)
                 continue
 
-            num_blocks_needed = self._blocks_needed(request, num_new)
-            if not self._try_allocate_blocks(request, num_blocks_needed):
+            is_prefill = request.is_prefill
+            speculative_tokens = (
+                self.config.num_speculative_tokens
+                if not is_prefill and request.temperature <= 0.0
+                else 0
+            )
+            scheduled_tokens = num_new + speculative_tokens
+            if scheduled_tokens > token_budget:
+                running_to_keep.append(request)
+                continue
+
+            if not self._try_allocate_request_blocks(request, scheduled_tokens):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
@@ -220,11 +250,10 @@ class Scheduler:
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
                 output.preempted_requests.append(preempted["request"])
-                if not self._try_allocate_blocks(request, num_blocks_needed):
+                if not self._try_allocate_request_blocks(request, scheduled_tokens):
                     running_to_keep.append(request)
                     continue
 
-            is_prefill = request.is_prefill
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
             output.scheduled_requests.append(
                 ScheduledRequest(
@@ -233,18 +262,36 @@ class Scheduler:
                     is_prefill=is_prefill,
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=list(all_block_ids),
+                    block_ids_by_group={
+                        name: list(block_ids)
+                        for name, block_ids in request.allocated_group_block_ids.items()
+                    },
+                    cache_partition=request.cache_partition,
                 )
             )
             scheduled_req_ids.add(request.request_id)
-            num_scheduled_tokens[request.request_id] = num_new
+            num_scheduled_tokens[request.request_id] = scheduled_tokens
             if is_prefill:
                 output.num_prefill_tokens += num_new
             else:
-                output.num_decode_tokens += num_new
-            token_budget -= num_new
+                output.num_decode_tokens += scheduled_tokens
+            token_budget -= scheduled_tokens
             running_to_keep.append(request)
 
-        self.running = running_to_keep
+        # Victims that appeared earlier in the iteration may already be in
+        # running_to_keep. They now live in the waiting queue and must not be
+        # retained in both queues.
+        self.running = [
+            request
+            for request in running_to_keep
+            if request.status is not RequestStatus.PREEMPTED
+        ]
+
+        # Fixed-shape DeepSeek decode rows use otherwise-free cache blocks as
+        # scratch space. Do not admit a new prefill wave while a decode wave is
+        # active, or those padding rows could overwrite the new request's cache.
+        if grouped_phase == "decode":
+            return output
 
         # Phase 2: schedule WAITING requests (new prefill)
         remaining_waiting: deque[Request] = deque()
@@ -280,8 +327,7 @@ class Scheduler:
                     remaining_waiting.append(request)
                     continue
 
-            num_blocks_needed = self._blocks_needed(request, num_new)
-            if not self._try_allocate_blocks(request, num_blocks_needed):
+            if not self._try_allocate_request_blocks(request, num_new):
                 self.kv_cache_manager.release_cached_blocks(cached_blocks)
                 request.cached_block_ids = []
                 request.num_computed_tokens = 0
@@ -298,6 +344,11 @@ class Scheduler:
                     is_prefill=True,
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=list(all_block_ids),
+                    block_ids_by_group={
+                        name: list(block_ids)
+                        for name, block_ids in request.allocated_group_block_ids.items()
+                    },
+                    cache_partition=request.cache_partition,
                 )
             )
             output.num_prefill_tokens += num_new
@@ -307,6 +358,16 @@ class Scheduler:
         self.waiting = remaining_waiting
 
         return output
+
+    def _grouped_cache_phase(self) -> str | None:
+        """Choose one execution phase when grouped caches share decode scratch space."""
+        if not self.kv_cache_manager.has_groups:
+            return None
+        if any(request.is_prefill and request.num_new_tokens_needed > 0 for request in self.running):
+            return "prefill"
+        if any(not request.is_prefill and request.num_new_tokens_needed > 0 for request in self.running):
+            return "decode"
+        return None
 
     def update_from_output(
         self,
@@ -403,6 +464,24 @@ class Scheduler:
         request.allocated_block_ids.extend(block_ids)
         return True
 
+    def _try_allocate_request_blocks(self, request: Request, num_new_tokens: int) -> bool:
+        """Grow either grouped or generic cache blocks for one scheduling step."""
+        if self.kv_cache_manager.has_groups:
+            total_tokens = request.num_computed_tokens + num_new_tokens
+            try:
+                request.allocated_group_block_ids = self.kv_cache_manager.ensure_group_blocks(
+                    request.request_id,
+                    total_tokens,
+                    partition=request.cache_partition,
+                )
+                request.cache_partition = self.kv_cache_manager.group_request_partition(
+                    request.request_id
+                )
+            except KVCacheCapacityError:
+                return False
+            return True
+        return self._try_allocate_blocks(request, self._blocks_needed(request, num_new_tokens))
+
     def _preempt_lowest_priority(
         self,
         exclude: Request,
@@ -418,6 +497,14 @@ class Scheduler:
         if not self.running:
             return None
         candidates = [r for r in self.running if r.request_id != exclude.request_id]
+        if self.kv_cache_manager.has_groups and exclude.cache_partition is not None:
+            same_partition = [
+                request
+                for request in candidates
+                if request.cache_partition == exclude.cache_partition
+            ]
+            if same_partition:
+                candidates = same_partition
         if not candidates:
             return None
         victim = max(candidates, key=lambda r: r.arrival_time)
@@ -439,6 +526,8 @@ class Scheduler:
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []
+        victim.allocated_group_block_ids = {}
+        victim.cache_partition = None
         victim.num_blocks_cached = 0
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
@@ -451,6 +540,10 @@ class Scheduler:
         )
         request.cached_block_ids = []
         request.allocated_block_ids = []
+        if request.allocated_group_block_ids:
+            self.kv_cache_manager.release_all_group_requests(request.request_id)
+            request.allocated_group_block_ids = {}
+        request.cache_partition = None
 
     def _cache_completed_blocks(self, request: Request) -> None:
         """Register completed blocks in the prefix cache."""

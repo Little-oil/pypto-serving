@@ -19,6 +19,8 @@ from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
     GenerateConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     LayerWeights,
     ModelConfig,
     ModelRecord,
@@ -56,8 +58,11 @@ from pypto_serving.serving.sched.scheduler import (
 from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
+    PrefillRequest,
+    StepCommand,
     StepResult,
     decode_command,
+    encode_command,
     encode_result,
 )
 from pypto_serving.serving.server.serving_worker import WorkerProcess
@@ -129,6 +134,131 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
         assert isinstance(token, TokenOutput)
         assert token.finished is True
         assert token.finish_reason == "error"
+
+
+def test_grouped_cache_preemption_removes_victim_from_running_queue():
+    manager = KvCacheManager(block_size=1, enable_prefix_cache=False)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="test",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=1, page_size_bytes=1),
+                max_blocks_per_seq=3,
+                num_blocks=3,
+            ),
+        ),
+        max_batch_size=2,
+    )
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=4,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    requests = [
+        Request(
+            request_id=request_id,
+            prompt_token_ids=[1],
+            max_new_tokens=5,
+            arrival_time=arrival_time,
+            status=RequestStatus.RUNNING,
+            num_computed_tokens=1,
+            output_token_ids=[2],
+            temperature=0.0,
+        )
+        for request_id, arrival_time in (("older", 1.0), ("newer", 2.0))
+    ]
+    for request in requests:
+        request.allocated_group_block_ids = manager.ensure_group_blocks(
+            request.request_id, 1
+        )
+        request.cache_partition = 0
+        scheduler.requests[request.request_id] = request
+    scheduler.running = requests
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in output.preempted_requests] == ["newer"]
+    assert [request.request_id for request in scheduler.running] == ["older"]
+    assert [request.request_id for request in scheduler.waiting] == ["newer"]
+
+
+def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._worker_known_req_ids = {"req"}
+    request = Request(
+        request_id="req",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    scheduled = ScheduledRequest(
+        request=request,
+        num_new_tokens=2,
+        is_prefill=True,
+        block_ids_by_group={"ori": [3, 4], "state": [5]},
+        cache_partition=2,
+    )
+    output = SchedulerOutput(scheduled_requests=[scheduled])
+
+    command = core._build_step_command(output, finished_ids=["req"])
+    decoded = decode_command(encode_command(command))
+
+    assert [item.request_id for item in decoded.new_requests] == ["req"]
+    assert decoded.finished_request_ids == ["req"]
+    assert decoded.prefill_requests[0].block_ids_by_group == {
+        "ori": [3, 4],
+        "state": [5],
+    }
+    assert decoded.prefill_requests[0].cache_partition == 2
+
+
+def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
+    requests = [
+        PrefillRequest(
+            request_id=request_id,
+            chunk_tokens=[1],
+            num_computed_tokens=0,
+            block_ids=[],
+            cache_partition=partition,
+        )
+        for request_id, partition in (("a", 0), ("b", 0), ("c", 1))
+    ]
+
+    chunks = WorkerProcess._partitioned_prefill_chunks(requests, max_batch=2)
+
+    assert [[request.request_id for request in chunk] for chunk in chunks] == [
+        ["a", "c"],
+        ["b"],
+    ]
+
+
+def test_worker_releases_preempted_state_before_same_command_reregistration():
+    released: list[str] = []
+    results: list[bytes] = []
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    worker._req_cache = {
+        "req": NewRequestData("req", [0], 0.0, 1.0, None),
+    }
+    worker.output_queue = SimpleNamespace(put=results.append)
+    worker._execute_step = lambda _cmd: StepResult(new_tokens={})
+    replacement = NewRequestData("req", [1, 2], 0.0, 1.0, None)
+    command = StepCommand(
+        new_requests=[replacement],
+        prefill_requests=[],
+        decode_requests=[],
+        finished_request_ids=["req"],
+    )
+
+    worker._handle_step_command(command)
+
+    assert released == ["req"]
+    assert worker._req_cache["req"] == replacement
+    assert len(results) == 1
 
 
 def test_abort_request_schedules_worker_cleanup():
