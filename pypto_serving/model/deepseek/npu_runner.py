@@ -83,6 +83,8 @@ DEEPSEEK_V4_HC_EPS = 1e-6
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
+DEEPSEEK_V4_LM_HEAD_TP_SIZE = 4
+DEEPSEEK_V4_MAX_LOGIT_ROWS = 8
 
 # Policy values indicate whether a resident argument contains mutable request
 # cache state and therefore must be invalidated before its Host backing is
@@ -94,6 +96,7 @@ _MAIN_STATIC_RESIDENT_POLICY = {
     "hc_head_scale": False,
     "hc_head_base": False,
     "final_norm_w": False,
+    "lm_head_weight": False,
 }
 _MAIN_CACHE_RESIDENT_POLICY = {
     "kv_cache": True,
@@ -230,9 +233,8 @@ def build_deepseek_v4_cache_group_specs(
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
 # mirrors pypto-lib prefill_fwd.py ``l3_prefill_fwd`` host signature: every
 # layer-stacked weight/state tensor in core-parameter order, followed by the
-# ``hc_head`` collapse weights, final RMSNorm input and an ``x_out`` output. The
-# kernel stops before LM-head; logits are computed on the host from selected
-# normalized hidden rows. A trailing ``num_tokens`` scalar is appended at dispatch.
+# ``hc_head`` collapse weights, final RMSNorm input, device LM-head weights, and
+# hidden/logit outputs and owner-major execution metadata.
 # The cache pools are ``pl.InOut`` tensors shared by prefill and decode; mutable
 # block tables, slot mappings and token metadata remain shared host inputs.
 _PREFILL_FWD_TENSOR_ORDER = (
@@ -315,13 +317,18 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "hc_head_base",
     "final_norm_w",
     "pre_hc_hidden_out",
-    "x_out",
+    "lm_head_weight",
+    "hidden_out",
+    "logits",
+    "num_tokens_per_owner",
+    "logit_row_indices",
+    "num_logit_rows",
 )
 
 # Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
 # mirrors pypto-lib decode_fwd.py ``l3_decode_fwd`` host signature: after the
-# ``hc_head`` collapse weights the kernel performs final RMSNorm and writes
-# normalized ``x_out``. LM-head is computed on the host side.
+# ``hc_head`` collapse weights the kernel performs final RMSNorm and device
+# LM-head projection.
 _DECODE_FWD_TENSOR_ORDER = (
     "x_hc",
     "hc_attn_fn",
@@ -408,7 +415,12 @@ _DECODE_FWD_TENSOR_ORDER = (
     "hc_head_base",
     "final_norm_w",
     "pre_hc_hidden_out",
-    "x_out",
+    "lm_head_weight",
+    "hidden_out",
+    "logits",
+    "num_tokens_per_owner",
+    "logit_row_indices",
+    "num_logit_rows",
 )
 
 _MTP_PREFILL_TENSOR_ORDER = (
@@ -467,6 +479,9 @@ _DECODE_INPUT_TENSOR_FIELDS = (
     "csa_idx_slot_mapping",
     "csa_state_slot_mapping",
     "csa_inner_state_slot_mapping",
+    "num_tokens_per_owner",
+    "logit_row_indices",
+    "num_logit_rows",
 )
 
 
@@ -1022,6 +1037,9 @@ class DeepSeekV4PreparedPrefillInputs:
     csa_idx_slot_mapping: torch.Tensor
     csa_state_slot_mapping: torch.Tensor
     csa_inner_state_slot_mapping: torch.Tensor
+    num_tokens_per_owner: torch.Tensor
+    logit_row_indices: torch.Tensor
+    num_logit_rows: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1056,6 +1074,9 @@ class DeepSeekV4PreparedDecodeInputs:
     csa_state_slot_mapping: torch.Tensor
     csa_inner_state_slot_mapping: torch.Tensor
     block_ids_by_group: tuple[dict[str, tuple[int, ...]], ...]
+    num_tokens_per_owner: torch.Tensor
+    logit_row_indices: torch.Tensor
+    num_logit_rows: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1075,6 +1096,7 @@ class _DeepSeekV4MainDecodeOutput:
     inputs: DeepSeekV4PreparedDecodeInputs
     hidden: torch.Tensor
     pre_hc_hidden: torch.Tensor
+    logits: torch.Tensor
 
 
 @dataclass
@@ -1247,6 +1269,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._decode_cache_block_ids: dict[str, dict[str, set[int]]] = {}
         self._global_weights: DeepSeekV4GlobalWeights | None = None
         self._static_final_norm_weight: torch.Tensor | None = None
+        self._static_lm_head_weight: torch.Tensor | None = None
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
@@ -1257,6 +1280,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._prefill_output_buffer: torch.Tensor | None = None
         self._prefill_pre_hc_output_buffer: torch.Tensor | None = None
+        self._prefill_logits_buffer: torch.Tensor | None = None
+        self._decode_logits_buffer: torch.Tensor | None = None
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
@@ -1308,11 +1333,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._materialize_mtp_device_kv_cache()
 
     def load_packed_global_weights(self) -> DeepSeekV4GlobalWeights:
-        """Load global tensors and pack the LM head for host-side projection."""
+        """Load global tensors and shard the device LM head across its TP ranks."""
         if self._global_weights is None:
-            self._global_weights = self._compiled.weight_store.load_packed_global_weights(
-                ranks=self._compiled.layout.ranks
+            loaded = self._compiled.weight_store.load_packed_global_weights(
+                ranks=DEEPSEEK_V4_LM_HEAD_TP_SIZE
             )
+            exact_weight = loaded.lm_head_weight[:, : loaded.lm_head_layout.vocab_per_rank, :].contiguous()
+            self._global_weights = replace(loaded, lm_head_weight=exact_weight)
         return self._global_weights
 
     def load_stacked_layer_weights(self) -> DeepSeekV4StackedLayerWeights:
@@ -1510,6 +1537,18 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 )
             )
 
+        num_tokens_per_owner = torch.zeros(layout.ranks, dtype=torch.int32)
+        logit_row_indices = torch.full(
+            (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+            -1,
+            dtype=torch.int32,
+        )
+        num_logit_rows = torch.zeros(layout.ranks, dtype=torch.int32)
+        for rank, actual_tokens in zip(ranks, actual_tokens_by_request, strict=True):
+            num_tokens_per_owner[rank] = actual_tokens
+            logit_row_indices[rank, 0] = actual_tokens - 1
+            num_logit_rows[rank] = 1
+
         return DeepSeekV4PreparedPrefillInputs(
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
@@ -1537,6 +1576,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 csa_inner_state_slot_mappings,
                 ranks,
             ),
+            num_tokens_per_owner=num_tokens_per_owner,
+            logit_row_indices=logit_row_indices,
+            num_logit_rows=num_logit_rows,
         )
 
     @staticmethod
@@ -1568,6 +1610,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             model,
             batch,
             assignment=assignment,
+            active_seq=1,
             positions=positions,
             token_rows=self._autoregressive_decode_token_rows(batch.token_ids, actual_batch),
             x_hc=builder.decode_x_hc(
@@ -1596,6 +1639,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             model,
             batch,
             assignment=assignment,
+            active_seq=self._compiled.layout.decode_seq,
             positions=positions,
             token_rows=self._mtp_decode_token_rows(
                 batch.token_ids,
@@ -1616,6 +1660,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         batch: DecodeBatch,
         *,
         assignment: _DeepSeekV4DecodeAssignment,
+        active_seq: int,
         positions: tuple[tuple[int, ...], ...],
         token_rows: torch.Tensor,
         x_hc: torch.Tensor,
@@ -1815,6 +1860,29 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 ).reshape(-1)
             )
 
+        num_tokens_per_owner = torch.tensor(
+            tuple(count * active_seq for count in per_rank_counts),
+            dtype=torch.int32,
+        )
+        logit_row_indices = torch.full(
+            (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+            -1,
+            dtype=torch.int32,
+        )
+        num_logit_rows = num_tokens_per_owner.clone()
+        for rank, count in enumerate(per_rank_counts):
+            row_count = count * active_seq
+            if row_count > DEEPSEEK_V4_MAX_LOGIT_ROWS:
+                raise ValueError(
+                    f"rank {rank} requires {row_count} logit rows, "
+                    f"capacity is {DEEPSEEK_V4_MAX_LOGIT_ROWS}"
+                )
+            if row_count:
+                logit_row_indices[rank, :row_count] = torch.arange(
+                    row_count,
+                    dtype=torch.int32,
+                )
+
         return DeepSeekV4PreparedDecodeInputs(
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
@@ -1852,6 +1920,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 field_rows["csa_inner_state_slot_mapping"]
             ),
             block_ids_by_group=active_group_ids,
+            num_tokens_per_owner=num_tokens_per_owner,
+            logit_row_indices=logit_row_indices,
+            num_logit_rows=num_logit_rows,
         )
 
     @staticmethod
@@ -1948,15 +2019,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._stage_prefill_fwd_inputs(inputs)
         hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
+        logits_buffer = self._require_prefill_logits_buffer(model.config.vocab_size)
         hidden_buffer.zero_()
         pre_hc_hidden_buffer.zero_()
-        args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer)
+        logits_buffer.zero_()
+        args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
         self._debug_prefill_dispatch(inputs, args)
         try:
             self._run_l3(
                 self._require_prefill_callable(),
                 *args,
-                self._int32_scalar(max(inputs.actual_tokens)),
             )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -1970,16 +2042,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
             raise RuntimeError("DeepSeekV4 packed prefill produced non-finite active hidden rows")
 
-        # Sample the last real prompt row (``actual_tokens - 1``) from host-side
-        # LM-head logits, mirroring the decode path.
-        owner_rows = tuple(
-            (rank, actual_tokens - 1)
-            for rank, actual_tokens in zip(inputs.ranks, inputs.actual_tokens, strict=True)
-        )
-        logits = self._logits_for_hidden(
-            hidden_buffer,
-            owner_rows=owner_rows,
-            label="prefill",
+        logits = torch.stack(
+            tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
         ).float()
         return PrefillResult(last_hidden=None, logits=logits)
 
@@ -1997,15 +2061,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self.prepare_decode_inputs(model, batch),
             active_seq=1,
         )
-        decode_seq = self._compiled.layout.decode_seq
-        owner_rows = tuple(
-            (rank, local_row * decode_seq)
-            for rank, local_row in zip(output.inputs.ranks, output.inputs.local_rows, strict=True)
-        )
-        logits = self._logits_for_hidden(
-            output.hidden,
-            owner_rows=owner_rows,
-            label="decode",
+        logits = torch.stack(
+            tuple(
+                output.logits[rank, local_row]
+                for rank, local_row in zip(
+                    output.inputs.ranks,
+                    output.inputs.local_rows,
+                    strict=True,
+                )
+            )
         ).float()
         return DecodeResult(hidden_states=None, logits=logits)
 
@@ -2023,15 +2087,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         inputs = output.inputs
         decode_seq = self._compiled.layout.decode_seq
-        pair_owner_rows = tuple(
-            (rank, local_row * decode_seq + offset)
-            for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
-            for offset in range(decode_seq)
-        )
-        pair_logits = self._logits_for_hidden(
-            output.hidden,
-            owner_rows=pair_owner_rows,
-            label="decode.mtp_main",
+        pair_logits = torch.stack(
+            tuple(
+                output.logits[rank, local_row * decode_seq + offset]
+                for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
+                for offset in range(decode_seq)
+            )
         ).float()
         main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
         accepted = accept_mtp_tokens(main_ids, draft_token_ids)
@@ -2088,19 +2149,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = decode_buffers.pre_hc_hidden_out
+        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
         hidden_buffer.zero_()
         pre_hc_hidden_buffer.zero_()
-        # ``num_tokens`` is the real active token count. PR 677 restores the
-        # gate norm/quant scopes for this num_tokens-aware path; the fixed padding
-        # rows remain valid metadata for attention but must not be routed by MoE.
-        num_tokens = active_decode_tokens
-        args = self._decode_fwd_args(inputs, x_hc, pre_hc_hidden_buffer, hidden_buffer)
+        logits_buffer.zero_()
+        args = self._decode_fwd_args(inputs, x_hc, pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
         self._debug_decode_dispatch(inputs, args)
         try:
             self._run_l3(
                 self._require_decode_callable(),
                 *args,
-                self._int32_scalar(num_tokens),
             )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -2116,6 +2174,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             inputs=inputs,
             hidden=hidden_buffer,
             pre_hc_hidden=pre_hc_hidden_buffer,
+            logits=logits_buffer,
         )
 
     @staticmethod
@@ -2177,7 +2236,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._ensure_decode_work_cache()
         self._require_prefill_output_buffer(model.config.hidden_size)
         self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
+        self._require_prefill_logits_buffer(model.config.vocab_size)
         self._static_final_norm_weight_tensor()
+        self._static_lm_head_weight_tensor()
+        self._require_decode_logits_buffer(model.config.vocab_size)
         if self._stacked_host_weights is None:
             if self._stacked_device_weights is None:
                 self._retain_stacked_host_weights(self.load_stacked_layer_weights())
@@ -2198,6 +2260,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         missing: list[str] = []
         expected = {
             "final_norm_w": self._static_final_norm_weight,
+            "lm_head_weight": self._static_lm_head_weight,
             "freqs_cos": self._static_freqs_cos,
             "freqs_sin": self._static_freqs_sin,
             "prefill_fwd_buffers": self._prefill_fwd_buffers,
@@ -2207,6 +2270,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
             "prefill_pre_hc_output": self._prefill_pre_hc_output_buffer,
+            "prefill_logits": self._prefill_logits_buffer,
+            "decode_logits": self._decode_logits_buffer,
         }
         if self._compiled.mtp_prefill is not None or self._compiled.mtp_decode is not None:
             expected["mtp_buffers"] = self._mtp_buffers
@@ -2222,12 +2287,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _prefill_fwd_args(
         self,
         pre_hc_hidden_out: torch.Tensor,
-        x_out: torch.Tensor,
+        hidden_out: torch.Tensor,
+        logits: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_prefill_fwd`` argument tuple.
 
-        The kernel runs final RMSNorm and emits normalized hidden rows. LM-head is
-        computed on the host from the selected rows.
+        The kernel runs final RMSNorm and the device-side LM-head.
         """
         buffers = self._require_prefill_fwd_buffers()
         stacked = self._require_stacked_weights()
@@ -2243,7 +2308,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hc_head_base": hc_head["hc_head_base"],
                 "final_norm_w": self._static_final_norm_weight_tensor(),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
-                "x_out": x_out,
+                "lm_head_weight": self._static_lm_head_weight_tensor(),
+                "hidden_out": hidden_out,
+                "logits": logits,
+                "num_tokens_per_owner": buffers.tensors["num_tokens_per_owner"],
+                "logit_row_indices": buffers.tensors["logit_row_indices"],
+                "num_logit_rows": buffers.tensors["num_logit_rows"],
             }
         )
         values.update(buffers.tensors)
@@ -2256,7 +2326,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         inputs: DeepSeekV4PreparedDecodeInputs,
         x_hc: torch.Tensor,
         pre_hc_hidden_out: torch.Tensor,
-        x_out: torch.Tensor,
+        hidden_out: torch.Tensor,
+        logits: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
         cache = self._materialize_decode_device_cache()
@@ -2301,7 +2372,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hc_head_base": hc_head["hc_head_base"],
                 "final_norm_w": self._static_final_norm_weight_tensor(),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
-                "x_out": x_out,
+                "lm_head_weight": self._static_lm_head_weight_tensor(),
+                "hidden_out": hidden_out,
+                "logits": logits,
+                "num_tokens_per_owner": inputs.num_tokens_per_owner,
+                "logit_row_indices": inputs.logit_row_indices,
+                "num_logit_rows": inputs.num_logit_rows,
             }
         )
         values = self._mark_resident_args(values, _DECODE_RESIDENT_POLICY)
@@ -2695,7 +2771,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "cmp_block_table",
             "idx_block_table",
             "input_ids",
-            "x_out",
+            "hidden_out",
+            "logits",
         )
         tensor_names = [
             name
@@ -2757,7 +2834,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "position_ids",
             "kv_seq_lens",
             "input_ids",
-            "x_out",
+            "hidden_out",
+            "logits",
         )
         tensor_names = [
             name
@@ -2958,6 +3036,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         torch.long,
                         name="decode_csa_inner_state_slot_mapping",
                     ),
+                    "num_tokens_per_owner": self._shared_empty(
+                        (ranks,),
+                        torch.int32,
+                        name="decode_num_tokens_per_owner",
+                    ),
+                    "logit_row_indices": self._shared_empty(
+                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                        torch.int32,
+                        name="decode_logit_row_indices",
+                    ),
+                    "num_logit_rows": self._shared_empty(
+                        (ranks,),
+                        torch.int32,
+                        name="decode_num_logit_rows",
+                    ),
                 },
             )
             self._decode_buffers = buffers
@@ -3100,6 +3193,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "csa_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_state_slot_mapping"),
             "csa_inner_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_inner_state_slot_mapping"),
             "input_ids": shared((ranks, seq), torch.long, "prefill_fwd_input_ids"),
+            "num_tokens_per_owner": shared(
+                (ranks,), torch.int32, "prefill_fwd_num_tokens_per_owner"
+            ),
+            "logit_row_indices": shared(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                torch.int32,
+                "prefill_fwd_logit_row_indices",
+            ),
+            "num_logit_rows": shared(
+                (ranks,), torch.int32, "prefill_fwd_num_logit_rows"
+            ),
         }
         buffers = _DeepSeekV4PrefillFwdSharedBuffers(
             x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.float32, "prefill_fwd_x_hc"),
@@ -3155,6 +3259,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
             "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
             "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
+            "num_tokens_per_owner": inputs.num_tokens_per_owner,
+            "logit_row_indices": inputs.logit_row_indices,
+            "num_logit_rows": inputs.num_logit_rows,
         }
         for name, tensor in shared_metadata.items():
             self._copy_shared(buffers.tensors[name], tensor, name=f"prefill_fwd_{name}")
@@ -3216,6 +3323,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _require_decode_output_buffer(self, hidden_size: int) -> torch.Tensor:
         return self._ensure_decode_buffers(int(hidden_size)).x_out
 
+    def _require_decode_logits_buffer(self, vocab_size: int) -> torch.Tensor:
+        """Return shared device LM-head logits for every decode owner rank."""
+        layout = self._compiled.layout
+        logits_shape = (layout.ranks, layout.decode_tokens, int(vocab_size))
+        if self._decode_logits_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("decode_logits")
+            self._decode_logits_buffer = self._shared_empty(logits_shape, torch.float32, name="decode_logits")
+        return self._decode_logits_buffer
+
     def _require_prefill_output_buffer(self, hidden_size: int) -> torch.Tensor:
         """Return the shared ``[ranks, prefill_seq, hidden]`` prefill hidden output."""
         layout = self._compiled.layout
@@ -3238,11 +3354,23 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         return self._prefill_pre_hc_output_buffer
 
+    def _require_prefill_logits_buffer(self, vocab_size: int) -> torch.Tensor:
+        """Return shared owner-major selected-row logits for packed prefill."""
+        layout = self._compiled.layout
+        logits_shape = (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, int(vocab_size))
+        if self._prefill_logits_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("prefill_logits")
+            self._prefill_logits_buffer = self._shared_empty(
+                logits_shape,
+                torch.float32,
+                name="prefill_logits",
+            )
+        return self._prefill_logits_buffer
+
     def _static_final_norm_weight_tensor(self) -> torch.Tensor:
         """Return the worker-resident per-rank final RMSNorm weight ``[ranks, D]``.
 
-        Reuses the same ``final_norm_weight`` already loaded for the host-side
-        ``_final_norm`` collapse, rank-replicated and cast to bf16 for the kernel.
+        Uses the model's final RMSNorm weight, rank-replicated and cast to bf16.
         """
         if self._static_final_norm_weight is None:
             global_weights = self.load_packed_global_weights()
@@ -3250,6 +3378,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
             final_norm_w = global_weights.final_norm_weight.to(torch.bfloat16).contiguous().cpu()
             self._static_final_norm_weight = self._static_device_tensor(self._rank_stack(final_norm_w))
         return self._static_final_norm_weight
+
+    def _static_lm_head_weight_tensor(self) -> torch.Tensor:
+        """Return the worker-visible TP-sharded device LM-head weight."""
+        if self._static_lm_head_weight is None:
+            global_weights = self.load_packed_global_weights()
+            self._ensure_shared_host_allocation_before_worker("lm_head_weight")
+            self._static_lm_head_weight = self._static_device_tensor(
+                global_weights.lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+            )
+        return self._static_lm_head_weight
 
     def _static_freqs_cos_tensor(self) -> torch.Tensor:
         if self._static_freqs_cos is None:
