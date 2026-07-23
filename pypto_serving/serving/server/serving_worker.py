@@ -26,6 +26,7 @@ from pypto_serving.config.types import (
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.server.ipc import (
+    PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
@@ -67,6 +68,11 @@ class WorkerProcess:
         # Request cache: prompt tokens + sampling params registered once per request.
         # Populated by StepCommand.new_requests; entries removed when the request finishes.
         self._req_cache: dict[str, NewRequestData] = {}
+        # Last-sampled tokens per request (most-recent-last, up to 2 kept for MTP
+        # prev-token context). Under async scheduling the engine sends
+        # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
+        # substitutes from here. Entries cleared when a request is released.
+        self._last_tokens: dict[str, list[int]] = {}
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -191,6 +197,7 @@ class WorkerProcess:
                     release_finished(cmd.finished_request_ids)
                 for req_id in cmd.finished_request_ids:
                     self._req_cache.pop(req_id, None)
+                    self._last_tokens.pop(req_id, None)
 
             # 2. Register new and restarted requests into the cache.
             for nr in cmd.new_requests:
@@ -201,7 +208,9 @@ class WorkerProcess:
             self.output_queue.put(encode_result(result))
         except Exception as e:
             logger.error(f"Worker step failed: {e}", exc_info=True)
-            self.output_queue.put(encode_result(StepResult(new_tokens={}, error=str(e))))
+            self.output_queue.put(
+                encode_result(StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id))
+            )
 
     def _execute_step(self, cmd: StepCommand) -> StepResult:
         """Execute one step using the lightweight IPC protocol."""
@@ -229,7 +238,21 @@ class WorkerProcess:
                 if cmd.decode_requests:
                     self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
 
-        return StepResult(new_tokens=new_tokens)
+        # Retain the tokens just sampled so a following pipelined decode step can
+        # resolve its PLACEHOLDER_TOKEN input from the worker cache.
+        for req_id, tokens in new_tokens.items():
+            if tokens:
+                self._record_last_tokens(req_id, tokens)
+
+        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id)
+
+    def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
+        """Append newly sampled tokens, keeping at most the last 2 (MTP prev ctx)."""
+        recent = self._last_tokens.get(request_id, [])
+        recent.extend(int(t) for t in tokens)
+        if len(recent) > 2:
+            recent = recent[-2:]
+        self._last_tokens[request_id] = recent
 
     @staticmethod
     def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
@@ -339,6 +362,35 @@ class WorkerProcess:
                     )
                     new_tokens[pr.request_id] = [token_id]
 
+    def _resolve_decode_token(self, dr: DecodeRequest) -> int:
+        """Return the decode input token, substituting from cache on placeholder.
+
+        Sync scheduling sends the real ``last_token``. Async scheduling may send
+        ``PLACEHOLDER_TOKEN`` when the step was built before the prior token was
+        sampled; the worker then uses the most recent token it sampled.
+        """
+        if dr.last_token != PLACEHOLDER_TOKEN:
+            return dr.last_token
+        recent = self._last_tokens.get(dr.request_id)
+        if not recent:
+            raise RuntimeError(
+                f"No cached token to resolve placeholder decode input for {dr.request_id!r}"
+            )
+        return recent[-1]
+
+    def _resolve_prev_token(self, dr: DecodeRequest) -> int:
+        """Return the MTP prev-context token, substituting from cache on placeholder."""
+        if dr.prev_token != PLACEHOLDER_TOKEN:
+            return dr.prev_token
+        recent = self._last_tokens.get(dr.request_id)
+        if not recent:
+            raise RuntimeError(
+                f"No cached token to resolve placeholder prev token for {dr.request_id!r}"
+            )
+        # Token at absolute position seq_len-2: the second-most-recent sampled
+        # token when available, else the only one we have.
+        return recent[-2] if len(recent) >= 2 else recent[-1]
+
     def _batch_decode(
         self,
         scheduled: list[DecodeRequest],
@@ -357,8 +409,8 @@ class WorkerProcess:
                 and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
             )
 
-            decode_tokens = [dr.last_token for dr in scheduled]
-            prev_tokens = [dr.prev_token for dr in scheduled]
+            decode_tokens = [self._resolve_decode_token(dr) for dr in scheduled]
+            prev_tokens = [self._resolve_prev_token(dr) for dr in scheduled]
             block_ids_list = [dr.block_ids for dr in scheduled]
             seq_lens = [dr.seq_len for dr in scheduled]
 

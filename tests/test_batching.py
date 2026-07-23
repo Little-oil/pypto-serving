@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import asyncio
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerOutput,
 )
 from pypto_serving.serving.server.ipc import (
+    PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
@@ -109,11 +111,169 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
+    """A RUNNING request that finished prefill and has one decoded token, i.e.
+    ready to schedule its next decode step (num_new_tokens_needed == 1)."""
+    return Request(
+        request_id=req_id,
+        prompt_token_ids=list(prompt),
+        max_new_tokens=8,
+        num_computed_tokens=len(prompt),
+        output_token_ids=[first_output],
+        status=RequestStatus.RUNNING,
+    )
+
+
+def test_async_advance_after_schedule_reserves_placeholder_and_advances():
+    """Optimistic advance: after schedule()+advance_after_schedule(), the step is
+    'in flight' — a placeholder stands in for the unsampled token and
+    num_computed is advanced, so scheduling can continue before the token
+    returns without double-counting the same slot."""
+    manager = KvCacheManager(num_blocks=8, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(enable_prefix_cache=False, async_scheduling=True), manager
+    )
+    request = _running_decode_request()  # computed=2, output=[99] -> num_new_needed=1
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    out1 = scheduler.schedule()
+    assert len(out1.scheduled_requests) == 1  # decode scheduled
+    scheduler.advance_after_schedule(out1)
+
+    # One token in flight: placeholder reserved, computed advanced to cover the
+    # token this step covers (prompt 2 + output 1 -> computed 3).
+    assert request.num_output_placeholders == 1
+    assert request.num_computed_tokens == 3
+    # num_tokens = 2 prompt + 1 output + 1 placeholder = 4, so exactly one more
+    # slot is schedulable (the NEXT token). The placeholder ensures we advanced
+    # rather than re-issuing the same slot; engine-side depth bounds concurrency.
+    assert request.num_new_tokens_needed == 1
+
+
+def test_async_reconciliation_matches_sync_end_state():
+    """Driving N decode steps through the async path (schedule -> advance ->
+    update_from_output) yields the same request state as the sync path."""
+    def run(async_mode: bool):
+        manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=False)
+        scheduler = Scheduler(
+            SchedulerConfig(enable_prefix_cache=False, async_scheduling=async_mode),
+            manager,
+        )
+        request = _running_decode_request()
+        scheduler.running.append(request)
+        scheduler.requests[request.request_id] = request
+
+        collected = []
+        for step_token in (10, 11, 12):
+            out = scheduler.schedule()
+            if not out.scheduled_requests:
+                break
+            if async_mode:
+                scheduler.advance_after_schedule(out)
+            outs = scheduler.update_from_output(out, {request.request_id: [step_token]})
+            collected.extend(o.new_token_id for o in outs if o.new_token_id is not None)
+        return request.output_token_ids, request.num_computed_tokens, collected
+
+    sync_out, sync_comp, sync_tokens = run(async_mode=False)
+    async_out, async_comp, async_tokens = run(async_mode=True)
+
+    assert async_out == sync_out == [99, 10, 11, 12]
+    assert async_comp == sync_comp
+    assert async_tokens == sync_tokens == [10, 11, 12]
+
+
+def test_async_placeholder_released_and_no_leak_after_reconcile():
+    """After the real token is applied, the placeholder is fully released so the
+    request can be scheduled again for the next token."""
+    manager = KvCacheManager(num_blocks=8, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(enable_prefix_cache=False, async_scheduling=True), manager
+    )
+    request = _running_decode_request()
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    out = scheduler.schedule()
+    scheduler.advance_after_schedule(out)
+    assert request.num_output_placeholders == 1
+
+    scheduler.update_from_output(out, {request.request_id: [42]})
+    assert request.num_output_placeholders == 0
+    assert request.output_token_ids == [99, 42]
+    # Ready to schedule the next decode.
+    assert request.num_new_tokens_needed == 1
+
+
+def test_async_discards_stale_result_for_preempted_request():
+    """A request preempted while its step is in flight must NOT have that step's
+    result applied: preemption reset its computed/placeholder state, so appending
+    the stale token would corrupt bookkeeping and emit a spurious output."""
+    manager = KvCacheManager(num_blocks=8, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(enable_prefix_cache=False, async_scheduling=True), manager
+    )
+    request = _running_decode_request()
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    out = scheduler.schedule()
+    scheduler.advance_after_schedule(out)      # step N in flight
+
+    # Preemption (as _preempt_lowest_priority does) resets state and marks the
+    # request PREEMPTED before step N's result returns.
+    request.status = RequestStatus.PREEMPTED
+    request.num_computed_tokens = 0
+    request.num_output_placeholders = 0
+
+    outputs = scheduler.update_from_output(out, {request.request_id: [42]})
+
+    # Stale token discarded: no output emitted, state untouched by reconcile.
+    assert outputs == []
+    assert request.output_token_ids == [99]          # unchanged (42 not appended)
+    assert request.num_computed_tokens == 0           # reset preserved
+    assert request.num_output_placeholders == 0
+
+
+def test_async_defers_prefix_cache_publish_until_confirmed():
+    """Prefix-cache blocks must be published only after the worker confirms the
+    step, not optimistically at dispatch — otherwise a failed step leaves hashes
+    for uncomputed KV that a later same-prompt request could hit."""
+    manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=True)
+    scheduler = Scheduler(
+        SchedulerConfig(enable_prefix_cache=True, async_scheduling=True), manager
+    )
+    # Fresh prompt long enough to complete >=1 cache block on prefill.
+    prompt = [5, 6, 7, 8]
+    request = Request(
+        request_id="p",
+        prompt_token_ids=prompt,
+        max_new_tokens=4,
+        status=RequestStatus.WAITING,
+    )
+    scheduler.add_request(request)
+
+    out = scheduler.schedule()
+    assert out.scheduled_requests and out.scheduled_requests[0].is_prefill
+    scheduler.advance_after_schedule(out)
+
+    # advance_after_schedule advanced computed tokens but must NOT have published
+    # any prefix-cache blocks yet.
+    assert scheduler.kv_cache_manager.get_computed_blocks(prompt) == []
+    assert request.num_blocks_cached == 0
+
+    # After the worker confirms, blocks are published.
+    scheduler.update_from_output(out, {request.request_id: [42]})
+    assert request.num_blocks_cached >= 1
+
+
 def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
+    core._batch_queue = deque()
+    core._discard_result_step_ids = set()
     core._request_contexts = {
         "req-a": SimpleNamespace(queue=asyncio.Queue()),
         "req-b": SimpleNamespace(queue=asyncio.Queue()),
@@ -125,7 +285,9 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
         ]
     )
 
-    core._handle_step_error(scheduler_output)
+    # Error path: the failed step's result was already consumed (result_pending
+    # False); no in-flight batches, so nothing to drain.
+    core._handle_step_error(7, scheduler_output, result_pending=False)
 
     assert aborted == ["req-a", "req-b"]
     assert core._pending_free_ids == ["req-a", "req-b"]
@@ -244,6 +406,7 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
     worker._req_cache = {
         "req": NewRequestData("req", [0], 0.0, 1.0, None),
     }
+    worker._last_tokens = {}
     worker.output_queue = SimpleNamespace(put=results.append)
     worker._execute_step = lambda _cmd: StepResult(new_tokens={})
     replacement = NewRequestData("req", [1, 2], 0.0, 1.0, None)
@@ -800,6 +963,48 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
     assert executor.decode_hidden_seen[0] is None
 
 
+def test_worker_resolves_placeholder_decode_token_from_cache():
+    """Under async scheduling the engine sends PLACEHOLDER_TOKEN; the worker must
+    substitute the token(s) it last sampled for that request."""
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._last_tokens = {}
+
+    # Record two sampled tokens (simulating two prior decode steps).
+    worker._record_last_tokens("r", [11])
+    worker._record_last_tokens("r", [22])
+    assert worker._last_tokens["r"] == [11, 22]
+
+    placeholder = DecodeRequest(
+        request_id="r",
+        last_token=PLACEHOLDER_TOKEN,
+        prev_token=PLACEHOLDER_TOKEN,
+        seq_len=5,
+        block_ids=[0],
+    )
+    # last -> most recent (22); prev -> second-most-recent (11).
+    assert worker._resolve_decode_token(placeholder) == 22
+    assert worker._resolve_prev_token(placeholder) == 11
+
+    # A real (non-placeholder) token is passed through untouched.
+    explicit = DecodeRequest(
+        request_id="r", last_token=99, prev_token=88, seq_len=5, block_ids=[0]
+    )
+    assert worker._resolve_decode_token(explicit) == 99
+    assert worker._resolve_prev_token(explicit) == 88
+
+    # Cache keeps only the last 2 tokens (MTP prev context bound).
+    worker._record_last_tokens("r", [33])
+    assert worker._last_tokens["r"] == [22, 33]
+
+    # Missing cache entry on placeholder is a hard error (never silently wrong).
+    orphan = DecodeRequest(
+        request_id="missing", last_token=PLACEHOLDER_TOKEN, prev_token=PLACEHOLDER_TOKEN,
+        seq_len=1, block_ids=[0],
+    )
+    with pytest.raises(RuntimeError):
+        worker._resolve_decode_token(orphan)
+
+
 def test_incremental_detok_matches_full_decode_and_hides_partial_chars():
     """Incremental detok must equal a full decode and never stream a partial char.
 
@@ -1067,6 +1272,10 @@ def test_flush_pending_frees_sends_cleanup_only_step_command():
     core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
     core._worker_known_req_ids = {"aborted"}
     core._pending_free_ids = ["aborted"]
+    core._batch_queue = deque()
+    core._discard_result_step_ids = set()
+    core._step_counter = 0
+    core._step_timeout = 300.0
 
     sent: list[bytes] = []
     core._input_queue = SimpleNamespace(put=sent.append)
@@ -1099,6 +1308,138 @@ def test_flush_pending_frees_noop_when_nothing_pending():
     asyncio.run(core._flush_pending_frees())
 
     assert sent == []
+
+
+def _async_pipeline_core():
+    """A ReplicaEngineCore wired for async pipelining with a fake in-process
+    worker: input_queue records dispatched commands, output_queue synthesises a
+    deterministic StepResult (each scheduled decode samples last_token+1)."""
+    from pypto_serving.serving.server.ipc import (
+        StepResult,
+        decode_command,
+        encode_result,
+    )
+
+    manager = KvCacheManager(num_blocks=32, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(enable_prefix_cache=False, async_scheduling=True), manager
+    )
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = scheduler
+    core.kv_cache_manager = manager
+    core.tokenizer = _Tokenizer()
+    core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
+    core._async_scheduling = True
+    core._pending_free_ids = []
+    core._worker_known_req_ids = set()
+    core._request_contexts = {}
+    core._batch_queue = deque()
+    core._discard_result_step_ids = set()
+    core._step_timeout = 300.0
+    core._max_in_flight = 2
+    core._step_counter = 0
+
+    dispatched: list = []
+    results: "deque" = deque()
+
+    def _put_cmd(raw: bytes):
+        cmd = decode_command(raw)
+        dispatched.append(cmd)
+        # Synthesise the worker result: each decode/prefill-completing req yields
+        # one token = resolved_last_token + 1 (placeholder resolves from prior).
+        new_tokens: dict[str, list[int]] = {}
+        for dr in cmd.decode_requests:
+            # Mirror the worker's placeholder resolution against our fake cache.
+            last = _fake_worker_last.get(dr.request_id)
+            base = dr.last_token if dr.last_token != PLACEHOLDER_TOKEN else last
+            tok = base + 1
+            new_tokens[dr.request_id] = [tok]
+            _fake_worker_last[dr.request_id] = tok
+        for pr in cmd.prefill_requests:
+            # Prefill that completes the prompt samples one token.
+            tok = 1000
+            new_tokens[pr.request_id] = [tok]
+            _fake_worker_last[pr.request_id] = tok
+        results.append(encode_result(StepResult(new_tokens=new_tokens, step_id=cmd.step_id)))
+
+    def _get_result(timeout=None):
+        return results.popleft()
+
+    _fake_worker_last: dict[str, int] = {}
+    core._input_queue = SimpleNamespace(put=_put_cmd)
+    core._output_queue = SimpleNamespace(get=_get_result)
+    return core, dispatched
+
+
+def test_async_pipeline_dispatches_two_steps_before_applying_first():
+    """Depth-2: the loop dispatches step N+1 while step N is still in flight,
+    so two commands reach the worker before the first result is applied."""
+    core, dispatched = _async_pipeline_core()
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+
+    # Dispatch twice without applying — mirrors the loop filling the queue.
+    assert core._try_dispatch_step() is True
+    assert core._try_dispatch_step() is True
+    assert len(core._batch_queue) == 2       # two steps in flight
+    assert len(dispatched) == 2
+
+    # Second dispatched decode carries a PLACEHOLDER (its input token is the
+    # not-yet-applied result of the first in-flight step).
+    second = dispatched[1]
+    assert second.decode_requests[0].last_token == PLACEHOLDER_TOKEN
+
+    # Now drain both in order; output must be the greedy chain 51, 52.
+    asyncio.run(core._await_and_apply_oldest())
+    asyncio.run(core._await_and_apply_oldest())
+    assert req.output_token_ids == [50, 51, 52]
+    assert req.num_output_placeholders == 0
+
+
+def test_async_pipeline_drains_stale_result_after_error():
+    """If the oldest in-flight step errors while a later step is queued, the
+    later step's result (already in transit from the FIFO worker) must be drained
+    and NOT misapplied to a subsequent batch."""
+    from pypto_serving.serving.server.ipc import StepResult, decode_result, encode_result
+
+    core, _dispatched = _async_pipeline_core()
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+    core._request_contexts = {
+        "r": SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)
+    }
+
+    # Two steps dispatched: both commands reached the FIFO worker, so both
+    # results are already in transit.
+    assert core._try_dispatch_step() is True
+    assert core._try_dispatch_step() is True
+    assert len(core._batch_queue) == 2
+    first_step_id, second_step_id = core._batch_queue[0][0], core._batch_queue[1][0]
+
+    # Drive the output queue by hand: step N errors, step N+1's (now stale)
+    # result sits behind it, then a fresh live step (id=99) lands.
+    outq = deque([
+        encode_result(StepResult(new_tokens={}, error="boom", step_id=first_step_id)),
+        encode_result(StepResult(new_tokens={"r": [51]}, step_id=second_step_id)),
+        encode_result(StepResult(new_tokens={"r": [77]}, step_id=99)),
+    ])
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: outq.popleft())
+
+    # Apply the oldest: it errors -> both in-flight batches discarded, the
+    # second step's id recorded for draining, request aborted with an error.
+    assert asyncio.run(core._await_and_apply_oldest()) is False
+    assert not core._batch_queue
+    assert second_step_id in core._discard_result_step_ids
+    tok = core._request_contexts["r"].queue.get_nowait()
+    assert tok.finished is True and tok.finish_reason == "error"
+
+    # Next live fetch must SKIP the stale second-step result and return step 99,
+    # leaving the discard set empty (no stale result misapplied).
+    got = decode_result(asyncio.run(core._get_live_result()))
+    assert got.step_id == 99
+    assert core._discard_result_step_ids == set()
 
 
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):

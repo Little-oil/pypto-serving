@@ -145,6 +145,9 @@ def harness():
         long_prefill_token_threshold=default_threshold,
         enable_prefix_cache=True,
         enable_chunk_prefill=True,
+        # Exercise the pipelined (depth-2) scheduler explicitly: greedy output
+        # must stay identical to the sync baseline (EXPECTED_TOKEN_IDS).
+        async_scheduling=True,
     )
 
     engine = AsyncLLMEngine(
@@ -153,6 +156,8 @@ def harness():
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
     )
+    # Guard against a silent regression to synchronous depth-1 execution.
+    assert engine._cores[0]._async_scheduling is True
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

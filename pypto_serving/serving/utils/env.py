@@ -1,0 +1,37 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Environment-driven serving knobs (worker init/step timeouts)."""
+
+from __future__ import annotations
+
+import os
+
+_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
+_DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
+
+
+def _positive_env_timeout_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number of seconds") from exc
+    if timeout <= 0:
+        raise ValueError(f"{name} must be a positive number of seconds")
+    return timeout
+
+
+def worker_init_timeout_seconds() -> float:
+    return _positive_env_timeout_seconds("PYPTO_WORKER_INIT_TIMEOUT", _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS)
+
+
+def worker_step_timeout_seconds() -> float:
+    return _positive_env_timeout_seconds("SERVING_WORKER_STEP_TIMEOUT", _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS)

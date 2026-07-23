@@ -49,6 +49,9 @@ class SchedulerConfig:
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
+    # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
+    # token returns, advancing request state optimistically via placeholders.
+    async_scheduling: bool = False
 
     def __post_init__(self) -> None:
         if self.num_speculative_tokens < 0:
@@ -75,6 +78,10 @@ class Request:
     cache_partition: int | None = None
     block_hashes: list[int] = field(default_factory=list)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
+    # Async scheduling: tokens scheduled optimistically but not yet sampled.
+    # Stands in for output tokens still in flight so the next schedule() advances
+    # correctly; decremented as real tokens are applied in update_from_output.
+    num_output_placeholders: int = 0
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -82,7 +89,10 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        return self.num_prompt_tokens + len(self.output_token_ids)
+        # Placeholders count as (not-yet-materialised) output tokens so that
+        # num_new_tokens_needed and is_prefill stay consistent when the next step
+        # is scheduled before the in-flight token has been appended.
+        return self.num_prompt_tokens + len(self.output_token_ids) + self.num_output_placeholders
 
     @property
     def num_new_tokens_needed(self) -> int:
@@ -369,6 +379,43 @@ class Scheduler:
             return "decode"
         return None
 
+    def advance_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Optimistically advance state for a just-scheduled step (async mode).
+
+        Called right after ``schedule()`` and before the worker result returns,
+        so the next ``schedule()`` sees consistent state and does not re-schedule
+        the same slot. For each scheduled request:
+
+        - ``num_computed_tokens += num_new_tokens`` (the tokens this step covers),
+          mirroring what ``update_from_output`` does synchronously.
+        - decode requests reserve one ``num_output_placeholders`` for the token
+          this step will sample but that is not yet known. Prefill chunks that do
+          not complete the prompt sample nothing, so they add no placeholder;
+          the chunk that completes the prompt reserves one (its first generated
+          token), matching the sync path where that token is appended.
+
+        The reconciliation in ``update_from_output`` removes the placeholder and
+        applies the real token when the result arrives.
+        """
+        if not self.config.async_scheduling:
+            return
+        for scheduled in scheduler_output.scheduled_requests:
+            request = scheduled.request
+            completes_prompt = (
+                request.num_computed_tokens + scheduled.num_new_tokens
+                >= request.num_prompt_tokens
+            )
+            request.num_computed_tokens += scheduled.num_new_tokens
+            # Do NOT publish prefix-cache blocks here: this runs at dispatch,
+            # before the worker confirms the KV was computed. A failed/timed-out
+            # step would leave block hashes published for uncomputed KV, which a
+            # later same-prompt request could hit via get_computed_blocks().
+            # Publication is deferred to _reconcile_async_output (confirmed result).
+            # A step samples a token iff it is a decode step or the prefill chunk
+            # that completes the prompt.
+            if not scheduled.is_prefill or completes_prompt:
+                request.num_output_placeholders += 1
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -379,6 +426,20 @@ class Scheduler:
 
         for scheduled in scheduler_output.scheduled_requests:
             request = scheduled.request
+            # Async pipelining: a request that finished (EOS/length/stop), was
+            # aborted, or was preempted at step N may still have step N+1 in
+            # flight. Discard that stale result — the request has left `running`
+            # (blocks freed) or had its computed-token/placeholder state reset,
+            # so applying tokens/advancing state would corrupt bookkeeping.
+            #
+            # NOTE: the PREEMPTED check is correct while max_in_flight == 2 —
+            # after preempting a request with an in-flight step, the batch queue
+            # is full, so that step is drained (and discarded here) before the
+            # next schedule() can re-admit the request to RUNNING. If pipeline
+            # depth grows past 2, switch to a per-request scheduling epoch to
+            # also catch the preempt -> re-RUNNING case.
+            if request.status.is_finished or request.status is RequestStatus.PREEMPTED:
+                continue
             token_value = new_token_ids.get(request.request_id)
             token_ids = (
                 []
@@ -387,7 +448,12 @@ class Scheduler:
                 if isinstance(token_value, int)
                 else [int(token_id) for token_id in token_value]
             )
-            if scheduled.is_prefill:
+            if self.config.async_scheduling:
+                # num_computed_tokens and block caching were already advanced in
+                # advance_after_schedule(); here we only apply the real sampled
+                # token(s) and release the matching placeholder(s).
+                self._reconcile_async_output(request, scheduled, token_ids, outputs)
+            elif scheduled.is_prefill:
                 request.num_computed_tokens += scheduled.num_new_tokens
                 self._cache_completed_blocks(request)
                 if request.num_computed_tokens < request.num_prompt_tokens:
@@ -435,6 +501,52 @@ class Scheduler:
             self.running = [r for r in self.running if r.request_id != req_id]
 
         return outputs
+
+    def _reconcile_async_output(
+        self,
+        request: "Request",
+        scheduled: "ScheduledRequest",
+        token_ids: list[int],
+        outputs: list["RequestOutput"],
+    ) -> None:
+        """Apply the real sampled token(s) for an optimistically-scheduled step.
+
+        ``advance_after_schedule`` already advanced ``num_computed_tokens`` and
+        reserved ``num_output_placeholders`` for the token(s) this step would
+        sample. Here — now that the worker has CONFIRMED the step — we:
+
+        - release the placeholder(s) reserved for this step,
+        - publish the now-computed prefix-cache blocks (deferred from dispatch so
+          a failed/timed-out step never leaves hashes for uncomputed KV), and
+        - append the real token(s) that came back, emitting RequestOutputs.
+
+        A prefill chunk that did not complete the prompt sampled nothing (no
+        placeholder was reserved and ``token_ids`` is empty), so it emits nothing
+        but still publishes its confirmed blocks.
+
+        For the single-token (Qwen) path a step yields exactly one token; the
+        release count therefore matches. Variable multi-token (MTP) reconciliation
+        — where fewer tokens may be accepted than optimistically reserved — is a
+        follow-up (async is gated off for MTP executors for now).
+        """
+        # This step reserved a placeholder iff it sampled a token: a decode step,
+        # or a prefill chunk that completed the prompt. num_computed_tokens was
+        # already advanced, so "completed the prompt" == num_computed >= prompt.
+        sampled_this_step = (
+            not scheduled.is_prefill
+            or request.num_computed_tokens >= request.num_prompt_tokens
+        )
+        if sampled_this_step and request.num_output_placeholders > 0:
+            request.num_output_placeholders -= 1
+
+        # Publish confirmed blocks now (worker succeeded), not at dispatch.
+        self._cache_completed_blocks(request)
+
+        for token_id in token_ids:
+            request.output_token_ids.append(token_id)
+            outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+            if self._check_finish(request) is not None:
+                break
 
     def _check_finish(self, request: Request) -> RequestStatus | None:
         if not request.output_token_ids:
@@ -529,6 +641,10 @@ class Scheduler:
         victim.allocated_group_block_ids = {}
         victim.cache_partition = None
         victim.num_blocks_cached = 0
+        # Async: drop any optimistic placeholder so the re-queued request restarts
+        # from a clean prefill state (its in-flight step's result, if any, is
+        # discarded engine-side since the request left `running`).
+        victim.num_output_placeholders = 0
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}

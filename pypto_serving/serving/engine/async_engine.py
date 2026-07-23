@@ -12,9 +12,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import queue
 import time
+from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Callable
@@ -22,6 +22,10 @@ from typing import Callable
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.utils.env import (
+    worker_init_timeout_seconds,
+    worker_step_timeout_seconds,
+)
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.sched.scheduler import (
     Request,
@@ -31,6 +35,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerOutput,
 )
 from pypto_serving.serving.server.ipc import (
+    PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
@@ -43,33 +48,6 @@ from pypto_serving.serving.server.serving_worker import spawn_worker
 from pypto_serving.tools.profile import profile_instant, profile_span
 
 logger = logging.getLogger(__name__)
-_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
-_DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 300.0
-_DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
-
-
-def _positive_env_timeout_seconds(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        timeout = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive number of seconds") from exc
-    if timeout <= 0:
-        raise ValueError(f"{name} must be a positive number of seconds")
-    return timeout
-
-
-def _worker_init_timeout_seconds() -> float:
-    return _positive_env_timeout_seconds("PYPTO_WORKER_INIT_TIMEOUT", _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS)
-
-
-def _worker_step_timeout_seconds(executor_cls: str = "") -> float:
-    default = _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS
-    if executor_cls == "PyptoDeepSeekV4Executor":
-        default = _DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS
-    return _positive_env_timeout_seconds("SERVING_WORKER_STEP_TIMEOUT", default)
 
 
 @dataclass
@@ -99,6 +77,17 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    # Async (pipelined) scheduling. None = auto: on for single-token decoders,
+    # off for MTP executors (DeepSeek V4) which return a variable token count per
+    # step (not yet supported by the optimistic-advance path).
+    async_scheduling: bool | None = None
+
+    def resolve_async_scheduling(self) -> bool:
+        """Resolve the async-scheduling flag, applying the MTP auto-gate."""
+        if self.async_scheduling is not None:
+            return self.async_scheduling
+        # Auto: enable for single-token decoders; MTP (DeepSeek V4) stays sync.
+        return self.executor_cls != "PyptoDeepSeekV4Executor"
 
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
@@ -183,6 +172,7 @@ class ReplicaEngineCore:
             max_batch_size=runtime.max_batch_size,
         )
 
+        self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
@@ -191,6 +181,7 @@ class ReplicaEngineCore:
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
+            async_scheduling=self._async_scheduling,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
@@ -206,6 +197,24 @@ class ReplicaEngineCore:
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
+        # Async (pipelined) scheduling: in-flight steps dispatched to the worker
+        # but whose results have not yet been applied. Depth 2 keeps one step
+        # executing on the device while the next is scheduled. Each entry is the
+        # SchedulerOutput awaiting its StepResult. Sync mode leaves this empty.
+        self._batch_queue: deque[tuple[int, SchedulerOutput]] = deque()
+        self._max_in_flight = 2 if self._async_scheduling else 1
+        self._step_counter = 0
+        # step_ids of dispatched steps whose worker StepResult has NOT yet been
+        # consumed off _output_queue but whose batch was discarded (error/timeout
+        # dropped the pipeline). The worker is FIFO and emits exactly one result
+        # per command, so these results are still in transit and must be drained
+        # and ignored before the next live result is applied — otherwise a stale
+        # result would be misapplied to a later batch.
+        self._discard_result_step_ids: set[int] = set()
+        # Worker timeouts are env-driven and process-level; resolve once at
+        # construction rather than re-reading os.environ every pipelined step.
+        self._init_timeout = worker_init_timeout_seconds()
+        self._step_timeout = worker_step_timeout_seconds()
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -217,11 +226,10 @@ class ReplicaEngineCore:
 
             logger.info("Waiting for worker to initialize model...")
             try:
-                init_timeout = _worker_init_timeout_seconds()
-                ready = await asyncio.to_thread(ready_event.wait, timeout=init_timeout)
+                ready = await asyncio.to_thread(ready_event.wait, timeout=self._init_timeout)
                 if not ready:
                     raise RuntimeError(
-                        f"Worker failed to initialize within {init_timeout:g}s timeout; "
+                        f"Worker failed to initialize within {self._init_timeout:g}s timeout; "
                         "set PYPTO_WORKER_INIT_TIMEOUT to allow more time for large checkpoints"
                     )
             except BaseException:
@@ -391,79 +399,159 @@ class ReplicaEngineCore:
             self._pending_free_ids.append(request_id)
 
     async def _engine_loop(self) -> None:
-        """Main loop: schedule -> send to worker -> receive results -> dispatch."""
-        logger.info("Engine loop started")
+        """Pipelined schedule/execute loop.
+
+        Depth is 1 in sync mode (dispatch a step, immediately await its result)
+        and 2 in async mode (dispatch step N+1 while step N executes on the
+        device, hiding host scheduling/IPC latency behind worker execution).
+
+        Each iteration:
+          1. If the in-flight queue has room and there is schedulable work,
+             schedule + dispatch a new step (non-blocking). In async mode this
+             also advances scheduler state optimistically so the next schedule
+             sees consistent counts.
+          2. Otherwise (queue full, or nothing new to schedule), block on the
+             OLDEST in-flight step's result and apply it. The worker is FIFO, so
+             results return in dispatch order.
+        """
+        logger.info("Engine loop started (async_scheduling=%s)", self._async_scheduling)
         while self._running:
-            if not self.scheduler.has_work():
-                # No schedulable work, but a just-aborted request may still be
-                # pinned on the worker. Flush pending frees now instead of
-                # waiting for unrelated future work to carry them.
+            dispatched = False
+            if len(self._batch_queue) < self._max_in_flight and self.scheduler.has_work():
+                dispatched = self._try_dispatch_step()
+
+            if self._batch_queue:
+                # Block on the oldest in-flight step when the queue is full, or
+                # when we could not dispatch anything new this iteration.
+                if len(self._batch_queue) >= self._max_in_flight or not dispatched:
+                    applied = await self._await_and_apply_oldest()
+                    if not applied:
+                        continue
+            elif not dispatched:
+                # Nothing in flight and nothing to dispatch: flush any pending
+                # frees (e.g. a just-aborted request) and idle briefly.
                 await self._flush_pending_frees()
                 await asyncio.sleep(self.config.engine_loop_interval)
-                continue
-
-            with profile_span("scheduler.schedule", cat="scheduler"):
-                scheduler_output = self.scheduler.schedule()
-            for request in scheduler_output.preempted_requests:
-                self._schedule_worker_free(request.request_id)
-            if scheduler_output.is_empty:
-                await self._flush_pending_frees()
-                await asyncio.sleep(self.config.engine_loop_interval)
-                continue
-
-            finished_ids = self._pending_free_ids.copy()
-            self._pending_free_ids.clear()
-            with profile_span(
-                "scheduler.queue_worker_step",
-                cat="scheduler",
-                args={"scheduled": len(scheduler_output.scheduled_requests)},
-            ):
-                step_cmd = self._build_step_command(scheduler_output, finished_ids)
-                self._input_queue.put(encode_command(step_cmd))
-
-            try:
-                with profile_span("scheduler.wait_worker_output", cat="scheduler"):
-                    step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
-                    raw_output = await asyncio.to_thread(
-                        self._output_queue.get, timeout=step_timeout
-                    )
-            except queue.Empty:
-                logger.error(f"Worker response timed out ({step_timeout:g}s)")
-                self._handle_step_error(scheduler_output)
-                continue
-
-            step_result = decode_result(raw_output)
-            error = step_result.error
-            # Unwrap list[int] values back to int | list[int] for update_from_output.
-            new_tokens: dict[str, int | list[int]] = {
-                req_id: (tokens[0] if len(tokens) == 1 else tokens)
-                for req_id, tokens in step_result.new_tokens.items()
-            }
-
-            if error:
-                logger.error(f"Worker returned error: {error}")
-                self._handle_step_error(scheduler_output)
-                continue
-
-            with profile_span(
-                "scheduler.process_step_output",
-                cat="scheduler",
-                args={"new_tokens": len(new_tokens)},
-            ):
-                self._process_step_output(scheduler_output, new_tokens)
 
         logger.info("Engine loop stopped")
+
+    def _try_dispatch_step(self) -> bool:
+        """Schedule one step and dispatch it to the worker without blocking.
+
+        Returns True if a non-empty step was dispatched (and enqueued as
+        in-flight), False if the scheduler produced nothing.
+        """
+        with profile_span("scheduler.schedule", cat="scheduler"):
+            scheduler_output = self.scheduler.schedule()
+        # Preempted requests must release their worker-side cache / device slots;
+        # queue their ids so the next StepCommand frees them.
+        for request in scheduler_output.preempted_requests:
+            self._schedule_worker_free(request.request_id)
+        if scheduler_output.is_empty:
+            return False
+
+        finished_ids = self._pending_free_ids.copy()
+        self._pending_free_ids.clear()
+        self._step_counter += 1
+        with profile_span(
+            "scheduler.queue_worker_step",
+            cat="scheduler",
+            args={"scheduled": len(scheduler_output.scheduled_requests)},
+        ):
+            step_cmd = self._build_step_command(
+                scheduler_output, finished_ids, step_id=self._step_counter
+            )
+            self._input_queue.put(encode_command(step_cmd))
+
+        # Advance scheduler state optimistically so the NEXT schedule() (which may
+        # run before this step's tokens return) sees consistent counts. No-op in
+        # sync mode.
+        self.scheduler.advance_after_schedule(scheduler_output)
+
+        self._batch_queue.append((self._step_counter, scheduler_output))
+        return True
+
+    async def _await_and_apply_oldest(self) -> bool:
+        """Block on the oldest in-flight step's result and apply it.
+
+        Returns True on success, False if the step errored/timed out (the batch
+        and any dependent in-flight batches are dropped and the failure handled).
+        The worker is FIFO and emits exactly one result per command, so the
+        oldest dispatched step is the next result off the output queue.
+        """
+        step_id, scheduler_output = self._batch_queue.popleft()
+        try:
+            with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                raw_output = await self._get_live_result()
+        except queue.Empty:
+            logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
+            # Timeout: the failed step's own result is still in transit.
+            self._handle_step_error(step_id, scheduler_output, result_pending=True)
+            return False
+
+        step_result = decode_result(raw_output)
+        if step_result.step_id != step_id:
+            # Should never happen: the worker is FIFO and stale results are
+            # drained in _get_live_result. Treat as a fatal desync rather than
+            # silently misapplying tokens. This result is already consumed.
+            logger.error(
+                "Pipeline desync: expected step_id=%d, got %d; aborting batch",
+                step_id, step_result.step_id,
+            )
+            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            return False
+        if step_result.error:
+            logger.error(f"Worker returned error: {step_result.error}")
+            # This step's result was just consumed; only in-flight steps pend.
+            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            return False
+
+        # Unwrap list[int] values back to int | list[int] for update_from_output.
+        new_tokens: dict[str, int | list[int]] = {
+            req_id: (tokens[0] if len(tokens) == 1 else tokens)
+            for req_id, tokens in step_result.new_tokens.items()
+        }
+        with profile_span(
+            "scheduler.process_step_output",
+            cat="scheduler",
+            args={"new_tokens": len(new_tokens)},
+        ):
+            self._process_step_output(scheduler_output, new_tokens)
+        return True
+
+    async def _get_live_result(self) -> bytes:
+        """Return the next non-discarded StepResult, draining stale ones.
+
+        Results for batches discarded by a prior error/timeout are still in
+        transit (the worker had already been sent those commands). Drain and
+        drop them so a stale result is never applied to a live batch.
+        """
+        while True:
+            raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
+            if not self._discard_result_step_ids:
+                return raw
+            sid = decode_result(raw).step_id
+            if sid in self._discard_result_step_ids:
+                self._discard_result_step_ids.discard(sid)
+                logger.info("Drained stale result for discarded step_id=%d", sid)
+                continue
+            return raw
 
     def _build_step_command(
         self,
         scheduler_output: SchedulerOutput,
         finished_ids: list[str],
+        step_id: int = 0,
     ) -> StepCommand:
         """Build a lightweight StepCommand from the scheduler output.
 
         Prompt tokens for requests that the worker has not yet seen are shipped
         as ``NewRequestData`` entries exactly once; subsequent steps carry only
         per-request deltas (~1 KB total at batch 16).
+
+        In async mode a decode input token for step N+1 may not be sampled yet
+        (its step N result has not returned); such tokens are sent as
+        ``PLACEHOLDER_TOKEN`` and the worker substitutes from its own cache.
         """
         new_requests: list[NewRequestData] = []
         prefill_requests: list[PrefillRequest] = []
@@ -508,13 +596,22 @@ class ReplicaEngineCore:
             else:
                 output_ids = req.output_token_ids
                 prompt_ids = req.prompt_token_ids
-                last_token = output_ids[-1] if output_ids else prompt_ids[-1]
-                if len(output_ids) >= 2:
-                    prev_token = output_ids[-2]
-                elif output_ids and prompt_ids:
-                    prev_token = prompt_ids[-1]
+                # In async mode a request scheduled while a prior token is still
+                # in flight (num_output_placeholders > 0) has a stale
+                # output_token_ids tail. Send placeholders so the worker uses the
+                # token(s) it just sampled (FIFO guarantees they are cached by the
+                # time it runs this step).
+                if req.num_output_placeholders > 0:
+                    last_token = PLACEHOLDER_TOKEN
+                    prev_token = PLACEHOLDER_TOKEN
                 else:
-                    prev_token = last_token
+                    last_token = output_ids[-1] if output_ids else prompt_ids[-1]
+                    if len(output_ids) >= 2:
+                        prev_token = output_ids[-2]
+                    elif output_ids and prompt_ids:
+                        prev_token = prompt_ids[-1]
+                    else:
+                        prev_token = last_token
                 decode_requests.append(DecodeRequest(
                     request_id=req_id,
                     last_token=last_token,
@@ -533,6 +630,7 @@ class ReplicaEngineCore:
             prefill_requests=prefill_requests,
             decode_requests=decode_requests,
             finished_request_ids=finished_ids,
+            step_id=step_id,
         )
 
     async def _flush_pending_frees(self) -> None:
@@ -546,42 +644,82 @@ class ReplicaEngineCore:
         """
         if not self._pending_free_ids:
             return
+        # Only safe to run its own request/response round-trip when nothing else
+        # is in flight; the caller (engine loop) only invokes this with an empty
+        # batch queue. Assert to catch a future ordering regression.
+        assert not self._batch_queue, "flush must not run with in-flight steps"
 
         finished_ids = self._pending_free_ids.copy()
         self._pending_free_ids.clear()
         for req_id in finished_ids:
             self._worker_known_req_ids.discard(req_id)
 
+        self._step_counter += 1
         cleanup_cmd = StepCommand(
             new_requests=[],
             prefill_requests=[],
             decode_requests=[],
             finished_request_ids=finished_ids,
+            step_id=self._step_counter,
         )
         self._input_queue.put(encode_command(cleanup_cmd))
         try:
-            step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
-            raw_output = await asyncio.to_thread(
-                self._output_queue.get, timeout=step_timeout
-            )
+            # Drains any stale results from previously-discarded steps first, so
+            # the cleanup reply is not confused with a leftover in-transit result.
+            raw_output = await self._get_live_result()
         except queue.Empty:
-            logger.error(f"Worker cleanup-step timed out ({step_timeout:g}s)")
+            logger.error(f"Worker cleanup-step timed out ({self._step_timeout:g}s)")
             return
         step_result = decode_result(raw_output)
         if step_result.error:
             logger.error(f"Worker cleanup-step returned error: {step_result.error}")
 
-    def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
-        """On worker error, abort all requests in the failed batch."""
-        for sr in scheduler_output.scheduled_requests:
-            request_id = sr.request.request_id
-            ctx = self._request_contexts.get(request_id)
-            if ctx is not None:
-                ctx.queue.put_nowait(
-                    TokenOutput(finished=True, finish_reason="error")
-                )
-            self._schedule_worker_free(request_id)
-            self.scheduler.abort_request(request_id)
+    def _handle_step_error(
+        self,
+        failed_step_id: int,
+        scheduler_output: SchedulerOutput,
+        *,
+        result_pending: bool = True,
+    ) -> None:
+        """On worker error/timeout, abort all requests in the failed batch.
+
+        In async mode any still-in-flight steps were built on the failed step's
+        optimistic state and can no longer be reconciled, so their batches are
+        discarded too and their requests aborted.
+
+        The worker is FIFO and emits exactly one result per dispatched command,
+        so every discarded step still has a StepResult in transit. Their step_ids
+        are recorded in ``_discard_result_step_ids`` and drained (ignored) by
+        ``_get_live_result`` before any live result is applied, preventing a
+        stale result from being misapplied to a later batch. ``result_pending``
+        is False when the caller already consumed the failed step's own result
+        (worker returned an error / step_id desync); True on timeout, where the
+        failed step's result is still coming.
+        """
+        failed_batches = [scheduler_output]
+        if result_pending:
+            self._discard_result_step_ids.add(failed_step_id)
+        # Any remaining in-flight batches depend on the failed step; drop them.
+        # Their results are still in transit and must be drained.
+        while self._batch_queue:
+            sid, batch = self._batch_queue.popleft()
+            self._discard_result_step_ids.add(sid)
+            failed_batches.append(batch)
+
+        seen: set[str] = set()
+        for batch in failed_batches:
+            for sr in batch.scheduled_requests:
+                request_id = sr.request.request_id
+                if request_id in seen:
+                    continue
+                seen.add(request_id)
+                ctx = self._request_contexts.get(request_id)
+                if ctx is not None:
+                    ctx.queue.put_nowait(
+                        TokenOutput(finished=True, finish_reason="error")
+                    )
+                self._schedule_worker_free(request_id)
+                self.scheduler.abort_request(request_id)
 
     def _process_step_output(
         self,

@@ -28,6 +28,12 @@ from typing import Union
 
 import msgspec
 
+# Sentinel for a decode input token the worker must resolve from its own cache.
+# Under async (pipelined) scheduling the engine builds step N+1 before step N's
+# sampled token is known, so it sends this placeholder and the worker substitutes
+# the token it last sampled for that request.
+PLACEHOLDER_TOKEN: int = -1
+
 
 # ---------------------------------------------------------------------------
 # Request-scoped structs (engine → worker)
@@ -63,14 +69,21 @@ class PrefillRequest(msgspec.Struct):
 
 
 class DecodeRequest(msgspec.Struct):
-    """Per-request payload for a decode step — delta only, no prompt tokens."""
+    """Per-request payload for a decode step — delta only, no prompt tokens.
+
+    Under async scheduling ``last_token``/``prev_token`` may be
+    ``PLACEHOLDER_TOKEN`` (-1): the engine scheduled this step before the prior
+    step's token was sampled, so the worker substitutes the token(s) it last
+    sampled for this request from its own cache.
+    """
 
     request_id: str
-    # output_token_ids[-1] (the token to decode from)
+    # output_token_ids[-1] (the token to decode from), or PLACEHOLDER_TOKEN.
     last_token: int
-    # output_token_ids[-2] if available, else prompt_token_ids[-1]  (for MTP prev context)
+    # output_token_ids[-2] if available, else prompt_token_ids[-1]  (for MTP prev
+    # context), or PLACEHOLDER_TOKEN.
     prev_token: int
-    # Total tokens computed so far: num_prompt_tokens + len(output_token_ids)
+    # Total tokens computed so far: num_prompt_tokens + len(output_token_ids).
     seq_len: int
     # Full KV block table for this request.
     block_ids: list[int]
@@ -96,6 +109,9 @@ class StepCommand(msgspec.Struct, tag="step"):
     decode_requests: list[DecodeRequest]
     # Request IDs that finished last step; worker releases device resources.
     finished_request_ids: list[str]
+    # Monotonic step counter, echoed back on StepResult. Cheap ordering guard for
+    # the pipelined loop (the worker is FIFO, so results must return in order).
+    step_id: int = 0
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):
@@ -123,6 +139,8 @@ class StepResult(msgspec.Struct):
 
     new_tokens: dict[str, list[int]]
     error: str | None = None
+    # Echoes the originating StepCommand.step_id (pipeline ordering guard).
+    step_id: int = 0
 
 
 # ---------------------------------------------------------------------------
