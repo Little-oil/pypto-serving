@@ -153,8 +153,6 @@ def harness():
     engine = AsyncLLMEngine(
         config=config,
         tokenizer=tokenizer,
-        eos_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id,
     )
     # Guard against a silent regression to synchronous depth-1 execution.
     assert engine._cores[0]._async_scheduling is True

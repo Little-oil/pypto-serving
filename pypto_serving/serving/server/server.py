@@ -141,6 +141,7 @@ class ServingServer:
             top_k=request.top_k,
             stop=tuple(request.stop) if request.stop else (),
             stream=request.stream,
+            ignore_eos=True,
         )
 
         with profile_span(
@@ -336,10 +337,10 @@ class ServingServer:
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
         mapping = {
-            "FINISHED_EOS": "stop",
+            "FINISHED_EOS": "eos",
             "FINISHED_LENGTH": "length",
             "FINISHED_STOP": "stop",
-            "FINISHED_ABORTED": "stop",
+            "FINISHED_ABORTED": "aborted",
         }
         return mapping.get(reason, "stop")
 

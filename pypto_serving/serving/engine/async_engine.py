@@ -147,15 +147,10 @@ class ReplicaEngineCore:
     def __init__(
         self,
         config: EngineConfig,
-        tokenizer=None,
-        eos_token_id: int | None = None,
-        bos_token_id: int | None = None
+        tokenizer
     ) -> None:
         self.config = config
         self.tokenizer = tokenizer
-        self.eos_token_id = eos_token_id
-        self.bos_token_id = bos_token_id
-
         runtime = self.config.runtime_config or RuntimeConfig()
         block_size = runtime.page_size
         self._runtime = runtime
@@ -304,27 +299,18 @@ class ReplicaEngineCore:
         prompt_token_ids: Sequence[int] | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer is required for request processing")
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
             args={"request_id": request_id, "max_new_tokens": config.max_new_tokens},
         ):
-            if prompt_token_ids is None:
-                prompt_token_ids = self.tokenizer.encode(prompt)
-            if not prompt_token_ids and self.bos_token_id is not None:
-                prompt_token_ids = [self.bos_token_id]
-            if not prompt_token_ids:
-                raise ValueError("Prompt tokenization produced no tokens.")
-
             request = Request(
                 request_id=request_id,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=config.max_new_tokens,
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
-                eos_token_id=self.eos_token_id,
+                eos_token_id=None if config.ignore_eos else self.tokenizer.eos_token_id,
                 temperature=config.temperature,
                 top_p=config.top_p,
                 top_k=config.top_k,
@@ -859,9 +845,7 @@ class AsyncLLMEngine:
     def __init__(
         self,
         config: EngineConfig,
-        tokenizer=None,
-        eos_token_id: int | None = None,
-        bos_token_id: int | None = None,
+        tokenizer,
         *,
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
     ) -> None:
@@ -876,8 +860,9 @@ class AsyncLLMEngine:
 
         self.config = config
         self.tokenizer = tokenizer
-        self.eos_token_id = eos_token_id
-        self.bos_token_id = bos_token_id
+        assert self.tokenizer is not None
+        self.eos_token_id = tokenizer.eos_token_id
+        self.bos_token_id = tokenizer.bos_token_id
         self.parallel_config = parallel
         self._request_counter = 0
         self._route_counter = 0
@@ -896,9 +881,7 @@ class AsyncLLMEngine:
             self._cores.append(
                 core_factory(
                     config=replica_config,
-                    tokenizer=tokenizer,
-                    eos_token_id=eos_token_id,
-                    bos_token_id=bos_token_id,
+                    tokenizer=tokenizer
                 )
             )
 
@@ -999,14 +982,12 @@ class AsyncLLMEngine:
         return self._cores[0]
 
     def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
-        if self.tokenizer is not None:
-            prompt_token_ids = self.tokenizer.encode(prompt)
-            if not prompt_token_ids and self.bos_token_id is not None:
-                prompt_token_ids = [self.bos_token_id]
-            if not prompt_token_ids:
-                raise ValueError("Prompt tokenization produced no tokens.")
-            return prompt_token_ids
-        return None
+        prompt_token_ids = self.tokenizer.encode(prompt)
+        if not prompt_token_ids and self.tokenizer.bos_token_id is not None:
+            prompt_token_ids = [self.tokenizer.bos_token_id]
+        if not prompt_token_ids:
+            raise ValueError("Prompt tokenization produced no tokens.")
+        return prompt_token_ids
 
     def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
         prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0
