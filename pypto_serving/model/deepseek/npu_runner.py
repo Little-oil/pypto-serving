@@ -346,7 +346,6 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "logits",
     "num_tokens_per_owner",
     "logit_row_indices",
-    "num_logit_rows",
 )
 
 # Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
@@ -444,7 +443,6 @@ _DECODE_FWD_TENSOR_ORDER = (
     "logits",
     "num_tokens_per_owner",
     "logit_row_indices",
-    "num_logit_rows",
 )
 
 _MTP_PREFILL_TENSOR_ORDER = (
@@ -505,7 +503,6 @@ _DECODE_INPUT_TENSOR_FIELDS = (
     "csa_inner_state_slot_mapping",
     "num_tokens_per_owner",
     "logit_row_indices",
-    "num_logit_rows",
 )
 
 
@@ -1065,7 +1062,6 @@ class DeepSeekV4PreparedPrefillInputs:
     csa_inner_state_slot_mapping: torch.Tensor
     num_tokens_per_owner: torch.Tensor
     logit_row_indices: torch.Tensor
-    num_logit_rows: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1102,7 +1098,6 @@ class DeepSeekV4PreparedDecodeInputs:
     block_ids_by_group: tuple[dict[str, tuple[int, ...]], ...]
     num_tokens_per_owner: torch.Tensor
     logit_row_indices: torch.Tensor
-    num_logit_rows: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1569,11 +1564,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             -1,
             dtype=torch.int32,
         )
-        num_logit_rows = torch.zeros(layout.ranks, dtype=torch.int32)
         for rank, actual_tokens in zip(ranks, actual_tokens_by_request, strict=True):
             num_tokens_per_owner[rank] = actual_tokens
             logit_row_indices[rank, 0] = actual_tokens - 1
-            num_logit_rows[rank] = 1
 
         return DeepSeekV4PreparedPrefillInputs(
             request_ids=tuple(batch.request_ids),
@@ -1604,7 +1597,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
             num_tokens_per_owner=num_tokens_per_owner,
             logit_row_indices=logit_row_indices,
-            num_logit_rows=num_logit_rows,
         )
 
     @staticmethod
@@ -1895,7 +1887,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             -1,
             dtype=torch.int32,
         )
-        num_logit_rows = num_tokens_per_owner.clone()
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
             if row_count > DEEPSEEK_V4_MAX_LOGIT_ROWS:
@@ -1948,7 +1939,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             block_ids_by_group=active_group_ids,
             num_tokens_per_owner=num_tokens_per_owner,
             logit_row_indices=logit_row_indices,
-            num_logit_rows=num_logit_rows,
         )
 
     @staticmethod
@@ -2394,7 +2384,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "logits": logits,
                 "num_tokens_per_owner": buffers.tensors["num_tokens_per_owner"],
                 "logit_row_indices": buffers.tensors["logit_row_indices"],
-                "num_logit_rows": buffers.tensors["num_logit_rows"],
             }
         )
         values.update(buffers.tensors)
@@ -2458,7 +2447,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "logits": logits,
                 "num_tokens_per_owner": inputs.num_tokens_per_owner,
                 "logit_row_indices": inputs.logit_row_indices,
-                "num_logit_rows": inputs.num_logit_rows,
             }
         )
         values = self._mark_resident_args(values, _DECODE_RESIDENT_POLICY)
@@ -3139,11 +3127,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         torch.int32,
                         name="decode_logit_row_indices",
                     ),
-                    "num_logit_rows": self._shared_empty(
-                        (ranks,),
-                        torch.int32,
-                        name="decode_num_logit_rows",
-                    ),
                 },
             )
             self._decode_buffers = buffers
@@ -3294,9 +3277,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 torch.int32,
                 "prefill_fwd_logit_row_indices",
             ),
-            "num_logit_rows": shared(
-                (ranks,), torch.int32, "prefill_fwd_num_logit_rows"
-            ),
         }
         buffers = _DeepSeekV4PrefillFwdSharedBuffers(
             x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.float32, "prefill_fwd_x_hc"),
@@ -3354,7 +3334,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
             "num_tokens_per_owner": inputs.num_tokens_per_owner,
             "logit_row_indices": inputs.logit_row_indices,
-            "num_logit_rows": inputs.num_logit_rows,
         }
         for name, tensor in shared_metadata.items():
             self._copy_shared(buffers.tensors[name], tensor, name=f"prefill_fwd_{name}")
@@ -3473,12 +3452,22 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return self._static_final_norm_weight
 
     def _static_lm_head_weight_tensor(self) -> torch.Tensor:
-        """Return the worker-visible TP-sharded device LM-head weight."""
+        """Return the worker-visible LM-head weight, one vocab shard per DP rank.
+
+        The kernel groups the DP world into ``ranks // tp`` independent TP groups,
+        so every card consumes shard ``rank % tp``. Resident arguments are handed
+        out per rank, so the shard has to be replicated here rather than indexed
+        inside the kernel.
+        """
         if self._static_lm_head_weight is None:
             global_weights = self.load_packed_global_weights()
             self._ensure_shared_host_allocation_before_worker("lm_head_weight")
+            packed = global_weights.lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+            tp_size = packed.shape[0]
+            ranks = self._compiled.layout.ranks
+            rank_shards = [packed[rank % tp_size] for rank in range(ranks)]
             self._static_lm_head_weight = self._static_device_tensor(
-                global_weights.lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+                torch.stack(rank_shards, dim=0).contiguous()
             )
         return self._static_lm_head_weight
 

@@ -701,9 +701,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "pre_hc_hidden_out": torch.empty(
                     (ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
                 ),
+                # One vocab shard per DP rank: the kernel groups the DP world into
+                # ranks // tp TP groups, and resident args are handed out per rank.
                 "lm_head_weight": torch.empty(
                     (
-                        DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        ranks,
                         model.config.vocab_size // DEEPSEEK_V4_LM_HEAD_TP_SIZE,
                         hidden,
                     ),
@@ -718,7 +720,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "logit_row_indices": torch.zeros(
                     (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), dtype=torch.int32
                 ),
-                "num_logit_rows": torch.ones((ranks,), dtype=torch.int32),
             }
         )
         return self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER)
@@ -886,9 +887,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "pre_hc_hidden_out": torch.empty(
                     (ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
                 ),
+                # One vocab shard per DP rank: the kernel groups the DP world into
+                # ranks // tp TP groups, and resident args are handed out per rank.
                 "lm_head_weight": torch.empty(
                     (
-                        DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                        ranks,
                         model.config.vocab_size // DEEPSEEK_V4_LM_HEAD_TP_SIZE,
                         hidden,
                     ),
@@ -898,7 +901,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "logits": torch.empty((ranks, tokens, model.config.vocab_size), dtype=torch.float32),
                 "num_tokens_per_owner": torch.full((ranks,), tokens, dtype=torch.int32),
                 "logit_row_indices": torch.arange(tokens, dtype=torch.int32).expand(ranks, -1).contiguous(),
-                "num_logit_rows": torch.full((ranks,), tokens, dtype=torch.int32),
             }
         )
         return self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER)
@@ -1063,13 +1065,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             actual = _int_constant_from_file(config_path, name)
             if actual is not None and actual != expected:
                 mismatched.append(f"{name}={actual} expected {expected}")
-        lm_head_tp_size = _int_constant_from_file(config_path, "LM_HEAD_TP_SIZE")
-        if lm_head_tp_size is None:
-            mismatched.append(f"LM_HEAD_TP_SIZE missing expected at least {DEEPSEEK_V4_LM_HEAD_TP_SIZE}")
-        elif lm_head_tp_size < DEEPSEEK_V4_LM_HEAD_TP_SIZE:
-            mismatched.append(
-                f"LM_HEAD_TP_SIZE={lm_head_tp_size} expected at least {DEEPSEEK_V4_LM_HEAD_TP_SIZE}"
-            )
         expected_module_constants = {
             "prefill_attention_hca.py": {
                 "HCA_STATE_BLOCK_NUM": layout.hca_state_max_blocks,

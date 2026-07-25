@@ -350,12 +350,11 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # In-kernel final RMSNorm plus TP4 device LM-head.
     assert prefill_args[prefill_order.index("final_norm_w")].shape == (8, 4096)
     assert prefill_args[prefill_order.index("pre_hc_hidden_out")].shape == (8, 128, 4, 4096)
-    assert prefill_args[prefill_order.index("lm_head_weight")].shape == (4, 32320, 4096)
+    assert prefill_args[prefill_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert prefill_args[prefill_order.index("hidden_out")].shape == (8, 128, 4096)
     assert prefill_args[prefill_order.index("logits")].shape == (8, 8, 129280)
     assert prefill_args[prefill_order.index("num_tokens_per_owner")].shape == (8,)
     assert prefill_args[prefill_order.index("logit_row_indices")].shape == (8, 8)
-    assert prefill_args[prefill_order.index("num_logit_rows")].shape == (8,)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
     # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
     # groups, each layer holding decode_batch (4) x state_max_blocks rows.
@@ -378,12 +377,11 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
         4,
         4096,
     )
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (4, 32320, 4096)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hidden_out")].shape == (8, 8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
@@ -856,7 +854,6 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
         -1,
     ]
     assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
-    assert prepared.num_logit_rows.tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
 
 
@@ -913,7 +910,6 @@ def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
     assert prepared.window_swa_lens[1, 1].item() == 5
     assert prepared.window_swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
     assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
-    assert prepared.num_logit_rows.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
 
 
