@@ -242,6 +242,8 @@ async def _collect_outputs(outputs):
 class _Tokenizer:
     def __init__(self) -> None:
         self.encode_calls = 0
+        self.eos_token_id = 0
+        self.bos_token_id = 1
 
     def encode(self, text: str) -> list[int]:
         self.encode_calls += 1

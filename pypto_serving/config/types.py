@@ -27,6 +27,7 @@ class GenerateConfig:
     top_k: int | None = None
     stop: tuple[str, ...] = ()
     stream: bool = False
+    ignore_eos: bool = False
 
 
 @dataclass(frozen=True)

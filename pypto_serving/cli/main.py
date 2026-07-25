@@ -349,9 +349,7 @@ def run_serve(
     tokenizer = load_tokenizer(config.model_dir)
     async_engine = AsyncLLMEngine(
         config=config,
-        tokenizer=tokenizer,
-        eos_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id,
+        tokenizer=tokenizer
     )
 
     app = create_serving_app(async_engine, model_id)
