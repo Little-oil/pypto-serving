@@ -356,6 +356,31 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
 
 
+def test_grouped_cache_capacity_scales_from_device_reported_primary_pool():
+    manager = KvCacheManager(block_size=1, enable_prefix_cache=False)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="primary",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=1, page_size_bytes=4),
+                max_blocks_per_seq=3,
+            ),
+            KVCacheGroupSpec(
+                name="compressed",
+                layer_indices=(1,),
+                spec=KVCacheSpec(block_size=1, page_size_bytes=2),
+                max_blocks_per_seq=2,
+            ),
+        ),
+        max_batch_size=8,
+        primary_num_blocks=6,
+    )
+
+    assert manager.group_num_blocks("primary") == 6
+    assert manager.group_num_blocks("compressed") == 4
+
+
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._worker_known_req_ids = {"req"}
