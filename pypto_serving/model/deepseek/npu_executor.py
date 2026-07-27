@@ -515,6 +515,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             self._kernel_dir,
             pypto_root=pypto_root,
             ep=len(self._device_ids),
+            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="prefill" if is_prefill else "decode",
             num_layers=DEEPSEEK_V4_FWD_NUM_LAYERS if is_prefill else None,
         ):
