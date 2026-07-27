@@ -24,6 +24,11 @@ from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as 
 from pypto_serving.model.common.executor.utils import rope_tables, round_up
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.qwen import qwen3_l3_dispatch
+from pypto_serving.model.qwen.kernel_cache import (
+    KernelCache,
+    compute_code_fingerprint,
+    compute_params_fingerprint,
+)
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
     _L3Callable,
@@ -113,6 +118,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
         pypto_root: str | None = None,
+        kernel_cache_dir: str | None = None,
     ) -> None:
         super().__init__(
             kv_cache_manager,
@@ -121,6 +127,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             save_kernels_dir=save_kernels_dir,
         )
         self._pypto_root = pypto_root
+        # One on-disk kernel cache shared by the load path (this executor, at
+        # compile time) and the store path (the runner, after the L3 worker has
+        # assembled the device binaries). Building it here computes the code
+        # fingerprint once (memoised) instead of per kernel.
+        self._kernel_cache = (
+            KernelCache(kernel_cache_dir, compute_code_fingerprint(pypto_root))
+            if kernel_cache_dir
+            else None
+        )
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -139,6 +154,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            kernel_cache=self._kernel_cache,
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -503,6 +519,27 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
         )
+        params_fingerprint = compute_params_fingerprint(
+            name, dummy_args, platform=self._platform, block_dim=_QWEN14B_BLOCK_DIM,
+        )
+        if self._kernel_cache is not None:
+            cached = self._kernel_cache.load(
+                name,
+                params_fingerprint,
+                platform=self._platform,
+                distributed_config=distributed_config,
+            )
+            if cached is not None:
+                # output_dir points at the cache slot, which also holds the
+                # compiled device binaries (cache/*.bin + kernels/*.o); the L3
+                # worker's compile_and_assemble finds them and skips recompiling.
+                return _L3Callable(
+                    compiled=cached,
+                    name=name,
+                    block_dim=_QWEN14B_BLOCK_DIM,
+                    aicpu_thread_num=4,
+                    params_fingerprint=params_fingerprint,
+                )
         run_config = RunConfig(
             platform=config.platform,
             device_id=config.device_id,
@@ -527,6 +564,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             name=name,
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
+            params_fingerprint=params_fingerprint,
         )
 
     @staticmethod
