@@ -23,6 +23,7 @@ from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
 from pypto_serving.model.deepseek import npu_executor, weight_loader
 from pypto_serving.model.deepseek.npu_runner import (
+    DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheMetadataBuilder,
     DeepSeekV4CompiledKernels,
@@ -1450,6 +1451,65 @@ def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
     assert logits.shape == (2, 5)
     assert logits[0].tolist() == [15, 16, 17, 31, 33]
     assert logits[1].tolist() == [6, 7, 8, 13, 15]
+
+
+def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank():
+    layout = DeepSeekV4CacheLayout()
+    tp_size = DEEPSEEK_V4_LM_HEAD_TP_SIZE
+    # The regression only shows up when the DP world spans more than one TP group.
+    assert layout.ranks > tp_size
+    compiled = DeepSeekV4CompiledKernels(
+        layout=layout,
+        model_dir="",
+        weight_map={},
+        weight_store=None,
+        compress_ratios=(),
+        layer_plan=(),
+        kernel_dir="",
+    )
+    runner = DeepSeekV4ModelRunner(compiled=compiled)
+    vocab_per_rank = 2
+    hidden_size = 3
+    # Shard s carries the constant s + 1 so every rank's copy is identifiable.
+    packed = torch.stack(
+        [
+            torch.full((vocab_per_rank, hidden_size), float(shard + 1), dtype=torch.bfloat16)
+            for shard in range(tp_size)
+        ]
+    )
+    runner._global_weights = weight_loader.DeepSeekV4GlobalWeights(
+        embed_weight=torch.empty(0),
+        final_norm_weight=torch.empty(0),
+        lm_head_weight=packed,
+        lm_head_layout=weight_loader.DeepSeekV4LmHeadLayout(
+            ranks=tp_size,
+            vocab_size=tp_size * vocab_per_rank,
+            hidden_size=hidden_size,
+            vocab_per_rank=vocab_per_rank,
+            padded_vocab_per_rank=vocab_per_rank,
+        ),
+        hc_head_fn=torch.empty(0),
+        hc_head_scale=torch.empty(0),
+        hc_head_base=torch.empty(0),
+    )
+
+    replicated = runner._static_lm_head_weight_tensor()
+
+    # Every card holds a full shard, not just the first TP group: ranks 4..7 must
+    # repeat shards 0..3 instead of reading whatever the kernel maps past rank 3.
+    assert replicated.shape == (layout.ranks, vocab_per_rank, hidden_size)
+    for rank in range(layout.ranks):
+        assert torch.equal(replicated[rank], packed[rank % tp_size]), f"rank {rank} shard mismatch"
+    assert [float(replicated[rank, 0, 0]) for rank in range(layout.ranks)] == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+    ]
 
 
 def test_deepseek_final_hidden_normalizes_before_hc_head_projection_overflows():

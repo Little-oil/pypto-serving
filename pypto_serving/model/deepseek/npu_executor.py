@@ -203,6 +203,20 @@ def _int_constant_from_file(path: Path, name: str) -> int | None:
     return None
 
 
+def _dummy_logit_row_indices(ranks: int, source_rows: int) -> torch.Tensor:
+    """Return dummy ``logit_row_indices`` shaped like the kernel argument.
+
+    The LM head derives its active row count from the ``-1`` sentinel, so the
+    dummy carries the same shape: leading entries index real hidden rows and the
+    tail stays ``-1`` rather than collapsing to an all-zero block that would read
+    as "every row is row 0".
+    """
+    active = max(min(int(source_rows), DEEPSEEK_V4_MAX_LOGIT_ROWS), 0)
+    indices = torch.full((ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+    indices[:, :active] = torch.arange(active, dtype=torch.int32)
+    return indices
+
+
 def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     """Return whether ``path`` is one of the top-level DeepSeekV4 kernel modules."""
     resolved = path.resolve()
@@ -717,9 +731,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     dtype=torch.float32,
                 ),
                 "num_tokens_per_owner": torch.full((ranks,), seq, dtype=torch.int32),
-                "logit_row_indices": torch.zeros(
-                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), dtype=torch.int32
-                ),
+                "logit_row_indices": _dummy_logit_row_indices(ranks, seq),
             }
         )
         return self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER)
@@ -900,7 +912,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hidden_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
                 "logits": torch.empty((ranks, tokens, model.config.vocab_size), dtype=torch.float32),
                 "num_tokens_per_owner": torch.full((ranks,), tokens, dtype=torch.int32),
-                "logit_row_indices": torch.arange(tokens, dtype=torch.int32).expand(ranks, -1).contiguous(),
+                "logit_row_indices": _dummy_logit_row_indices(ranks, tokens),
             }
         )
         return self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER)
