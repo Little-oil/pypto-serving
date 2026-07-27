@@ -23,6 +23,7 @@ from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
 from pypto_serving.model.deepseek import npu_executor, weight_loader
 from pypto_serving.model.deepseek.npu_runner import (
+    DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheMetadataBuilder,
     DeepSeekV4CompiledKernels,
@@ -350,12 +351,11 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # In-kernel final RMSNorm plus TP4 device LM-head.
     assert prefill_args[prefill_order.index("final_norm_w")].shape == (8, 4096)
     assert prefill_args[prefill_order.index("pre_hc_hidden_out")].shape == (8, 128, 4, 4096)
-    assert prefill_args[prefill_order.index("lm_head_weight")].shape == (4, 32320, 4096)
+    assert prefill_args[prefill_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert prefill_args[prefill_order.index("hidden_out")].shape == (8, 128, 4096)
     assert prefill_args[prefill_order.index("logits")].shape == (8, 8, 129280)
     assert prefill_args[prefill_order.index("num_tokens_per_owner")].shape == (8,)
     assert prefill_args[prefill_order.index("logit_row_indices")].shape == (8, 8)
-    assert prefill_args[prefill_order.index("num_logit_rows")].shape == (8,)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
     # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
     # groups, each layer holding decode_batch (4) x state_max_blocks rows.
@@ -378,12 +378,11 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
         4,
         4096,
     )
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (4, 32320, 4096)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hidden_out")].shape == (8, 8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
@@ -856,7 +855,6 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
         -1,
     ]
     assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
-    assert prepared.num_logit_rows.tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
 
 
@@ -913,7 +911,6 @@ def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
     assert prepared.window_swa_lens[1, 1].item() == 5
     assert prepared.window_swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
     assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
-    assert prepared.num_logit_rows.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
 
 
@@ -1454,6 +1451,65 @@ def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
     assert logits.shape == (2, 5)
     assert logits[0].tolist() == [15, 16, 17, 31, 33]
     assert logits[1].tolist() == [6, 7, 8, 13, 15]
+
+
+def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank():
+    layout = DeepSeekV4CacheLayout()
+    tp_size = DEEPSEEK_V4_LM_HEAD_TP_SIZE
+    # The regression only shows up when the DP world spans more than one TP group.
+    assert layout.ranks > tp_size
+    compiled = DeepSeekV4CompiledKernels(
+        layout=layout,
+        model_dir="",
+        weight_map={},
+        weight_store=None,
+        compress_ratios=(),
+        layer_plan=(),
+        kernel_dir="",
+    )
+    runner = DeepSeekV4ModelRunner(compiled=compiled)
+    vocab_per_rank = 2
+    hidden_size = 3
+    # Shard s carries the constant s + 1 so every rank's copy is identifiable.
+    packed = torch.stack(
+        [
+            torch.full((vocab_per_rank, hidden_size), float(shard + 1), dtype=torch.bfloat16)
+            for shard in range(tp_size)
+        ]
+    )
+    runner._global_weights = weight_loader.DeepSeekV4GlobalWeights(
+        embed_weight=torch.empty(0),
+        final_norm_weight=torch.empty(0),
+        lm_head_weight=packed,
+        lm_head_layout=weight_loader.DeepSeekV4LmHeadLayout(
+            ranks=tp_size,
+            vocab_size=tp_size * vocab_per_rank,
+            hidden_size=hidden_size,
+            vocab_per_rank=vocab_per_rank,
+            padded_vocab_per_rank=vocab_per_rank,
+        ),
+        hc_head_fn=torch.empty(0),
+        hc_head_scale=torch.empty(0),
+        hc_head_base=torch.empty(0),
+    )
+
+    replicated = runner._static_lm_head_weight_tensor()
+
+    # Every card holds a full shard, not just the first TP group: ranks 4..7 must
+    # repeat shards 0..3 instead of reading whatever the kernel maps past rank 3.
+    assert replicated.shape == (layout.ranks, vocab_per_rank, hidden_size)
+    for rank in range(layout.ranks):
+        assert torch.equal(replicated[rank], packed[rank % tp_size]), f"rank {rank} shard mismatch"
+    assert [float(replicated[rank, 0, 0]) for rank in range(layout.ranks)] == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+    ]
 
 
 def test_deepseek_final_hidden_normalizes_before_hc_head_projection_overflows():
