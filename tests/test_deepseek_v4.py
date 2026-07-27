@@ -1308,6 +1308,37 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
         assert name not in prefill.tensors
 
 
+def test_deepseek_shared_buffer_setup_does_not_require_decode_work_cache(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    runner._stacked_device_weights = object()
+    zero_page_calls = []
+
+    for method_name in (
+        "load_packed_global_weights",
+        "_static_freqs_cos_tensor",
+        "_static_freqs_sin_tensor",
+        "_ensure_decode_buffers",
+        "_ensure_mtp_buffers",
+        "_require_prefill_output_buffer",
+        "_require_prefill_pre_hc_output_buffer",
+        "_require_prefill_logits_buffer",
+        "_static_final_norm_weight_tensor",
+        "_static_lm_head_weight_tensor",
+        "_require_decode_logits_buffer",
+        "_hc_head_tensors",
+        "_ensure_prefill_fwd_buffers",
+        "_assert_l3_shared_buffers_preallocated",
+        "_materialize_resident_weights",
+    ):
+        monkeypatch.setattr(runner, method_name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_ensure_cache_zero_page", lambda: zero_page_calls.append(True))
+
+    runner._ensure_l3_shared_buffers(model)
+
+    assert zero_page_calls == [True]
+    assert not hasattr(runner, "_decode_work_cache")
+
+
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     layout = DeepSeekV4CacheLayout(
         ranks=1,

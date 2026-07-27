@@ -124,21 +124,19 @@ def compute_params_fingerprint(
     dummy_args: Sequence[Any],
     *,
     platform: str,
-    block_dim: int,
 ) -> str:
     """Fingerprint of everything that specialises this kernel's binary.
 
     The ``dummy_args`` shape+dtype signature encodes every compile-time
     dimension (batch, max_seq, page_size, vocab, head_dim, block-table stride,
-    ...); combined with the kernel name, target platform, and block dim it
-    uniquely identifies the compiled kernel. Two launches differing in any of
-    these produce different fingerprints, so a config change can never be
-    served a stale binary.
+    ...); combined with the kernel name and target platform it uniquely
+    identifies the compiled kernel. Two launches differing in any of these
+    produce different fingerprints, so a config change can never be served a
+    stale binary.
     """
     digest = hashlib.sha256()
     digest.update(name.encode())
     digest.update(platform.encode())
-    digest.update(str(block_dim).encode())
     for arg in dummy_args:
         digest.update(str(tuple(arg.shape)).encode())
         digest.update(str(arg.dtype).encode())

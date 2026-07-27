@@ -2517,8 +2517,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
             self._ensure_mtp_buffers(model.config.hidden_size)
             self._ensure_cache_zero_page()
-        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_work_cache", cat="executor"):
-            self._ensure_decode_work_cache()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_outputs", cat="executor"):
             self._require_prefill_output_buffer(model.config.hidden_size)
             self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)

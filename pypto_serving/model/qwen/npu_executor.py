@@ -38,7 +38,6 @@ from pypto_serving.model.qwen.npu_runner import (
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 128
-_QWEN14B_BLOCK_DIM = 24
 
 
 @dataclass
@@ -516,12 +515,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         distributed_config = DistributedConfig(
             device_ids=list(self._device_ids),
             num_sub_workers=0,
-            block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
         )
-        params_fingerprint = compute_params_fingerprint(
-            name, dummy_args, platform=self._platform, block_dim=_QWEN14B_BLOCK_DIM,
-        )
+        params_fingerprint = compute_params_fingerprint(name, dummy_args, platform=self._platform)
         if self._kernel_cache is not None:
             cached = self._kernel_cache.load(
                 name,
@@ -536,7 +532,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 return _L3Callable(
                     compiled=cached,
                     name=name,
-                    block_dim=_QWEN14B_BLOCK_DIM,
                     aicpu_thread_num=4,
                     params_fingerprint=params_fingerprint,
                 )
@@ -562,7 +557,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return _L3Callable(
             compiled=compiled,
             name=name,
-            block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
             params_fingerprint=params_fingerprint,
         )
