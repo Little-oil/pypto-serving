@@ -69,6 +69,7 @@ def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
 
 DEEPSEEK_V4_RANKS = 8
 DEEPSEEK_V4_HC_MULT = 4
+DEEPSEEK_V4_VOCAB_SIZE = 129280
 DEEPSEEK_V4_BLOCK_SIZE = 128
 DEEPSEEK_V4_DECODE_BATCH = 4
 DEEPSEEK_V4_DECODE_SEQ = 2
@@ -142,6 +143,7 @@ _DECODE_RESIDENT_POLICY = {
 _MTP_RESIDENT_POLICY = {
     "freqs_cos": False,
     "freqs_sin": False,
+    "lm_head_weight": False,
     "kv_cache": True,
 }
 
@@ -459,7 +461,7 @@ _MTP_PREFILL_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "hidden_out", "pre_hc_hidden_out",
+    "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
 )
 
 _MTP_DECODE_TENSOR_ORDER = (
@@ -476,7 +478,7 @@ _MTP_DECODE_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "hidden_out", "next_pre_hc_hidden",
+    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "logit_row_indices",
 )
 
 _DECODE_INPUT_TENSOR_FIELDS = (
@@ -1174,8 +1176,12 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_kv_cache: torch.Tensor
     prefill_hidden_out: torch.Tensor
     prefill_pre_hc_out: torch.Tensor
+    prefill_logits: torch.Tensor
+    prefill_logit_row_indices: torch.Tensor
     decode_hidden_out: torch.Tensor
     decode_pre_hc_out: torch.Tensor
+    decode_logits: torch.Tensor
+    decode_logit_row_indices: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -2482,8 +2488,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "ori_slot_mapping": buffers.prefill_slot_mapping,
                 "position_ids": buffers.prefill_position_ids,
                 "input_ids": buffers.prefill_input_ids,
+                "lm_head_weight": self._static_lm_head_weight_tensor(),
                 "hidden_out": buffers.prefill_hidden_out,
                 "pre_hc_hidden_out": buffers.prefill_pre_hc_out,
+                "logits": buffers.prefill_logits,
+                "logit_row_indices": buffers.prefill_logit_row_indices,
             }
         )
         values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
@@ -2507,8 +2516,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "swa_indices": buffers.decode_swa_indices,
                 "swa_lens": buffers.decode_swa_lens,
                 "input_ids": buffers.decode_input_ids,
+                "lm_head_weight": self._static_lm_head_weight_tensor(),
                 "hidden_out": buffers.decode_hidden_out,
                 "next_pre_hc_hidden": buffers.decode_pre_hc_out,
+                "logits": buffers.decode_logits,
+                "logit_row_indices": buffers.decode_logit_row_indices,
             }
         )
         values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
@@ -2619,6 +2631,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers.prefill_slot_mapping[owner_rank].copy_(context.slot_mapping)
         buffers.prefill_hidden_out.zero_()
         buffers.prefill_pre_hc_out.zero_()
+        buffers.prefill_logits.zero_()
+        buffers.prefill_logit_row_indices.fill_(-1)
+        buffers.prefill_logit_row_indices[owner_rank, 0] = n - 1
         with profile_span(
             "DeepSeekV4ModelRunner.mtp.prefill.l3_dispatch",
             cat="executor",
@@ -2629,13 +2644,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 *self._mtp_prefill_args(),
                 self._int32_scalar(n),
             )
-        with profile_span("DeepSeekV4ModelRunner.mtp.prefill.lm_head", cat="executor"):
-            draft_logits = self._logits_for_hidden(
-                buffers.prefill_hidden_out,
-                owner_rows=((owner_rank, n - 1),),
-                label="mtp.prefill",
-            )
-        state.draft_token_id = int(draft_logits.argmax(dim=-1)[0].item())
+        state.draft_token_id = int(buffers.prefill_logits[owner_rank, 0].argmax().item())
         state.tail_token_id = int(first_token[0].item())
         state.tail_pre_hc_hidden = context.prev_hidden_states[n - 1].clone()
         state.tail_position = int(context.position_ids[n - 1].item())
@@ -2794,6 +2803,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
         buffers.decode_hidden_out.zero_()
         buffers.decode_pre_hc_out.zero_()
+        buffers.decode_logits.zero_()
+        buffers.decode_logit_row_indices.fill_(-1)
+        for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True):
+            buffers.decode_logit_row_indices[rank, local_row] = (
+                local_row * layout.decode_seq + layout.decode_seq - 1
+            )
         active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
         with profile_span(
             "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
@@ -2805,20 +2820,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 *self._mtp_decode_args(),
                 self._int32_scalar(active_tokens),
             )
-        draft_owner_rows = tuple(
-            (rank, local_row * layout.decode_seq + layout.decode_seq - 1)
-            for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
-        )
-        with profile_span("DeepSeekV4ModelRunner.mtp.decode.lm_head", cat="executor"):
-            draft_ids = self._logits_for_hidden(
-                buffers.decode_hidden_out,
-                owner_rows=draft_owner_rows,
-                label="mtp.decode",
-            ).argmax(dim=-1)
         for request_index, request_id in enumerate(inputs.request_ids):
             state = self._require_mtp_request_state(request_id)
             _, committed_hidden, committed_positions = committed[request_index]
-            state.draft_token_id = int(draft_ids[request_index].item())
+            state.draft_token_id = int(
+                buffers.decode_logits[inputs.ranks[request_index], inputs.local_rows[request_index]].argmax().item()
+            )
             state.tail_token_id = int(committed[request_index][0][-1].item())
             state.tail_pre_hc_hidden = committed_hidden[-1].clone()
             state.tail_position = int(committed_positions[-1].item())
@@ -3205,6 +3212,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 torch.float32,
                 name="mtp_prefill_pre_hc_out",
             ),
+            prefill_logits=self._shared_empty(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
+                torch.float32,
+                name="mtp_prefill_logits",
+            ),
+            prefill_logit_row_indices=self._shared_empty(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), torch.int32, name="mtp_prefill_logit_row_indices"
+            ),
             decode_hidden_out=self._shared_empty(
                 (ranks, tokens, hidden), torch.bfloat16, name="mtp_decode_hidden_out"
             ),
@@ -3212,6 +3227,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 (ranks, tokens, layout.hc_mult, hidden),
                 torch.float32,
                 name="mtp_decode_pre_hc_out",
+            ),
+            decode_logits=self._shared_empty(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
+                torch.float32,
+                name="mtp_decode_logits",
+            ),
+            decode_logit_row_indices=self._shared_empty(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), torch.int32, name="mtp_decode_logit_row_indices"
             ),
         )
         self._mtp_buffers.prefill_kv_cache.zero_()
