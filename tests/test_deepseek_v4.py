@@ -795,16 +795,18 @@ def _grouped_cache_rows(count: int) -> list[dict[str, list[int]]]:
 def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     runner, model = _runner_for_prepared_inputs()
     layout = runner._compiled.layout
-    embeddings = torch.arange(12, dtype=torch.bfloat16).reshape(1, 3, 4)
+    embeddings = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
 
     prepared = runner.prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=["req-a"],
-            token_ids=torch.tensor([[10, 11, 12]], dtype=torch.long),
+            token_ids=torch.tensor([10, 11, 12], dtype=torch.long),
             input_embeddings=embeddings,
-            seq_lens=torch.tensor([129], dtype=torch.int32),
-            positions=torch.tensor([[126, 127, 128]], dtype=torch.long),
+            seq_lens=[129],
+            chunk_lens=[3],
+            chunk_offsets=[0],
+            chunk_starts=[126],
             block_ids_by_group=_grouped_cache_rows(1),
             cache_partitions=[0],
         ),

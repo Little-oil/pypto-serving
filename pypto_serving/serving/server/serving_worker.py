@@ -14,14 +14,12 @@ import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
-from typing import TYPE_CHECKING
-
 from pypto_serving.config.types import (
     DecodeBatch,
-    PrefillBatch,
     SamplingParams,
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
@@ -36,6 +34,7 @@ from pypto_serving.serving.server.ipc import (
     decode_command,
     encode_result,
 )
+from pypto_serving.serving.utils.prefill import pack_prefill_batch
 from pypto_serving.tools.profile import get_profiler, profile_span
 
 if TYPE_CHECKING:
@@ -292,49 +291,30 @@ class WorkerProcess:
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             device = runtime_model.runtime.device
-            batch_size = len(scheduled)
-            max_chunk = max(len(pr.chunk_tokens) for pr in scheduled)
-
+            chunk_tokens_list = [pr.chunk_tokens for pr in scheduled]
+            seq_lens = [pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled]
+            chunk_starts = [pr.num_computed_tokens for pr in scheduled]
+            block_ids_list = [pr.block_ids for pr in scheduled]
             allow_device_greedy_sampling = (
                 self.executor.supports_device_sampling
                 and all(self._req_cache[pr.request_id].temperature <= 0.0 for pr in scheduled)
             )
-
-            token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
-            embeddings = None
+            embedding_lookup = None
             if not self.executor.supports_device_embedding:
-                embeddings = torch.zeros(
-                    (batch_size, max_chunk, self.model_record.config.hidden_size),
-                    dtype=runtime_model.embed_tokens.dtype,
-                    device=device,
+                embedding_lookup = lambda token_ids: self.executor.lookup_embeddings(
+                    runtime_model, token_ids
                 )
-            positions_tensor = torch.full((batch_size, max_chunk), -1, dtype=torch.long, device=device)
-
-            seq_lens = []
-            block_ids_list = []
-            for i, pr in enumerate(scheduled):
-                row = torch.tensor(pr.chunk_tokens, dtype=torch.long, device=device)
-                token_tensor[i, : len(pr.chunk_tokens)] = row
-                if embeddings is not None:
-                    embeddings[i, : len(pr.chunk_tokens), :] = self.executor.lookup_embeddings(
-                        runtime_model, row
-                    )
-                positions = range(pr.num_computed_tokens, pr.num_computed_tokens + len(pr.chunk_tokens))
-                positions_tensor[i, : len(pr.chunk_tokens)] = torch.tensor(
-                    list(positions), dtype=torch.long, device=device
-                )
-                seq_lens.append(pr.num_computed_tokens + len(pr.chunk_tokens))
-                block_ids_list.append(pr.block_ids)
 
             prefill_result = self.executor.run_prefill(
                 runtime_model,
-                PrefillBatch(
+                pack_prefill_batch(
                     request_ids=[pr.request_id for pr in scheduled],
-                    token_ids=token_tensor,
-                    input_embeddings=embeddings,
-                    seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                    token_chunks=chunk_tokens_list,
+                    seq_lens=seq_lens,
+                    chunk_starts=chunk_starts,
+                    device=device,
+                    embedding_lookup=embedding_lookup,
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
-                    positions=positions_tensor,
                     block_ids=block_ids_list,
                     block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
                     cache_partitions=[pr.cache_partition for pr in scheduled],

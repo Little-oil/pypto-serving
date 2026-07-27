@@ -19,7 +19,6 @@ from pypto_serving.config.types import (
     GenerateConfig,
     GenerateResult,
     ModelRecord,
-    PrefillBatch,
     RequestState,
     RuntimeConfig,
 )
@@ -27,6 +26,7 @@ from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.model.common.executor.sampler import Sampler
 from pypto_serving.model.model_loader import ModelLoader
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.utils.prefill import pack_prefill_batch
 from pypto_serving.tools.profile import profile_span
 
 
@@ -69,8 +69,7 @@ class LLMEngine:
             )
             config = loaded.config
             runtime = loaded.runtime_model.runtime
-            self._kv_cache_manager.register_model(model_id, config, runtime)
-            self._models[model_id] = ModelRecord(
+            record = ModelRecord(
                 config=config,
                 runtime=runtime,
                 tokenizer=loaded.tokenizer,
@@ -78,8 +77,16 @@ class LLMEngine:
                 runtime_model=loaded.runtime_model,
             )
             register_model = getattr(self._executor, "register_model", None)
+            actual_num_pages = None
             if callable(register_model):
-                register_model(model_id, self._models[model_id])
+                actual_num_pages = register_model(model_id, record)
+            self._kv_cache_manager.register_model(
+                model_id,
+                config,
+                runtime,
+                num_pages=actual_num_pages,
+            )
+            self._models[model_id] = record
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
         """Generate text for one prompt, optionally returning a text stream."""
@@ -168,53 +175,16 @@ class LLMEngine:
                     )
                 )
 
-            max_prompt_len = max(len(token_ids) for token_ids in prompt_token_ids)
             allow_device_greedy_sampling = (
                 generate_config.temperature <= 0.0
                 and self._executor.supports_device_sampling
                 and self._executor.supports_device_embedding
             )
-            token_tensor = torch.zeros(
-                (len(prompt_token_ids), max_prompt_len),
-                dtype=torch.long,
-                device=runtime_model.runtime.device,
-            )
-            embeddings = None
+            embedding_lookup = None
             if not self._executor.supports_device_embedding:
-                embeddings = torch.zeros(
-                    (len(prompt_token_ids), max_prompt_len, record.config.hidden_size),
-                    dtype=runtime_model.embed_tokens.dtype,
-                    device=runtime_model.runtime.device,
+                embedding_lookup = lambda token_ids: self._executor.lookup_embeddings(
+                    runtime_model, token_ids
                 )
-            for batch_idx, token_ids in enumerate(prompt_token_ids):
-                row_tokens = torch.tensor(token_ids, dtype=torch.long, device=runtime_model.runtime.device)
-                token_tensor[batch_idx, : len(token_ids)] = row_tokens
-                if embeddings is not None:
-                    embeddings[batch_idx, : len(token_ids), :] = self._executor.lookup_embeddings(
-                        runtime_model,
-                        row_tokens,
-                    )
-
-            prefill_batch = PrefillBatch(
-                request_ids=[request.request_id for request in requests],
-                token_ids=token_tensor,
-                input_embeddings=embeddings,
-                seq_lens=torch.tensor(
-                    [len(token_ids) for token_ids in prompt_token_ids],
-                    dtype=torch.int32,
-                    device=runtime_model.runtime.device,
-                ),
-                allow_device_greedy_sampling=allow_device_greedy_sampling,
-                kv_allocations=allocations,
-            )
-            fast_path_result = self._executor.try_generate_batch(
-                record,
-                requests,
-                prefill_batch,
-                generate_config,
-            )
-            if fast_path_result is not None:
-                return fast_path_result
 
             # Greedy chunked prefill: when total prompt tokens exceed
             # max_num_batched_tokens, split into chunks that each pack up
@@ -225,7 +195,8 @@ class LLMEngine:
             if total_tokens > total_budget:
                 remaining = [[ri, len(ids)] for ri, ids in enumerate(prompt_token_ids)]
                 offsets = [0] * len(prompts)
-                prefill_result = None
+                completed_logits: dict[int, torch.Tensor] = {}
+                completed_sampled_ids: dict[int, torch.Tensor] = {}
                 with self._executor.session():
                     while remaining:
                         # greedily take up to total_budget tokens
@@ -242,33 +213,37 @@ class LLMEngine:
                             chunk_lens.append(take)
                             budget -= take
                             offsets[ri] += take
-                        n_sub = len(chunk_req)
-                        max_len = max_prompt_len  # fixed across chunks
-                        sub_tokens = torch.zeros(
-                            (n_sub, max_len), dtype=torch.long,
-                            device=runtime_model.runtime.device,
-                        )
-                        sub_emb = None
-                        if not self._executor.supports_device_embedding:
-                            sub_emb = torch.zeros(
-                                (n_sub, max_len, record.config.hidden_size),
-                                dtype=runtime_model.embed_tokens.dtype,
-                                device=runtime_model.runtime.device,
-                            )
-                        sub_seq_lens: list[int] = []
+                        token_chunks: list[list[int]] = []
+                        chunk_starts: list[int] = []
                         for row, ri in enumerate(chunk_req):
                             n = chunk_lens[row]
                             start = offsets[ri] - n
-                            tids = prompt_token_ids[ri][start:offsets[ri]]
-                            sub_tokens[row, :n] = torch.tensor(
-                                tids, dtype=torch.long,
-                                device=runtime_model.runtime.device,
-                            )
-                            sub_seq_lens.append(offsets[ri])
-                            if sub_emb is not None:
-                                sub_emb[row, :n, :] = self._executor.lookup_embeddings(
-                                    runtime_model, sub_tokens[row, :n],
-                                )
+                            token_chunks.append(prompt_token_ids[ri][start:offsets[ri]])
+                            chunk_starts.append(start)
+                        sub_batch = pack_prefill_batch(
+                            request_ids=[requests[ri].request_id for ri in chunk_req],
+                            token_chunks=token_chunks,
+                            seq_lens=[offsets[ri] for ri in chunk_req],
+                            chunk_starts=chunk_starts,
+                            device=runtime_model.runtime.device,
+                            embedding_lookup=embedding_lookup,
+                            allow_device_greedy_sampling=allow_device_greedy_sampling,
+                            kv_allocations=[allocations[ri] for ri in chunk_req],
+                        )
+                        prefill_result = self._executor.run_prefill(runtime_model, sub_batch)
+                        sampled_ids = (
+                            prefill_result.sampled_token_ids.view(-1)
+                            if prefill_result.sampled_token_ids is not None
+                            else None
+                        )
+                        for row, ri in enumerate(chunk_req):
+                            if offsets[ri] < len(prompt_token_ids[ri]):
+                                continue
+                            completed_logits[ri] = self._select_batch_row(
+                                prefill_result.logits, row
+                            ).clone()
+                            if sampled_ids is not None:
+                                completed_sampled_ids[ri] = sampled_ids[row].clone()
                         # remove completed requests from the pool
                         for i in range(len(remaining) - 1, -1, -1):
                             ri = remaining[i][0]
@@ -276,24 +251,37 @@ class LLMEngine:
                                 del remaining[i]
                             else:
                                 remaining[i] = [ri, len(prompt_token_ids[ri]) - offsets[ri]]
-                        all_done = not remaining
-                        sub_batch = PrefillBatch(
-                            request_ids=[requests[ri].request_id for ri in chunk_req],
-                            token_ids=sub_tokens,
-                            input_embeddings=sub_emb,
-                            seq_lens=torch.tensor(
-                                sub_seq_lens, dtype=torch.int32,
-                                device=runtime_model.runtime.device,
-                            ),
-                            allow_device_greedy_sampling=(
-                                allow_device_greedy_sampling and all_done
-                            ),
-                            kv_allocations=[allocations[ri] for ri in chunk_req],
-                        )
-                        prefill_result = self._executor.run_prefill(
-                            runtime_model, sub_batch,
-                        )
+                if len(completed_logits) != len(requests):
+                    raise RuntimeError("Chunked prefill did not produce logits for every request")
+                prefill_logits = torch.stack(
+                    [completed_logits[request_idx] for request_idx in range(len(requests))]
+                )
+                prefill_sampled_token_ids = (
+                    torch.stack(
+                        [completed_sampled_ids[request_idx] for request_idx in range(len(requests))]
+                    )
+                    if allow_device_greedy_sampling and len(completed_sampled_ids) == len(requests)
+                    else None
+                )
             else:
+                prefill_batch = pack_prefill_batch(
+                    request_ids=[request.request_id for request in requests],
+                    token_chunks=prompt_token_ids,
+                    seq_lens=[len(token_ids) for token_ids in prompt_token_ids],
+                    chunk_starts=[0] * len(prompt_token_ids),
+                    device=runtime_model.runtime.device,
+                    embedding_lookup=embedding_lookup,
+                    allow_device_greedy_sampling=allow_device_greedy_sampling,
+                    kv_allocations=allocations,
+                )
+                fast_path_result = self._executor.try_generate_batch(
+                    record,
+                    requests,
+                    prefill_batch,
+                    generate_config,
+                )
+                if fast_path_result is not None:
+                    return fast_path_result
                 with self._executor.session():
                     prefill_result = self._executor.run_prefill(
                         runtime_model,
@@ -306,85 +294,85 @@ class LLMEngine:
                     else None
                 )
 
-                sampling_params = self._sampler.from_generate_config(generate_config)
-                current_tokens = self._sample_batch_rows(
-                    prefill_logits,
-                    sampling_params,
-                    len(requests),
-                    prefill_sampled_token_ids,
+            sampling_params = self._sampler.from_generate_config(generate_config)
+            current_tokens = self._sample_batch_rows(
+                prefill_logits,
+                sampling_params,
+                len(requests),
+                prefill_sampled_token_ids,
+            )
+            active_indices = list(range(len(requests)))
+            finish_reasons = ["length"] * len(requests)
+
+            for _ in range(generate_config.max_new_tokens):
+                next_active: list[int] = []
+                decode_tokens: list[int] = []
+                for request_idx in active_indices:
+                    request = requests[request_idx]
+                    current_token = current_tokens[request_idx]
+                    request.generated_token_ids.append(current_token)
+                    request.output_text = tokenizer.decode(request.generated_token_ids)
+
+                    if record.config.eos_token_id is not None and current_token == record.config.eos_token_id:
+                        finish_reasons[request_idx] = "eos"
+                        continue
+                    if any(stop and request.output_text.endswith(stop) for stop in generate_config.stop):
+                        finish_reasons[request_idx] = "stop"
+                        continue
+                    if len(request.generated_token_ids) >= generate_config.max_new_tokens:
+                        finish_reasons[request_idx] = "length"
+                        continue
+
+                    alloc = request.kv_allocation
+                    if alloc is None:
+                        raise RuntimeError("Request is missing KV allocation.")
+                    self._kv_cache_manager.ensure_one_more_slot(alloc)
+                    request.seq_len += 1
+                    next_active.append(request_idx)
+                    decode_tokens.append(current_token)
+
+                if not next_active:
+                    break
+
+                decode_token_tensor = torch.tensor(
+                    decode_tokens,
+                    dtype=torch.long,
+                    device=runtime_model.runtime.device,
                 )
-                active_indices = list(range(len(requests)))
-                finish_reasons = ["length"] * len(requests)
-
-                for _ in range(generate_config.max_new_tokens):
-                    next_active: list[int] = []
-                    decode_tokens: list[int] = []
-                    for request_idx in active_indices:
-                        request = requests[request_idx]
-                        current_token = current_tokens[request_idx]
-                        request.generated_token_ids.append(current_token)
-                        request.output_text = tokenizer.decode(request.generated_token_ids)
-
-                        if record.config.eos_token_id is not None and current_token == record.config.eos_token_id:
-                            finish_reasons[request_idx] = "eos"
-                            continue
-                        if any(stop and request.output_text.endswith(stop) for stop in generate_config.stop):
-                            finish_reasons[request_idx] = "stop"
-                            continue
-                        if len(request.generated_token_ids) >= generate_config.max_new_tokens:
-                            finish_reasons[request_idx] = "length"
-                            continue
-
-                        alloc = request.kv_allocation
-                        if alloc is None:
-                            raise RuntimeError("Request is missing KV allocation.")
-                        self._kv_cache_manager.ensure_one_more_slot(alloc)
-                        request.seq_len += 1
-                        next_active.append(request_idx)
-                        decode_tokens.append(current_token)
-
-                    if not next_active:
-                        break
-
-                    decode_token_tensor = torch.tensor(
-                        decode_tokens,
-                        dtype=torch.long,
-                        device=runtime_model.runtime.device,
-                    )
-                    decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
-                        runtime_model,
-                        decode_token_tensor,
-                    )
-                    active_allocations = []
-                    for idx in next_active:
-                        alloc = requests[idx].kv_allocation
-                        if alloc is None:
-                            raise RuntimeError("Request is missing KV allocation.")
-                        active_allocations.append(alloc)
-                    decode_result = self._executor.run_decode(
-                        runtime_model,
-                        DecodeBatch(
-                            request_ids=[requests[idx].request_id for idx in next_active],
-                            token_ids=decode_token_tensor.unsqueeze(1),
-                            hidden_states=decode_embeddings,
-                            seq_lens=torch.tensor(
-                                [requests[idx].seq_len for idx in next_active],
-                                dtype=torch.int32,
-                                device=runtime_model.runtime.device,
-                            ),
-                            allow_device_greedy_sampling=allow_device_greedy_sampling,
-                            kv_allocations=active_allocations,
+                decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
+                    runtime_model,
+                    decode_token_tensor,
+                )
+                active_allocations = []
+                for idx in next_active:
+                    alloc = requests[idx].kv_allocation
+                    if alloc is None:
+                        raise RuntimeError("Request is missing KV allocation.")
+                    active_allocations.append(alloc)
+                decode_result = self._executor.run_decode(
+                    runtime_model,
+                    DecodeBatch(
+                        request_ids=[requests[idx].request_id for idx in next_active],
+                        token_ids=decode_token_tensor.unsqueeze(1),
+                        hidden_states=decode_embeddings,
+                        seq_lens=torch.tensor(
+                            [requests[idx].seq_len for idx in next_active],
+                            dtype=torch.int32,
+                            device=runtime_model.runtime.device,
                         ),
-                    )
-                    decoded_tokens = self._sample_batch_rows(
-                        decode_result.logits,
-                        sampling_params,
-                        len(next_active),
-                        decode_result.sampled_token_ids if allow_device_greedy_sampling else None,
-                    )
-                    for row_idx, request_idx in enumerate(next_active):
-                        current_tokens[request_idx] = decoded_tokens[row_idx]
-                    active_indices = next_active
+                        allow_device_greedy_sampling=allow_device_greedy_sampling,
+                        kv_allocations=active_allocations,
+                    ),
+                )
+                decoded_tokens = self._sample_batch_rows(
+                    decode_result.logits,
+                    sampling_params,
+                    len(next_active),
+                    decode_result.sampled_token_ids if allow_device_greedy_sampling else None,
+                )
+                for row_idx, request_idx in enumerate(next_active):
+                    current_tokens[request_idx] = decoded_tokens[row_idx]
+                active_indices = next_active
         finally:
             for alloc in allocations:
                 self._kv_cache_manager.free(alloc)
@@ -427,25 +415,26 @@ class LLMEngine:
         )
 
         try:
-            token_tensor = torch.tensor(prompt_token_ids, dtype=torch.long, device=runtime_model.runtime.device)
-            embeddings = None
+            embedding_lookup = None
             if not self._executor.supports_device_embedding:
-                embeddings = self._executor.lookup_embeddings(runtime_model, token_tensor).unsqueeze(0)
+                embedding_lookup = lambda token_ids: self._executor.lookup_embeddings(
+                    runtime_model, token_ids
+                )
+
+            prefill_batch = pack_prefill_batch(
+                request_ids=[request.request_id],
+                token_chunks=[prompt_token_ids],
+                seq_lens=[len(prompt_token_ids)],
+                chunk_starts=[0],
+                device=runtime_model.runtime.device,
+                embedding_lookup=embedding_lookup,
+                kv_allocations=[alloc],
+            )
 
             with self._executor.session():
                 prefill_result = self._executor.run_prefill(
                     runtime_model,
-                    PrefillBatch(
-                        request_ids=[request.request_id],
-                        token_ids=token_tensor.unsqueeze(0),
-                        input_embeddings=embeddings,
-                        seq_lens=torch.tensor(
-                            [len(prompt_token_ids)],
-                            dtype=torch.int32,
-                            device=runtime_model.runtime.device,
-                        ),
-                        kv_allocations=[alloc],
-                    ),
+                    prefill_batch,
                 )
 
                 logits = self._select_batch_row(prefill_result.logits, 0)

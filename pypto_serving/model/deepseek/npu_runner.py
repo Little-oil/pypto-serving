@@ -1433,20 +1433,23 @@ class DeepSeekV4ModelRunner(ModelRunner):
         # pools. The same worker-resident shards are passed to decode, so no
         # parent-side cache snapshot or handoff is required.
         for index, (rank, groups) in enumerate(zip(ranks, group_rows, strict=True)):
-            actual_tokens = self._prefill_actual_tokens(batch, row=index)
-            positions = self._prefill_positions(batch, actual_tokens, row=index)
+            actual_tokens = batch.chunk_lens[index]
+            chunk_offset = batch.chunk_offsets[index]
+            chunk_start = batch.chunk_starts[index]
+            positions = list(range(chunk_start, chunk_start + actual_tokens))
             if positions[-1] >= model.runtime.max_seq_len:
                 raise ValueError(
                     f"prefill position {positions[-1]} exceeds max_seq_len={model.runtime.max_seq_len}"
                 )
+            chunk_end = chunk_offset + actual_tokens
+            embeddings = batch.input_embeddings[chunk_offset:chunk_end].to(torch.float32).cpu()
+            token_ids = batch.token_ids[chunk_offset:chunk_end].detach().cpu().to(torch.long)
             kernel_tokens = self._prefill_kernel_tokens(actual_tokens)
             kernel_positions = self._prefill_kernel_positions(
                 positions,
                 kernel_tokens=kernel_tokens,
                 max_seq_len=model.runtime.max_seq_len,
             )
-            embeddings = batch.input_embeddings[index, :actual_tokens].to(torch.float32).cpu()
-            token_ids = batch.token_ids[index, :actual_tokens].detach().cpu().to(torch.long)
             kernel_embeddings_by_request.append(self._padded_rows(embeddings, kernel_tokens))
             input_ids_by_request.append(
                 self._padded_vector(token_ids, layout.prefill_seq, dtype=torch.long)
@@ -4354,41 +4357,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         out = torch.full((length,), -1, dtype=mapping.dtype)
         out[: mapping.numel()].copy_(mapping.to(dtype=mapping.dtype))
         return out
-
-    @staticmethod
-    def _prefill_actual_tokens(batch: PrefillBatch, *, row: int = 0) -> int:
-        if batch.positions is not None:
-            valid = batch.positions[row].detach().cpu()
-            valid = valid[valid >= 0]
-            if valid.numel() <= 0:
-                raise ValueError("prefill positions must include at least one token")
-            return int(valid.numel())
-        seq_len = int(batch.seq_lens[row].item())
-        if seq_len <= 0:
-            raise ValueError("prefill seq_len must be positive")
-        return seq_len
-
-    @staticmethod
-    def _prefill_positions(
-        batch: PrefillBatch,
-        actual_tokens: int,
-        *,
-        row: int = 0,
-    ) -> list[int]:
-        if batch.positions is None:
-            positions = list(range(actual_tokens))
-        else:
-            raw = batch.positions[row, :actual_tokens].detach().cpu().to(torch.long)
-            positions = [int(pos) for pos in raw.tolist()]
-        if any(pos < 0 for pos in positions):
-            raise ValueError("prefill positions must be non-negative")
-        expected = list(range(positions[0], positions[0] + actual_tokens))
-        if positions != expected:
-            raise ValueError(
-                "prefill positions must form one contiguous chunk: "
-                f"positions={positions[:8]}{'...' if len(positions) > 8 else ''}"
-            )
-        return positions
 
     def _decode_assignment(self, batch: DecodeBatch) -> _DeepSeekV4DecodeAssignment:
         """Assign scheduler rows to the fixed rank-local decode tile."""
