@@ -1331,9 +1331,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._l3_cache_tensor_keys: set[tuple[int, tuple[int, ...], torch.dtype]] = set()
         self._cache_group_specs: tuple[KVCacheGroupSpec, ...] = ()
         self._cache_group_num_blocks: dict[str, int] = {}
-        self._cache_zero_page: torch.Tensor | None = None
         self._decode_device_cache: DeepSeekV4DeviceCache | None = None
-        self._decode_cache_block_ids: dict[str, dict[str, set[int]]] = {}
         self._global_weights: DeepSeekV4GlobalWeights | None = None
         self._static_final_norm_weight: torch.Tensor | None = None
         self._static_lm_head_weight: torch.Tensor | None = None
@@ -1372,7 +1370,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             layout=self._compiled.layout,
             hidden_size=config.hidden_size,
         )
-        self._decode_cache_block_ids.clear()
         self._cache_group_specs = self._resolve_cache_group_specs(config, runtime)
 
         # Shape/metadata-only unit tests construct a runner without compiled
@@ -1503,7 +1500,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             try:
                 self._materialize_decode_device_cache()
                 self._materialize_mtp_device_kv_cache()
-                self._zero_scratch_cache_blocks()
                 return capacity_slots
             except (RuntimeError, MemoryError) as exc:
                 self._free_device_caches()
@@ -1556,10 +1552,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError("DeepSeekV4 KV cache capacity is not initialized") from exc
 
     def release_finished_requests(self, request_ids: Iterable[str]) -> None:
-        """Discard cache ownership metadata for finished or preempted requests."""
+        """Discard request-local MTP state for finished or preempted requests."""
         request_ids = tuple(request_ids)
         for request_id in request_ids:
-            self._decode_cache_block_ids.pop(request_id, None)
             state = self._mtp_request_states.pop(request_id, None)
             if state is not None and state.proposed_tokens:
                 logger.info(
@@ -2252,15 +2247,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 self._ensure_l3_shared_buffers(model)
             with profile_span("DeepSeekV4ModelRunner.prefill.prepare_inputs", cat="executor"):
                 inputs = self.prepare_prefill_inputs(model, batch)
-        group_rows = self._normalize_group_block_ids(
-            batch.block_ids_by_group,
-            actual_batch=len(inputs.request_ids),
-        )
-        self._initialize_decode_cache_blocks(
-            inputs.request_ids,
-            inputs.ranks,
-            group_rows,
-        )
         with profile_span(
             "DeepSeekV4ModelRunner.prefill.prepare_fwd_args",
             cat="executor",
@@ -2399,11 +2385,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run the mode-independent packed main-model decode kernel."""
         with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
             inputs = self._stage_decode_inputs(prepared)
-        self._seed_decode_work_cache_from_group_ids(
-            inputs.request_ids,
-            inputs.ranks,
-            inputs.block_ids_by_group,
-        )
         decode_buffers = self._require_decode_buffers()
         x_hc = decode_buffers.x_hc_a
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
@@ -2516,7 +2497,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._ensure_decode_buffers(model.config.hidden_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
             self._ensure_mtp_buffers(model.config.hidden_size)
-            self._ensure_cache_zero_page()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_outputs", cat="executor"):
             self._require_prefill_output_buffer(model.config.hidden_size)
             self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
@@ -2561,7 +2541,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "freqs_sin": self._static_freqs_sin,
             "prefill_fwd_buffers": self._prefill_fwd_buffers,
             "decode_buffers": self._decode_buffers,
-            "cache_zero_page": self._cache_zero_page,
             "stacked_weights": self._stacked_host_weights or self._stacked_device_weights,
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
@@ -3732,144 +3711,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
 
-    def _seed_decode_work_cache_from_group_ids(
-        self,
-        request_ids: Sequence[str],
-        ranks: Sequence[int],
-        block_ids_by_group: Sequence[dict[str, tuple[int, ...]]],
-    ) -> None:
-        """Initialize scheduler-grown blocks; prefill already wrote the cache in place."""
-        self._initialize_decode_cache_blocks(request_ids, ranks, block_ids_by_group)
-
-    def _initialize_decode_cache_blocks(
-        self,
-        request_ids: Sequence[str],
-        ranks: Sequence[int],
-        block_ids_by_group: Sequence[dict[str, tuple[int, ...]]],
-    ) -> None:
-        """Clear newly owned physical blocks without disturbing resident cache state."""
-        if len(request_ids) != len(ranks) or len(ranks) != len(block_ids_by_group):
-            raise ValueError("decode request IDs, ranks, and grouped KV rows must have the same length")
-        if len(set(request_ids)) != len(request_ids):
-            raise ValueError("decode request IDs must be unique")
-        for request_id, rank, groups in zip(
-            request_ids,
-            ranks,
-            block_ids_by_group,
-            strict=True,
-        ):
-            initialized = self._decode_cache_block_ids.setdefault(request_id, {})
-            new_blocks = {
-                name: tuple(
-                    block_id
-                    for block_id in (int(value) for value in block_ids)
-                    if block_id not in initialized.get(name, set())
-                )
-                for name, block_ids in groups.items()
-            }
-            self._zero_device_cache_blocks(int(rank), new_blocks)
-            for name, block_ids in groups.items():
-                initialized.setdefault(name, set()).update(int(value) for value in block_ids)
-
-    def _zero_scratch_cache_blocks(self) -> None:
-        """Clear the tail pages used by inactive fixed kernel rows."""
-        layout = self._compiled.layout
-        for rank in range(layout.ranks):
-            self._zero_device_cache_blocks(
-                rank,
-                {
-                    name: tuple(
-                        block_id
-                        for (block_id,) in self._scratch_group_block_ids(
-                            group_name=name,
-                            kernel_rows=layout.decode_batch,
-                        )
-                    )
-                    for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-                },
-            )
-
-    def _zero_device_cache_blocks(
-        self,
-        rank: int,
-        block_ids_by_group: dict[str, Sequence[int]],
-    ) -> None:
-        """Clear selected pages in-place without a full host-side cache mirror."""
-        layout = self._compiled.layout
-        if not 0 <= rank < layout.ranks:
-            raise ValueError(f"DeepSeekV4 cache rank must be in [0, {layout.ranks - 1}]")
-        cache = self._decode_device_cache
-        worker = self._l3_worker
-        zero_page = self._cache_zero_page
-        if cache is None or worker is None or zero_page is None:
-            raise RuntimeError("DeepSeekV4 device cache must be materialized before clearing pages")
-        tensors_by_group = {
-            "ori": ((cache.kv_cache, DEEPSEEK_V4_FWD_NUM_LAYERS),),
-            "cmp": ((cache.cmp_kv, DEEPSEEK_V4_FWD_NUM_LAYERS),),
-            "idx": (
-                (cache.idx_kv_cache, DEEPSEEK_V4_CSA_NUM_LAYERS),
-                (cache.idx_kv_scale, DEEPSEEK_V4_CSA_NUM_LAYERS),
-            ),
-            "hca_state": (
-                (cache.hca_compress_state, DEEPSEEK_V4_HCA_NUM_LAYERS),
-            ),
-            "csa_state": (
-                (cache.csa_compress_state, DEEPSEEK_V4_CSA_NUM_LAYERS),
-            ),
-            "csa_inner_state": (
-                (cache.csa_inner_compress_state, DEEPSEEK_V4_CSA_NUM_LAYERS),
-            ),
-        }
-        unknown = sorted(set(block_ids_by_group) - set(tensors_by_group))
-        if unknown:
-            raise ValueError("unknown DeepSeekV4 cache groups: " + ", ".join(unknown))
-        for name, block_ids in block_ids_by_group.items():
-            ids = tuple(dict.fromkeys(int(block_id) for block_id in block_ids))
-            if not ids:
-                continue
-            blocks_per_layer = self._physical_cache_num_blocks(name)
-            if any(block_id < 0 or block_id >= blocks_per_layer for block_id in ids):
-                raise ValueError(
-                    f"DeepSeekV4 {name} block IDs must be in [0, {blocks_per_layer})"
-                )
-            for stacked, layer_count in tensors_by_group[name]:
-                shard = stacked.shards[rank]
-                worker_id = stacked.worker_ids[rank]
-                page_numel = math.prod(shard.shape[1:])
-                page_nbytes = page_numel * torch.empty((), dtype=shard.dtype).element_size()
-                if page_nbytes > zero_page.numel():
-                    raise RuntimeError(
-                        f"DeepSeekV4 zero page has {zero_page.numel()} bytes, "
-                        f"{name} needs {page_nbytes}"
-                    )
-                for layer in range(layer_count):
-                    for block_id in ids:
-                        flat_index = layer * blocks_per_layer + block_id
-                        worker.copy_to(
-                            shard.data_ptr + flat_index * page_nbytes,
-                            zero_page.data_ptr(),
-                            page_nbytes,
-                            worker_id=worker_id,
-                        )
-
-            if name == "ori" and self._mtp_device_kv_cache is not None:
-                stacked = self._mtp_device_kv_cache
-                shard = stacked.shards[rank]
-                worker_id = stacked.worker_ids[rank]
-                page_numel = math.prod(shard.shape[1:])
-                page_nbytes = page_numel * torch.empty((), dtype=shard.dtype).element_size()
-                if any(block_id < 0 or block_id >= blocks_per_layer for block_id in ids):
-                    raise ValueError(
-                        f"DeepSeekV4 {name} block IDs must be in [0, {blocks_per_layer})"
-                    )
-                for block_id in ids:
-                    worker.copy_to(
-                        shard.data_ptr + block_id * page_nbytes,
-                        zero_page.data_ptr(),
-                        page_nbytes,
-                        worker_id=worker_id,
-                    )
-
     def _logits_for_hidden(
         self,
         x_hc: torch.Tensor,
@@ -4242,6 +4083,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 worker = DistributedWorker(
                     compiled,
                     persistent=True,
+                    reset_persistent_windows=False,
                     inherited_host_tensors=self._inherited_host_weights(),
                 )
             self._l3_worker = worker
@@ -4253,29 +4095,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._mtp_buffers is not None:
             tensors.extend(self._mtp_buffers.weights.values())
         return tensors
-
-    def _ensure_cache_zero_page(self) -> torch.Tensor:
-        """Create one pre-fork zero source reused for device-page clearing."""
-        if self._cache_zero_page is not None:
-            return self._cache_zero_page
-        self._ensure_shared_host_allocation_before_worker("cache zero page")
-        max_page_bytes = max(
-            spec.spec.page_size_bytes // max(len(spec.layer_indices), 1)
-            for spec in self._cache_group_specs
-        )
-        max_page_bytes = max(
-            max_page_bytes,
-            self._compiled.layout.block_size
-            * DEEPSEEK_V4_HEAD_DIM
-            * torch.bfloat16.itemsize,
-        )
-        self._cache_zero_page = self._shared_empty(
-            (max_page_bytes,),
-            torch.uint8,
-            name="cache_zero_page",
-        )
-        self._cache_zero_page.zero_()
-        return self._cache_zero_page
 
     def _alloc_empty_stacked_tensor(
         self,
@@ -4464,7 +4283,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 worker.close()
         finally:
             self._l3_worker = None
-            self._cache_zero_page = None
             self._cache_group_num_blocks.clear()
             self._stacked_host_weights = None
             self._stacked_device_weights = None
@@ -4473,7 +4291,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._global_weights = None
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
-            self._decode_cache_block_ids.clear()
             self._mtp_request_states.clear()
             self._l3_static_tensors.clear()
             self._l3_cache_tensor_keys.clear()

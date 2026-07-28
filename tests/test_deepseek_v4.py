@@ -902,7 +902,6 @@ def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch
 
     monkeypatch.setattr(runner, "_materialize_decode_device_cache", allocate_main_cache)
     monkeypatch.setattr(runner, "_materialize_mtp_device_kv_cache", lambda: None)
-    monkeypatch.setattr(runner, "_zero_scratch_cache_blocks", lambda: None)
 
     assert runner._alloc_kv_cache_with_retry(8) == 2
     assert attempts == [8, 4, 2]
@@ -1213,7 +1212,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     )
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner._stage_decode_inputs = fake_stage
-    runner._seed_decode_work_cache_from_group_ids = lambda *args, **kwargs: None
     runner._require_decode_buffers = lambda: SimpleNamespace(
         x_hc_a=captured["prepared"].x_hc,
         pre_hc_hidden_out=torch.empty(
@@ -1308,10 +1306,9 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
         assert name not in prefill.tensors
 
 
-def test_deepseek_shared_buffer_setup_does_not_require_decode_work_cache(monkeypatch):
+def test_deepseek_shared_buffer_setup_does_not_require_cache_zeroing_buffers(monkeypatch):
     runner, model = _runner_for_prepared_inputs()
     runner._stacked_device_weights = object()
-    zero_page_calls = []
 
     for method_name in (
         "load_packed_global_weights",
@@ -1331,12 +1328,11 @@ def test_deepseek_shared_buffer_setup_does_not_require_decode_work_cache(monkeyp
         "_materialize_resident_weights",
     ):
         monkeypatch.setattr(runner, method_name, lambda *args, **kwargs: None)
-    monkeypatch.setattr(runner, "_ensure_cache_zero_page", lambda: zero_page_calls.append(True))
 
     runner._ensure_l3_shared_buffers(model)
 
-    assert zero_page_calls == [True]
     assert not hasattr(runner, "_decode_work_cache")
+    assert not hasattr(runner, "_cache_zero_page")
 
 
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
@@ -1375,12 +1371,8 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
 
 
-def test_deepseek_release_finished_requests_discards_request_owned_state():
+def test_deepseek_release_finished_requests_discards_mtp_state():
     runner, _model = _runner_for_prepared_inputs()
-    runner._decode_cache_block_ids = {
-        "req-a": {"ori": {0}},
-        "req-b": {"ori": {1}},
-    }
     runner._mtp_request_states = {
         "req-a": SimpleNamespace(proposed_tokens=0),
         "req-b": SimpleNamespace(proposed_tokens=0),
@@ -1388,7 +1380,6 @@ def test_deepseek_release_finished_requests_discards_request_owned_state():
 
     runner.release_finished_requests(["req-a"])
 
-    assert runner._decode_cache_block_ids == {"req-b": {"ori": {1}}}
     assert runner._mtp_request_states == {
         "req-b": SimpleNamespace(proposed_tokens=0),
     }
