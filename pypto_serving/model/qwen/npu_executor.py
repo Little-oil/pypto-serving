@@ -40,6 +40,36 @@ _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 128
 
 
+def _kernel_batch_pad(kernel_module: object) -> tuple[int, bool]:
+    """Return ``(padded row count, module predates the BATCH_PAD rename)``.
+
+    pypto-lib renamed this constant ``BATCH`` -> ``BATCH_PAD`` when decode's
+    public batch became dynamic, because the two meanings had been conflated:
+    ``BATCH_PAD`` is the padded pipeline width (the M of every matmul), while
+    the public batch is a runtime value read from the ``seq_lens`` descriptor.
+    Accept either spelling so this file works against a pypto-lib from before
+    or after that rename.
+
+    The second element reports only which pypto-lib generation the module came
+    from -- NOT that the stage itself takes a dynamic batch. Decode does;
+    greedy_sample carries the new spelling but is still fixed-batch. Callers
+    must apply their own stage's rule. The distinction matters because a
+    pre-rename decode writes exactly ``BATCH`` rows whatever the runtime batch,
+    so pointing it at buffers sized for a smaller ``max_batch_size`` would
+    overrun them.
+    """
+    value = getattr(kernel_module, "BATCH_PAD", None)
+    if value is not None:
+        return int(value), True
+    value = getattr(kernel_module, "BATCH", None)
+    if value is not None:
+        return int(value), False
+    raise AttributeError(
+        f"{getattr(kernel_module, '__name__', kernel_module)!r} exposes neither "
+        "BATCH_PAD nor BATCH; cannot determine the kernel's padded batch width"
+    )
+
+
 @dataclass
 class _KernelLayerWeights:
     """Kernel-ready weights for one transformer layer."""
@@ -183,12 +213,22 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 "out-of-bounds rope reads. Rebuild the kernel with a larger MAX_SEQ."
             )
 
-        if int(qwen3_decode_fwd.BATCH) != kernel_batch:
+        decode_batch_pad, decode_batch_is_dynamic = _kernel_batch_pad(qwen3_decode_fwd)
+        if decode_batch_is_dynamic:
+            if kernel_batch > decode_batch_pad:
+                raise ValueError(
+                    "decode_fwd.decode_fwd pads its pipeline to "
+                    f"{decode_batch_pad} rows, but runtime max_batch_size is "
+                    f"{kernel_batch}; the runtime batch must not exceed the "
+                    "padded width."
+                )
+        elif decode_batch_pad != kernel_batch:
             raise ValueError(
                 "decode_fwd.decode_fwd is compiled for a fixed kernel BATCH of "
-                f"{int(qwen3_decode_fwd.BATCH)}, but runtime max_batch_size is "
-                f"{kernel_batch}; they must match (decode statically computes and "
-                "writes BATCH rows / BATCH logit rows)."
+                f"{decode_batch_pad}, but runtime max_batch_size is "
+                f"{kernel_batch}; they must match (this pypto-lib predates the "
+                "dynamic public batch, so decode statically writes BATCH rows / "
+                "BATCH logit rows and would overrun smaller buffers)."
             )
         if int(model.config.num_hidden_layers) != int(qwen3_decode_fwd.NUM_LAYERS):
             raise ValueError(
@@ -214,10 +254,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
                 f"{int(qwen3_decode_fwd.REAL_VOCAB)}."
             )
-        if int(qwen3_greedy_sample.BATCH) != kernel_batch:
+        # greedy_sample_fwd is still a STATIC-batch stage (it was not converted
+        # alongside decode), so this stays an exact match rather than a bound.
+        greedy_sample_batch, _ = _kernel_batch_pad(qwen3_greedy_sample)
+        if greedy_sample_batch != kernel_batch:
             raise ValueError(
-                "greedy_sample_fwd is compiled for a fixed kernel BATCH of "
-                f"{int(qwen3_greedy_sample.BATCH)}, but runtime max_batch_size is {kernel_batch}."
+                "greedy_sample_fwd is compiled for a fixed kernel batch of "
+                f"{greedy_sample_batch}, but runtime max_batch_size is {kernel_batch}."
             )
         if int(qwen3_greedy_sample.VOCAB) != padded_vocab:
             raise ValueError(
