@@ -178,6 +178,31 @@ class KvCacheManager:
         """Return the total number of physical KV blocks."""
         return len(self.blocks)
 
+    def initialize(
+        self,
+        runtime: RuntimeConfig,
+        *,
+        num_blocks: int,
+    ) -> None:
+        """Initialize scheduler-visible pools from the runtime cache topology.
+
+        ``num_blocks`` is the device-reported capacity of the primary cache
+        group, or the complete capacity for a generic single cache pool.
+        """
+        num_blocks = int(num_blocks)
+        if num_blocks <= 0:
+            raise RuntimeError(
+                f"Worker reported invalid KV cache block count: {num_blocks}"
+            )
+        if runtime.kv_cache_groups:
+            self.init_groups(
+                runtime.kv_cache_groups,
+                max_batch_size=runtime.max_batch_size,
+                primary_num_blocks=num_blocks,
+            )
+            return
+        self._init_blocks(num_blocks, runtime.page_size)
+
     def _init_blocks(self, num_blocks: int, block_size: int) -> None:
         if self.blocks:
             if len(self.blocks) != num_blocks or self.block_size != block_size:
@@ -484,8 +509,16 @@ class KvCacheManager:
         group_specs: tuple[KVCacheGroupSpec, ...],
         *,
         max_batch_size: int,
+        primary_num_blocks: int | None = None,
     ) -> None:
-        """Initialize independent physical pools for model-specific caches."""
+        """Initialize independent physical pools for model-specific caches.
+
+        ``primary_num_blocks`` is the device-reported capacity of the first
+        group. All groups are scaled to the same number of
+        ``max_blocks_per_seq`` capacity slots, keeping heterogeneous physical
+        pools in lockstep with the runner's allocation. Explicit ``num_blocks``
+        values must agree with the device-reported capacity.
+        """
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         if not group_specs:
@@ -498,10 +531,49 @@ class KvCacheManager:
         if len(partition_counts) != 1:
             raise ValueError("KV cache groups must use the same num_partitions")
 
-        requested_sizes = {
-            group.name: group.num_blocks or max_batch_size * group.max_blocks_per_seq
-            for group in group_specs
-        }
+        capacity_slots = None
+        if primary_num_blocks is not None:
+            primary_num_blocks = int(primary_num_blocks)
+            primary_stride = group_specs[0].max_blocks_per_seq
+            if primary_num_blocks <= 0 or primary_num_blocks % primary_stride:
+                raise ValueError(
+                    "primary_num_blocks must be a positive multiple of the first "
+                    "KV cache group's max_blocks_per_seq"
+                )
+            capacity_slots = primary_num_blocks // primary_stride
+        if capacity_slots is not None:
+            requested_sizes = {
+                group.name: capacity_slots * group.max_blocks_per_seq
+                for group in group_specs
+            }
+            conflicting_sizes = [
+                (
+                    group.name,
+                    group.num_blocks,
+                    requested_sizes[group.name],
+                )
+                for group in group_specs
+                if group.num_blocks is not None
+                and group.num_blocks != requested_sizes[group.name]
+            ]
+            if conflicting_sizes:
+                details = ", ".join(
+                    f"{name} configured={configured}, device={device}"
+                    for name, configured, device in conflicting_sizes
+                )
+                raise ValueError(
+                    "KV cache group num_blocks conflicts with device-reported capacity: "
+                    + details
+                )
+        else:
+            requested_sizes = {
+                group.name: (
+                    group.num_blocks
+                    if group.num_blocks is not None
+                    else max_batch_size * group.max_blocks_per_seq
+                )
+                for group in group_specs
+            }
         undersized = [
             group.name
             for group in group_specs

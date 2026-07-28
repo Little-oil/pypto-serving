@@ -74,7 +74,6 @@ class _L3Callable:
 
     compiled: object
     name: str
-    block_dim: int
     aicpu_thread_num: int
     dispatch_args: tuple[Any, ...] = ()
     #: Fingerprint of this kernel's compile parameters; written into the cache
@@ -797,7 +796,6 @@ class Qwen314BModelRunner(ModelRunner):
         """Run a compiled HOST wrapper through the shared PyPTO L3 worker."""
         span_args = {
             "kernel": callable_spec.name,
-            "block_dim": callable_spec.block_dim,
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
         }
         with profile_span(

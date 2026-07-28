@@ -90,8 +90,8 @@ def _cache(tmp_path, code_fingerprint="v1+abcd"):
 
 # --- params fingerprint ----------------------------------------------------
 
-def _pf(name, args, platform="a2a3", block_dim=24):
-    return compute_params_fingerprint(name, args, platform=platform, block_dim=block_dim)
+def _pf(name, args, platform="a2a3"):
+    return compute_params_fingerprint(name, args, platform=platform)
 
 
 def test_params_fingerprint_is_stable():
@@ -105,10 +105,9 @@ def test_params_fingerprint_tracks_every_distinguishing_dimension():
     base = _pf("decode_fwd", args)
     # max_seq (shape) change -> the exact bug the name-only key missed
     assert base != _pf("decode_fwd", [_FakeTensor((16, 2048), "bfloat16")])
-    # dtype, platform, block_dim, and kernel name all distinguish a binary
+    # dtype, platform, and kernel name all distinguish a binary
     assert base != _pf("decode_fwd", [_FakeTensor((16, 512), "float32")])
     assert base != _pf("decode_fwd", args, platform="a2a3sim")
-    assert base != _pf("decode_fwd", args, block_dim=48)
     assert base != _pf("prefill_fwd", args)
 
 

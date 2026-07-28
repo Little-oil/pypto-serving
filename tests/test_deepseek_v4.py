@@ -16,6 +16,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from pypto.runtime import DeviceTensor
 
 import pypto_serving.cli.main as cli
 from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
@@ -30,7 +31,9 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
     accept_mtp_tokens,
+    build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
+    deepseek_v4_cache_blocks_for_slots,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4WeightStore,
@@ -317,6 +320,10 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][0].shape == (8, 8, 4, 4096)
     assert compiled_args["deepseek_v4_prefill"][0].dtype == torch.float32
     assert compiled_args["deepseek_v4_decode"][0].dtype == torch.float32
+    cache_blocks = executor._compile_cache_blocks(
+        loaded.runtime_model,
+        DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8),
+    )
     prefill_order = npu_executor._PREFILL_FWD_TENSOR_ORDER
     # Packed prefill flattens the FWD work caches to 5-D (kv_cache/cmp_kv stack x43,
     # idx_kv_cache stacks x21 across the CSA group) and stacks the compress-state
@@ -325,17 +332,31 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # per-rank copies (the kernel slices them per layer). The kernel emits
     # final-normalized hidden rows.
     prefill_args = compiled_args["deepseek_v4_prefill"]
-    assert prefill_args[prefill_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
-    assert prefill_args[prefill_order.index("cmp_kv")].shape == (8, 43 * 32, 128, 1, 512)
-    assert prefill_args[prefill_order.index("idx_kv_cache")].shape == (8, 21 * 64, 128, 1, 128)
+    assert prefill_args[prefill_order.index("kv_cache")].shape == (
+        8, 43 * cache_blocks["ori"], 128, 1, 512
+    )
+    assert prefill_args[prefill_order.index("cmp_kv")].shape == (
+        8, 43 * cache_blocks["cmp"], 128, 1, 512
+    )
+    assert prefill_args[prefill_order.index("idx_kv_cache")].shape == (
+        8, 21 * cache_blocks["idx"], 128, 1, 128
+    )
     assert prefill_args[prefill_order.index("idx_kv_cache")].dtype == torch.int8
-    assert prefill_args[prefill_order.index("idx_kv_scale")].shape == (8, 21 * 64, 128, 1, 1)
+    assert prefill_args[prefill_order.index("idx_kv_scale")].shape == (
+        8, 21 * cache_blocks["idx"], 128, 1, 1
+    )
     assert prefill_args[prefill_order.index("hca_cmp_wkv")].shape == (8, 20 * 512, 4096)
     assert prefill_args[prefill_order.index("csa_cmp_wkv")].shape == (8, 21 * 1024, 4096)
     assert prefill_args[prefill_order.index("csa_inner_wkv")].shape == (8, 21 * 256, 4096)
-    assert prefill_args[prefill_order.index("hca_compress_state")].shape == (8, 20 * 64, 8, 1024)
-    assert prefill_args[prefill_order.index("csa_compress_state")].shape == (8, 21 * 65, 4, 2048)
-    assert prefill_args[prefill_order.index("csa_inner_compress_state")].shape == (8, 21 * 65, 4, 512)
+    assert prefill_args[prefill_order.index("hca_compress_state")].shape == (
+        8, 20 * cache_blocks["hca_state"], 8, 1024
+    )
+    assert prefill_args[prefill_order.index("csa_compress_state")].shape == (
+        8, 21 * cache_blocks["csa_state"], 4, 2048
+    )
+    assert prefill_args[prefill_order.index("csa_inner_compress_state")].shape == (
+        8, 21 * cache_blocks["csa_inner_state"], 4, 512
+    )
     assert prefill_args[prefill_order.index("hca_compress_state_block_table")].shape == (8, 2048)
     assert prefill_args[prefill_order.index("csa_compress_state_block_table")].shape == (8, 4096)
     assert prefill_args[prefill_order.index("csa_inner_compress_state_block_table")].shape == (8, 4096)
@@ -357,13 +378,17 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert prefill_args[prefill_order.index("num_tokens_per_owner")].shape == (8,)
     assert prefill_args[prefill_order.index("logit_row_indices")].shape == (8, 8)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
-    # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
-    # groups, each layer holding decode_batch (4) x state_max_blocks rows.
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("hca_compress_state")].shape == (8, 20 * 64, 8, 1024)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_compress_state")].shape == (8, 21 * 65, 4, 2048)
+    # Cache tensor dimensions follow the runtime pool capacity; table depths
+    # remain the fixed kernel ABI below.
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("hca_compress_state")].shape == (
+        8, 20 * cache_blocks["hca_state"], 8, 1024
+    )
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_compress_state")].shape == (
+        8, 21 * cache_blocks["csa_state"], 4, 2048
+    )
     assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_inner_compress_state")].shape == (
         8,
-        21 * 65,
+        21 * cache_blocks["csa_inner_state"],
         4,
         512,
     )
@@ -383,12 +408,17 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
+    # Prefill and decode share the same runtime-sized physical pool.
     decode_args = compiled_args["deepseek_v4_decode"]
-    assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
+    assert decode_args[decode_order.index("kv_cache")].shape == (
+        8, 43 * cache_blocks["ori"], 128, 1, 512
+    )
     assert decode_args[decode_order.index("block_table")].shape == (8, 8, 128)
     assert decode_args[decode_order.index("idx_kv_cache")].dtype == torch.int8
-    assert decode_args[decode_order.index("idx_kv_scale")].shape == (8, 21 * 64, 128, 1, 1)
+    assert decode_args[decode_order.index("idx_kv_scale")].shape == (
+        8, 21 * cache_blocks["idx"], 128, 1, 1
+    )
     # SWA/HCA/CSA metadata all use the cache-first full window, plus the paged
     # write slot mapping.
     assert decode_args[decode_order.index("swa_slot_mapping")].shape == (8, 8)
@@ -784,6 +814,168 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
     assert hca_state_mapping.tolist() == [[64 * 8, 64 * 8 + 1, 64 * 8 + 2]]
 
 
+def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing():
+    compress_ratios = (0, 0, *([4] * 21), *([128] * 20))
+    specs = build_deepseek_v4_cache_group_specs(43, compress_ratios, decode_batch=8)
+    by_name = {spec.name: spec for spec in specs}
+
+    assert all(spec.num_blocks is None for spec in specs)
+    assert by_name["ori"].spec.page_size_bytes == 43 * 128 * 512 * 2
+    assert by_name["idx"].spec.page_size_bytes == 21 * 128 * (128 + 4)
+    assert by_name["hca_state"].spec.page_size_bytes == 20 * 8 * 1024 * 4
+    assert deepseek_v4_cache_blocks_for_slots(specs, 3) == {
+        "ori": 96,
+        "cmp": 24,
+        "idx": 48,
+        "hca_state": 48,
+        "csa_state": 48,
+        "csa_inner_state": 48,
+    }
+
+
+def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch):
+    layout = DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8)
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=tuple([0] * 43),
+            layer_plan=(),
+            kernel_dir="",
+            device_id=2,
+            device_ids=(2, 5),
+        )
+    )
+    runner._cache_group_specs = build_deepseek_v4_cache_group_specs(
+        43,
+        runner._compiled.compress_ratios,
+        decode_batch=layout.decode_batch,
+    )
+    memory = {
+        "npu:2": (5_000_000_000, 10_000_000_000),
+        "npu:5": (4_000_000_000, 10_000_000_000),
+    }
+    monkeypatch.setattr(torch.npu, "mem_get_info", lambda device: memory[device])
+    runtime = RuntimeConfig(npu_memory_utilization=0.8)
+
+    bytes_per_slot = sum(
+        spec.max_blocks_per_seq * spec.spec.page_size_bytes
+        for spec in runner._cache_group_specs
+    )
+    scratch_bytes = sum(
+        layout.decode_batch * spec.spec.page_size_bytes
+        for spec in runner._cache_group_specs
+    )
+    expected = max((2_000_000_000 - scratch_bytes) // bytes_per_slot, 1)
+
+    assert runner._compute_kv_cache_capacity_slots(runtime) == expected
+
+
+def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch):
+    layout = DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8)
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=tuple([0] * 43),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+    runner._cache_group_specs = build_deepseek_v4_cache_group_specs(
+        43,
+        runner._compiled.compress_ratios,
+        decode_batch=layout.decode_batch,
+    )
+    attempts = []
+
+    def allocate_main_cache():
+        slots = runner._cache_group_num_blocks["ori"] // 32
+        attempts.append(slots)
+        if slots > 2:
+            raise MemoryError("synthetic OOM")
+        return object()
+
+    monkeypatch.setattr(runner, "_materialize_decode_device_cache", allocate_main_cache)
+    monkeypatch.setattr(runner, "_materialize_mtp_device_kv_cache", lambda: None)
+
+    assert runner._alloc_kv_cache_with_retry(8) == 2
+    assert attempts == [8, 4, 2]
+    assert runner._cache_group_num_blocks == deepseek_v4_cache_blocks_for_slots(
+        runner._cache_group_specs,
+        2,
+    )
+
+
+def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        block_size=1,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=tuple([0] * 43),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+    runner._cache_group_num_blocks = {
+        name: 2
+        for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
+    }
+
+    class FakeWorker:
+        def __init__(self):
+            self.allocations = []
+            self.frees = []
+
+        def alloc_tensor(self, shape, dtype, *, worker_id=0):
+            tensor = DeviceTensor(
+                0x1000 + len(self.allocations) * 0x100,
+                tuple(shape),
+                dtype,
+            )
+            self.allocations.append((worker_id, tensor))
+            return tensor
+
+        def free_tensor(self, tensor, *, worker_id=0):
+            self.frees.append((worker_id, tensor))
+
+        def free_stacked_tensor(self, stacked):
+            for tensor, worker_id in zip(
+                stacked.shards,
+                stacked.worker_ids,
+                strict=True,
+            ):
+                self.free_tensor(tensor, worker_id=worker_id)
+
+    worker = FakeWorker()
+    runner._l3_worker = worker
+
+    cache = runner._materialize_decode_device_cache()
+
+    assert cache.kv_cache.full_shape == (2, 43 * 3, 1, 1, 512)
+    assert cache.cmp_kv.full_shape == (2, 43 * 3, 1, 1, 512)
+    assert cache.idx_kv_cache.full_shape == (2, 21 * 3, 1, 1, 128)
+    assert cache.hca_compress_state.full_shape == (2, 20 * 3, 8, 1024)
+    assert len(worker.allocations) == 14
+    assert {worker_id for worker_id, _tensor in worker.allocations} == {0, 1}
+
+    runner._free_device_caches()
+    assert len(worker.frees) == 14
+
+
 def _grouped_cache_rows(count: int) -> list[dict[str, list[int]]]:
     names = ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
     return [
@@ -1020,7 +1212,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     )
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner._stage_decode_inputs = fake_stage
-    runner._seed_decode_work_cache_from_group_ids = lambda *args, **kwargs: None
     runner._require_decode_buffers = lambda: SimpleNamespace(
         x_hc_a=captured["prepared"].x_hc,
         pre_hc_hidden_out=torch.empty(
@@ -1100,10 +1291,9 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
             freqs_sin=torch.empty((1, 1), dtype=torch.bfloat16),
         )
     )
-    cache = runner._ensure_decode_work_cache()
     prefill = runner._ensure_prefill_fwd_buffers(hidden_size=1)
 
-    assert cache is runner._decode_work_cache
+    assert not hasattr(runner, "_decode_work_cache")
     for name in (
         "kv_cache",
         "cmp_kv",
@@ -1114,6 +1304,35 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
         "csa_inner_compress_state",
     ):
         assert name not in prefill.tensors
+
+
+def test_deepseek_shared_buffer_setup_does_not_require_cache_zeroing_buffers(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    runner._stacked_device_weights = object()
+
+    for method_name in (
+        "load_packed_global_weights",
+        "_static_freqs_cos_tensor",
+        "_static_freqs_sin_tensor",
+        "_ensure_decode_buffers",
+        "_ensure_mtp_buffers",
+        "_require_prefill_output_buffer",
+        "_require_prefill_pre_hc_output_buffer",
+        "_require_prefill_logits_buffer",
+        "_static_final_norm_weight_tensor",
+        "_static_lm_head_weight_tensor",
+        "_require_decode_logits_buffer",
+        "_hc_head_tensors",
+        "_ensure_prefill_fwd_buffers",
+        "_assert_l3_shared_buffers_preallocated",
+        "_materialize_resident_weights",
+    ):
+        monkeypatch.setattr(runner, method_name, lambda *args, **kwargs: None)
+
+    runner._ensure_l3_shared_buffers(model)
+
+    assert not hasattr(runner, "_decode_work_cache")
+    assert not hasattr(runner, "_cache_zero_page")
 
 
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
@@ -1152,12 +1371,8 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
 
 
-def test_deepseek_release_finished_requests_discards_request_owned_state():
+def test_deepseek_release_finished_requests_discards_mtp_state():
     runner, _model = _runner_for_prepared_inputs()
-    runner._decode_cache_block_ids = {
-        "req-a": {"ori": {0}},
-        "req-b": {"ori": {1}},
-    }
     runner._mtp_request_states = {
         "req-a": SimpleNamespace(proposed_tokens=0),
         "req-b": SimpleNamespace(proposed_tokens=0),
@@ -1165,7 +1380,6 @@ def test_deepseek_release_finished_requests_discards_request_owned_state():
 
     runner.release_finished_requests(["req-a"])
 
-    assert runner._decode_cache_block_ids == {"req-b": {"ori": {1}}}
     assert runner._mtp_request_states == {
         "req-b": SimpleNamespace(proposed_tokens=0),
     }

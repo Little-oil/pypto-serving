@@ -42,7 +42,9 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4ModelRunner,
     _DECODE_FWD_TENSOR_ORDER,
     _PREFILL_FWD_TENSOR_ORDER,
+    build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
+    deepseek_v4_physical_cache_blocks,
     DEEPSEEK_V4_CSA_NUM_LAYERS,
     DEEPSEEK_V4_FWD_NUM_LAYERS,
     DEEPSEEK_V4_HCA_NUM_LAYERS,
@@ -436,6 +438,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     modules["prefill_mtp"].l3_mtp_prefill_fwd,
                     self._mtp_dummy_args(
                         modules["prefill_mtp"],
+                        model=model,
+                        layout=layout,
                         num_tokens=layout.prefill_seq,
                     ),
                 )
@@ -444,6 +448,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     modules["decode_mtp"].l3_mtp_decode_layer,
                     self._mtp_dummy_args(
                         modules["decode_mtp"],
+                        model=model,
+                        layout=layout,
                         num_tokens=layout.decode_tokens,
                     ),
                 )
@@ -457,6 +463,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             layer_plan=layer_plan,
             kernel_dir=str(self._kernel_dir),
+            runtime_model=model,
             prefill=prefill,
             decode=decode,
             mtp_prefill=mtp_prefill,
@@ -465,6 +472,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             freqs_sin=freqs_sin,
             platform=self._platform,
             device_id=self._device_ids[0],
+            device_ids=self._device_ids,
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
             enable_mtp=self._enable_mtp,
@@ -519,12 +527,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         self,
         mtp_module: object,
         *,
+        model: RuntimeModel,
+        layout: DeepSeekV4CacheLayout,
         num_tokens: int,
     ) -> tuple[Any, ...]:
         """Build shape-only dummy tensors in an MTP module's tensor-spec order."""
         args: list[Any] = []
         pypto_root = self._kernel_dir.parents[2]
         is_prefill = getattr(mtp_module, "__name__", "") == "prefill_mtp"
+        cache_blocks = self._compile_cache_blocks(model, layout)
         with _deepseek_v4_import_context(
             self._kernel_dir,
             pypto_root=pypto_root,
@@ -537,7 +548,16 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 if spec.name == "num_tokens":
                     args.append(self._int32_arg(num_tokens))
                 else:
-                    args.append(torch.empty(tuple(spec.shape), dtype=spec.dtype))
+                    shape = tuple(spec.shape)
+                    if spec.name == "kv_cache":
+                        shape = (
+                            layout.ranks,
+                            cache_blocks["ori"],
+                            layout.block_size,
+                            1,
+                            model.config.head_dim,
+                        )
+                    args.append(torch.empty(shape, dtype=spec.dtype))
         return tuple(args)
 
     def _compile_l3_callable(self, name: str, jit_fn: object, dummy_args: Sequence[Any]) -> DeepSeekV4L3Callable:
@@ -571,6 +591,33 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}")
         return DeepSeekV4L3Callable(compiled=compiled, name=name)
+
+    @staticmethod
+    def _compile_cache_blocks(
+        model: RuntimeModel,
+        layout: DeepSeekV4CacheLayout,
+    ) -> dict[str, int]:
+        """Return worst-case runtime pool shapes used for JIT dummy arguments.
+
+        Actual worker allocations are HBM-sized after compilation. Like Qwen's
+        paged kernels, DeepSeek kernels must derive their layer/page stride from
+        the runtime tensor shape rather than baking these dummy dimensions into
+        generated code.
+        """
+        specs = model.runtime.kv_cache_groups or build_deepseek_v4_cache_group_specs(
+            model.config.num_hidden_layers,
+            model.extra.get("compress_ratios"),
+            decode_batch=layout.decode_batch,
+        )
+        local_capacity_slots = max(
+            1,
+            (model.runtime.max_batch_size + layout.ranks - 1) // layout.ranks,
+        )
+        return deepseek_v4_physical_cache_blocks(
+            specs,
+            local_capacity_slots,
+            scratch_blocks=layout.decode_batch,
+        )
 
     def _prefill_dummy_args(
         self,
@@ -610,6 +657,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
         csa = DEEPSEEK_V4_CSA_NUM_LAYERS
         hca = DEEPSEEK_V4_HCA_NUM_LAYERS
+        cache_blocks = self._compile_cache_blocks(model, layout)
 
         def stacked(name: str, count: int) -> torch.Tensor:
             base = single[name]
@@ -638,7 +686,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hca_compress_state": torch.empty(
                     (
                         ranks,
-                        hca * layout.hca_state_max_blocks,
+                        hca * cache_blocks["hca_state"],
                         layout.c128_state_block_size,
                         DEEPSEEK_V4_HCA_STATE_DIM,
                     ),
@@ -652,7 +700,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.csa_state_max_blocks,
+                        csa * cache_blocks["csa_state"],
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_STATE_DIM,
                     ),
@@ -665,7 +713,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_inner_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.csa_inner_state_max_blocks,
+                        csa * cache_blocks["csa_inner_state"],
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_INNER_STATE_DIM,
                     ),
@@ -679,19 +727,19 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 # stacks across the 21 CSA layers. The kernel reshapes the fused
                 # layer x block axis internally.
                 "kv_cache": torch.empty(
-                    (ranks, fwd * layout.prefill_ori_max_blocks, layout.block_size, 1, head_dim),
+                    (ranks, fwd * cache_blocks["ori"], layout.block_size, 1, head_dim),
                     dtype=torch.bfloat16,
                 ),
                 "cmp_kv": torch.empty(
-                    (ranks, fwd * layout.prefill_cmp_block_num, layout.block_size, 1, head_dim),
+                    (ranks, fwd * cache_blocks["cmp"], layout.block_size, 1, head_dim),
                     dtype=torch.bfloat16,
                 ),
                 "idx_kv_cache": torch.empty(
-                    (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
+                    (ranks, csa * cache_blocks["idx"], layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
                     dtype=torch.int8,
                 ),
                 "idx_kv_scale": torch.empty(
-                    (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, 1),
+                    (ranks, csa * cache_blocks["idx"], layout.block_size, 1, 1),
                     dtype=torch.float32,
                 ),
                 # Shared single per-rank prefill metadata (the kernel passes each
@@ -768,6 +816,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
         csa = DEEPSEEK_V4_CSA_NUM_LAYERS
         hca = DEEPSEEK_V4_HCA_NUM_LAYERS
+        cache_blocks = self._compile_cache_blocks(model, layout)
 
         def stacked(name: str, count: int) -> torch.Tensor:
             base = single[name]
@@ -795,7 +844,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "kv_cache": torch.empty(
                     (
                         ranks,
-                        fwd * layout.decode_ori_max_blocks,
+                        fwd * cache_blocks["ori"],
                         layout.block_size,
                         1,
                         model.config.head_dim,
@@ -805,7 +854,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "cmp_kv": torch.empty(
                     (
                         ranks,
-                        fwd * layout.cmp_max_blocks,
+                        fwd * cache_blocks["cmp"],
                         layout.block_size,
                         1,
                         model.config.head_dim,
@@ -816,7 +865,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "idx_kv_cache": torch.empty(
                     (
                         ranks,
-                        csa * layout.idx_max_blocks,
+                        csa * cache_blocks["idx"],
                         layout.block_size,
                         1,
                         DEEPSEEK_V4_IDX_HEAD_DIM,
@@ -826,7 +875,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "idx_kv_scale": torch.empty(
                     (
                         ranks,
-                        csa * layout.idx_max_blocks,
+                        csa * cache_blocks["idx"],
                         layout.block_size,
                         1,
                         1,
@@ -836,7 +885,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.csa_state_max_blocks,
+                        csa * cache_blocks["csa_state"],
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_STATE_DIM,
                     ),
@@ -845,7 +894,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_inner_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.csa_inner_state_max_blocks,
+                        csa * cache_blocks["csa_inner_state"],
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_INNER_STATE_DIM,
                     ),
@@ -855,7 +904,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hca_compress_state": torch.empty(
                     (
                         ranks,
-                        hca * layout.hca_state_max_blocks,
+                        hca * cache_blocks["hca_state"],
                         layout.c128_state_block_size,
                         DEEPSEEK_V4_HCA_STATE_DIM,
                     ),
@@ -1064,10 +1113,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             "KV_ORI_TABLE_MAX_BLOCKS": layout.ori_table_max_blocks,
             "KV_CMP_MAX_BLOCKS": layout.cmp_max_blocks,
             "IDX_CACHE_MAX_BLOCKS": layout.idx_max_blocks,
-            "ORI_KV_BLOCK_NUM": layout.decode_ori_max_blocks,
-            "HCA_STATE_PHYSICAL_BLOCKS": layout.hca_state_max_blocks,
-            "CSA_STATE_PHYSICAL_BLOCKS": layout.csa_state_max_blocks,
-            "CSA_INNER_STATE_PHYSICAL_BLOCKS": layout.csa_inner_state_max_blocks,
             "PREFILL_ORI_MAX_BLOCKS": layout.prefill_ori_max_blocks,
             "PREFILL_CMP_MAX_BLOCKS": layout.prefill_cmp_max_blocks,
             "PREFILL_IDX_MAX_BLOCKS": layout.prefill_idx_max_blocks,
@@ -1080,13 +1125,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 mismatched.append(f"{name}={actual} expected {expected}")
         expected_module_constants = {
             "prefill_attention_hca.py": {
-                "HCA_STATE_BLOCK_NUM": layout.hca_state_max_blocks,
                 "HCA_STATE_MAX_BLOCKS": layout.prefill_hca_state_max_blocks,
             },
             "prefill_attention_csa.py": {
-                "CSA_STATE_BLOCK_NUM": layout.csa_state_max_blocks,
                 "CSA_STATE_MAX_BLOCKS": layout.prefill_csa_state_max_blocks,
-                "INNER_STATE_BLOCK_NUM": layout.csa_inner_state_max_blocks,
                 "INNER_STATE_MAX_BLOCKS": layout.prefill_csa_inner_state_max_blocks,
             },
         }

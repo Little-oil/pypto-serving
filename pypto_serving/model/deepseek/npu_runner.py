@@ -154,7 +154,14 @@ def build_deepseek_v4_cache_group_specs(
     *,
     decode_batch: int = DEEPSEEK_V4_DECODE_TOKENS,
 ) -> tuple[KVCacheGroupSpec, ...]:
-    """Describe cache namespaces and reserve padding pages for the decode specialization."""
+    """Describe cache namespaces independently from their runtime pool sizes.
+
+    ``max_blocks_per_seq`` is a per-request ring/table limit. The number of
+    physical blocks in each rank-local pool is intentionally left unset: the
+    runner fills available NPU memory after weights and persistent scratch have
+    been materialized, then the engine scales every group to the reported
+    runtime capacity.
+    """
     decode_batch = int(decode_batch)
     if decode_batch <= 0:
         raise ValueError("decode_batch must be positive")
@@ -172,6 +179,7 @@ def build_deepseek_v4_cache_group_specs(
         row_width: int,
         max_blocks: int,
         compress_ratio: int = 1,
+        extra_row_bytes: int = 0,
     ) -> KVCacheGroupSpec:
         if max_blocks <= decode_batch:
             raise ValueError(
@@ -183,21 +191,19 @@ def build_deepseek_v4_cache_group_specs(
             layer_indices=layers,
             spec=KVCacheSpec(
                 block_size=block_size,
-                page_size_bytes=block_size * row_width * element_bytes,
+                # One scheduler-visible block owns a page in every layer of
+                # this cache family. Keep the complete physical footprint here
+                # so all heterogeneous pools share one accurate HBM budget.
+                page_size_bytes=(
+                    len(layers)
+                    * block_size
+                    * (row_width * element_bytes + extra_row_bytes)
+                ),
                 compress_ratio=compress_ratio,
             ),
-            # One rank-local decode row owns one disjoint ring slice. This is
-            # the same fixed-pool partitioning used by pypto-lib's B4 host
-            # metadata, while allocation/release remains scheduler-owned.
+            # Each request may address this many pages through its logical ring;
+            # physical capacity across concurrent requests is runtime-sized.
             max_blocks_per_seq=blocks_per_request,
-            # pypto-lib exposes one fixed physical pool per DP rank. The
-            # scheduler shares that pool across the rank-local decode rows and
-            # applies backpressure when their combined working sets do not fit.
-            # Attention/compressor kernels execute every fixed B row even when
-            # MoE receives a smaller num_tokens prefix. Reserve one physical
-            # scratch page per kernel row so padding can never alias a live
-            # scheduler-owned page.
-            num_blocks=max_blocks - decode_batch,
             num_partitions=DEEPSEEK_V4_RANKS,
         )
 
@@ -224,10 +230,12 @@ def build_deepseek_v4_cache_group_specs(
             "idx",
             csa_layers,
             block_size=DEEPSEEK_V4_BLOCK_SIZE,
-            element_bytes=2,
+            element_bytes=1,
             row_width=DEEPSEEK_V4_IDX_HEAD_DIM,
             max_blocks=DEEPSEEK_V4_IDX_MAX_BLOCKS,
             compress_ratio=4,
+            # One float32 scale accompanies every int8 index-cache row.
+            extra_row_bytes=4,
         ),
         group(
             "hca_state",
@@ -254,6 +262,52 @@ def build_deepseek_v4_cache_group_specs(
             max_blocks=DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
         ),
     )
+
+
+DEEPSEEK_V4_CACHE_GROUP_NAMES = (
+    "ori",
+    "cmp",
+    "idx",
+    "hca_state",
+    "csa_state",
+    "csa_inner_state",
+)
+
+
+def deepseek_v4_cache_blocks_for_slots(
+    group_specs: Sequence[KVCacheGroupSpec],
+    capacity_slots: int,
+) -> dict[str, int]:
+    """Return scheduler-visible blocks per rank for ``capacity_slots`` requests."""
+    capacity_slots = int(capacity_slots)
+    if capacity_slots <= 0:
+        raise ValueError("DeepSeekV4 cache capacity_slots must be positive")
+    specs = {spec.name: spec for spec in group_specs}
+    missing = [name for name in DEEPSEEK_V4_CACHE_GROUP_NAMES if name not in specs]
+    if missing:
+        raise ValueError("missing DeepSeekV4 cache groups: " + ", ".join(missing))
+    return {
+        name: capacity_slots * specs[name].max_blocks_per_seq
+        for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
+    }
+
+
+def deepseek_v4_physical_cache_blocks(
+    group_specs: Sequence[KVCacheGroupSpec],
+    capacity_slots: int,
+    *,
+    scratch_blocks: int,
+) -> dict[str, int]:
+    """Return physical blocks per rank, including isolated padding pages."""
+    if scratch_blocks <= 0:
+        raise ValueError("DeepSeekV4 scratch_blocks must be positive")
+    return {
+        name: num_blocks + int(scratch_blocks)
+        for name, num_blocks in deepseek_v4_cache_blocks_for_slots(
+            group_specs,
+            capacity_slots,
+        ).items()
+    }
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
@@ -510,7 +564,12 @@ _DECODE_INPUT_TENSOR_FIELDS = (
 
 @dataclass(frozen=True)
 class DeepSeekV4CacheLayout:
-    """Static cache layout baked into the current DeepSeekV4 kernels."""
+    """Kernel table depths and fixed execution dimensions.
+
+    Physical cache-pool sizes are runtime state on ``DeepSeekV4ModelRunner``;
+    the ``*_max_blocks`` fields here only bound per-request metadata tables and
+    provide compatibility defaults for shape-only callers.
+    """
 
     ranks: int = DEEPSEEK_V4_RANKS
     hc_mult: int = DEEPSEEK_V4_HC_MULT
@@ -536,16 +595,6 @@ class DeepSeekV4CacheLayout:
     prefill_hca_state_max_blocks: int = DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS
     prefill_csa_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
     prefill_csa_inner_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
-
-    @property
-    def prefill_cmp_block_num(self) -> int:
-        """Physical cmp_kv blocks per layer in the packed prefill kernel."""
-        return self.prefill_cmp_max_blocks
-
-    @property
-    def prefill_idx_block_num(self) -> int:
-        """Physical idx_kv_cache blocks per CSA layer in the packed prefill kernel."""
-        return self.prefill_idx_max_blocks
 
     def validate_runtime(self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]) -> None:
         """Validate serving/runtime options against kernel-fixed dimensions."""
@@ -976,19 +1025,6 @@ class _TransientDeviceTensor:
 
 
 @dataclass
-class DeepSeekV4LayerCache:
-    """Shared host backing for the rank-sharded DeepSeekV4 cache pools."""
-
-    kv_cache: torch.Tensor
-    cmp_kv: torch.Tensor
-    idx_kv_cache: torch.Tensor
-    idx_kv_scale: torch.Tensor
-    hca_compress_state: torch.Tensor
-    csa_compress_state: torch.Tensor
-    csa_inner_compress_state: torch.Tensor
-
-
-@dataclass
 class DeepSeekV4DeviceCache:
     """Worker-resident rank shards shared by packed prefill and decode."""
 
@@ -1012,6 +1048,7 @@ class DeepSeekV4CompiledKernels:
     compress_ratios: tuple[int, ...]
     layer_plan: tuple["DeepSeekV4LayerPlan", ...]
     kernel_dir: str
+    runtime_model: RuntimeModel | None = None
     prefill: DeepSeekV4L3Callable | None = None
     decode: DeepSeekV4L3Callable | None = None
     mtp_prefill: DeepSeekV4L3Callable | None = None
@@ -1020,6 +1057,7 @@ class DeepSeekV4CompiledKernels:
     freqs_sin: torch.Tensor | None = None
     platform: str = "a2a3"
     device_id: int = 0
+    device_ids: tuple[int, ...] = ()
     n_routed_experts: int = 256
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
@@ -1291,9 +1329,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             tuple[int, tuple[int, ...], torch.dtype], StackedDeviceTensor
         ] = {}
         self._l3_cache_tensor_keys: set[tuple[int, tuple[int, ...], torch.dtype]] = set()
-        self._decode_work_cache: DeepSeekV4LayerCache | None = None
+        self._cache_group_specs: tuple[KVCacheGroupSpec, ...] = ()
+        self._cache_group_num_blocks: dict[str, int] = {}
         self._decode_device_cache: DeepSeekV4DeviceCache | None = None
-        self._decode_cache_block_ids: dict[str, dict[str, set[int]]] = {}
         self._global_weights: DeepSeekV4GlobalWeights | None = None
         self._static_final_norm_weight: torch.Tensor | None = None
         self._static_lm_head_weight: torch.Tensor | None = None
@@ -1322,27 +1360,226 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._prefill_completion = self._ignore_prefill_context
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
-        """Initialize runner state and return scheduler-only KV block capacity.
+        """Allocate heterogeneous cache pools from the post-weight HBM budget.
 
-        DeepSeekV4 owns its model-specific cache tensors, while the scheduler's
-        grouped ``KvCacheManager`` is the sole owner of request partitions and
-        block IDs. No generic KV tensors are allocated here.
+        The returned value is the scheduler-visible ``ori`` block count in one
+        rank-local partition. Other group capacities are derived from the same
+        number of maximum-sequence cache slots by ``KvCacheManager``.
         """
         self.input_builder = DeepSeekV4InputBuilder(
             layout=self._compiled.layout,
             hidden_size=config.hidden_size,
         )
-        self._decode_cache_block_ids.clear()
+        self._cache_group_specs = self._resolve_cache_group_specs(config, runtime)
+
+        # Shape/metadata-only unit tests construct a runner without compiled
+        # callables. Preserve a deterministic fixed fallback for that path; the
+        # production executor always attaches the RuntimeModel and callables.
+        model = self._compiled.runtime_model
+        if model is None or not self._compiled.l3_callables():
+            self._cache_group_num_blocks = self._fallback_cache_group_num_blocks()
+            return self._cache_group_num_blocks["ori"]
+
+        logger.info("[init_kv_cache] preparing DeepSeekV4 worker and resident weights …")
+        self._ensure_l3_shared_buffers(model)
+
+        requested_slots = self._compute_kv_cache_capacity_slots(runtime)
+        allocated_slots = self._alloc_kv_cache_with_retry(requested_slots)
+        self._log_kv_cache_allocation(runtime, requested_slots, allocated_slots)
+        return self._cache_group_num_blocks["ori"]
+
+    def _resolve_cache_group_specs(
+        self,
+        config: ModelConfig,
+        runtime: RuntimeConfig,
+    ) -> tuple[KVCacheGroupSpec, ...]:
+        specs = runtime.kv_cache_groups or build_deepseek_v4_cache_group_specs(
+            config.num_hidden_layers,
+            self._compiled.compress_ratios,
+            decode_batch=self._compiled.layout.decode_batch,
+        )
+        names = tuple(spec.name for spec in specs)
+        if names != DEEPSEEK_V4_CACHE_GROUP_NAMES:
+            raise ValueError(
+                "DeepSeekV4 KV cache groups must be ordered as "
+                + ", ".join(DEEPSEEK_V4_CACHE_GROUP_NAMES)
+                + f"; got {names}"
+            )
+        if any(spec.num_partitions != self._compiled.layout.ranks for spec in specs):
+            raise ValueError(
+                f"DeepSeekV4 KV cache groups must use {self._compiled.layout.ranks} partitions"
+            )
+        return tuple(specs)
+
+    def _fallback_cache_group_num_blocks(self) -> dict[str, int]:
+        """Return aligned fixed capacities for shape-only/non-runtime callers."""
+        layout = self._compiled.layout
+        physical_limits = {
+            "ori": layout.decode_ori_max_blocks,
+            "cmp": layout.cmp_max_blocks,
+            "idx": layout.idx_max_blocks,
+            "hca_state": layout.hca_state_max_blocks,
+            "csa_state": layout.csa_state_max_blocks,
+            "csa_inner_state": layout.csa_inner_state_max_blocks,
+        }
+        specs = {spec.name: spec for spec in self._cache_group_specs}
+        capacity_slots = min(
+            (physical_limits[name] - layout.decode_batch)
+            // specs[name].max_blocks_per_seq
+            for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
+        )
+        if capacity_slots <= 0:
+            raise RuntimeError(
+                "DeepSeekV4 fixed fallback cache cannot hold one maximum-length "
+                "sequence after reserving decode scratch blocks"
+            )
+        return deepseek_v4_cache_blocks_for_slots(
+            self._cache_group_specs,
+            capacity_slots,
+        )
+
+    def _compute_kv_cache_capacity_slots(self, runtime: RuntimeConfig) -> int:
+        """Compute common cache slots using Qwen's utilization-budget formula."""
+        ori_spec = self._cache_group_specs[0]
         if runtime.total_kv_pages is not None:
-            return int(runtime.total_kv_pages)
-        max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
-        return int(runtime.max_batch_size * max_blocks_per_seq)
+            requested_pages = int(runtime.total_kv_pages)
+            if requested_pages < ori_spec.max_blocks_per_seq:
+                raise ValueError(
+                    "DeepSeekV4 total_kv_pages must hold at least one maximum ring: "
+                    f"expected >= {ori_spec.max_blocks_per_seq}, got {requested_pages}"
+                )
+            return requested_pages // ori_spec.max_blocks_per_seq
+
+        device_ids = self._compiled.device_ids or (self._compiled.device_id,)
+        utilization = float(getattr(runtime, "npu_memory_utilization", 0.90))
+        budgets = []
+        memory_rows = []
+        for device_id in device_ids:
+            free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+            peak_non_kv = int(total_bytes) - int(free_bytes)
+            budget = int(int(total_bytes) * utilization - peak_non_kv)
+            budgets.append(budget)
+            memory_rows.append((int(device_id), int(free_bytes), int(total_bytes), budget))
+
+        bytes_per_slot = sum(
+            spec.max_blocks_per_seq * spec.spec.page_size_bytes
+            for spec in self._cache_group_specs
+        )
+        scratch_bytes = sum(
+            self._compiled.layout.decode_batch * spec.spec.page_size_bytes
+            for spec in self._cache_group_specs
+        )
+        # The optional MTP layer addresses the same ori IDs but owns a separate
+        # one-layer BF16 pool.
+        mtp_page_bytes = (
+            self._compiled.layout.block_size * DEEPSEEK_V4_HEAD_DIM * torch.bfloat16.itemsize
+            if self._compiled.enable_mtp
+            else 0
+        )
+        bytes_per_slot += ori_spec.max_blocks_per_seq * mtp_page_bytes
+        scratch_bytes += self._compiled.layout.decode_batch * mtp_page_bytes
+
+        kv_budget = min(budgets)
+        minimum_bytes = scratch_bytes + bytes_per_slot
+        if kv_budget < minimum_bytes:
+            device_id, free_bytes, total_bytes, budget = min(
+                memory_rows,
+                key=lambda row: row[3],
+            )
+            raise RuntimeError(
+                "DeepSeekV4 KV cache cannot fit one capacity slot within "
+                f"npu_memory_utilization={utilization:.2f} on npu:{device_id}: "
+                f"post-weight budget={budget} bytes, requires at least "
+                f"{minimum_bytes} bytes ({scratch_bytes} scratch + "
+                f"{bytes_per_slot} one slot); total={total_bytes} bytes, "
+                f"free={free_bytes} bytes"
+            )
+        capacity_slots = (kv_budget - scratch_bytes) // bytes_per_slot
+        logger.info(
+            "DeepSeekV4 KV cache sizing: utilization=%.2f, limiting_budget=%.2f GB, "
+            "slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
+            utilization,
+            kv_budget / 1e9,
+            bytes_per_slot / 1e6,
+            scratch_bytes / 1e6,
+            capacity_slots,
+        )
+        for device_id, free_bytes, total_bytes, budget in memory_rows:
+            logger.info(
+                "  npu:%d total=%.2f GB free=%.2f GB post-weight KV budget=%.2f GB",
+                device_id,
+                total_bytes / 1e9,
+                free_bytes / 1e9,
+                budget / 1e9,
+            )
+        return int(capacity_slots)
+
+    def _alloc_kv_cache_with_retry(self, requested_slots: int) -> int:
+        """Allocate every cache family atomically, halving capacity on OOM."""
+        capacity_slots = max(int(requested_slots), 1)
+        while capacity_slots >= 1:
+            self._cache_group_num_blocks = deepseek_v4_cache_blocks_for_slots(
+                self._cache_group_specs,
+                capacity_slots,
+            )
+            try:
+                self._materialize_decode_device_cache()
+                self._materialize_mtp_device_kv_cache()
+                return capacity_slots
+            except (RuntimeError, MemoryError) as exc:
+                self._free_device_caches()
+                if capacity_slots == 1:
+                    raise RuntimeError(
+                        "DeepSeekV4 KV cache allocation failed at the one-slot minimum"
+                    ) from exc
+                previous = capacity_slots
+                capacity_slots = max(capacity_slots // 2, 1)
+                logger.warning(
+                    "DeepSeekV4 KV cache allocation failed (%s); retrying slots %d -> %d",
+                    exc,
+                    previous,
+                    capacity_slots,
+                )
+        raise RuntimeError("DeepSeekV4 KV cache allocation failed")
+
+    def _log_kv_cache_allocation(
+        self,
+        runtime: RuntimeConfig,
+        requested_slots: int,
+        allocated_slots: int,
+    ) -> None:
+        main_bytes = sum(
+            self._physical_cache_num_blocks(spec.name) * spec.spec.page_size_bytes
+            for spec in self._cache_group_specs
+        )
+        mtp_bytes = 0
+        if self._compiled.enable_mtp:
+            mtp_bytes = (
+                self._physical_cache_num_blocks("ori")
+                * self._compiled.layout.block_size
+                * DEEPSEEK_V4_HEAD_DIM
+                * torch.bfloat16.itemsize
+            )
+        logger.info(
+            "[init_kv_cache] allocated DeepSeekV4 cache: slots=%d (requested=%d), "
+            "per-rank=%.2f GB, ori_blocks=%d, max_seq_len=%d",
+            allocated_slots,
+            requested_slots,
+            (main_bytes + mtp_bytes) / 1e9,
+            self._cache_group_num_blocks["ori"],
+            runtime.max_seq_len,
+        )
+
+    def _physical_cache_num_blocks(self, group_name: str) -> int:
+        try:
+            return self._cache_group_num_blocks[group_name] + self._compiled.layout.decode_batch
+        except KeyError as exc:
+            raise RuntimeError("DeepSeekV4 KV cache capacity is not initialized") from exc
 
     def release_finished_requests(self, request_ids: Iterable[str]) -> None:
-        """Discard cache ownership metadata for finished or preempted requests."""
+        """Discard request-local MTP state for finished or preempted requests."""
         request_ids = tuple(request_ids)
         for request_id in request_ids:
-            self._decode_cache_block_ids.pop(request_id, None)
             state = self._mtp_request_states.pop(request_id, None)
             if state is not None and state.proposed_tokens:
                 logger.info(
@@ -1733,15 +1970,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "csa_inner_state_slot_mapping",
             )
         }
-        group_limits = {
-            "ori": layout.decode_ori_max_blocks,
-            "cmp": layout.cmp_max_blocks,
-            "idx": layout.idx_max_blocks,
-            "hca_state": layout.hca_state_max_blocks,
-            "csa_state": layout.csa_state_max_blocks,
-            "csa_inner_state": layout.csa_inner_state_max_blocks,
-        }
-
         for rank, request_indices in enumerate(indices_by_rank):
             if request_indices:
                 local_positions = [positions[index] for index in request_indices]
@@ -1764,16 +1992,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 padded_positions.append(local_positions[0])
 
             padded_group_ids = {}
-            for name, max_blocks in group_limits.items():
+            for name in DEEPSEEK_V4_CACHE_GROUP_NAMES:
                 if local_groups:
                     padded_group_ids[name] = self._pad_group_block_ids(
                         [groups[name] for groups in local_groups],
-                        max_blocks=max_blocks,
+                        group_name=name,
                         kernel_rows=layout.decode_batch,
                     )
                 else:
                     padded_group_ids[name] = self._scratch_group_block_ids(
-                        max_blocks=max_blocks,
+                        group_name=name,
                         kernel_rows=layout.decode_batch,
                     )
 
@@ -1975,14 +2203,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         return tuple(normalized)
 
-    @staticmethod
     def _pad_group_block_ids(
+        self,
         active_rows: Sequence[Sequence[int]],
         *,
-        max_blocks: int,
+        group_name: str,
         kernel_rows: int,
     ) -> tuple[tuple[int, ...], ...]:
-        """Pad inactive kernel rows without expanding pypto-lib's fixed pools."""
+        """Pad inactive rows with pages at the tail of a dynamic cache pool."""
         if not active_rows or len(active_rows) > kernel_rows:
             raise ValueError("active grouped KV rows must fit the kernel batch")
         normalized = [tuple(int(block_id) for block_id in row) for row in active_rows]
@@ -1991,15 +2219,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
         used = [block_id for row in normalized for block_id in row]
         if len(used) != len(set(used)):
             raise ValueError("active grouped KV rows must not share physical blocks")
-        scratch = DeepSeekV4ModelRunner._scratch_group_block_ids(
-            max_blocks=max_blocks,
+        scratch = self._scratch_group_block_ids(
+            group_name=group_name,
             kernel_rows=kernel_rows,
         )
-        allocator_blocks = max_blocks - kernel_rows
+        try:
+            allocator_blocks = self._cache_group_num_blocks[group_name]
+        except KeyError as exc:
+            raise ValueError(f"unknown DeepSeekV4 cache group: {group_name}") from exc
         if any(block_id < 0 or block_id >= allocator_blocks for block_id in used):
             raise ValueError(
                 f"grouped KV block IDs must be in [0, {allocator_blocks}); "
-                f"[{allocator_blocks}, {max_blocks}) is reserved for kernel padding"
+                f"[{allocator_blocks}, {allocator_blocks + kernel_rows}) is reserved "
+                "for kernel padding"
             )
         padded = list(normalized)
         # Attention and compressor cache writes are fixed-B and are not fully
@@ -2008,16 +2240,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
         padded.extend(scratch[: kernel_rows - len(normalized)])
         return tuple(padded)
 
-    @staticmethod
     def _scratch_group_block_ids(
+        self,
         *,
-        max_blocks: int,
+        group_name: str,
         kernel_rows: int,
     ) -> tuple[tuple[int, ...], ...]:
         """Return one isolated physical scratch page for every fixed kernel row."""
-        if kernel_rows <= 0 or max_blocks <= kernel_rows:
+        if kernel_rows <= 0:
+            raise ValueError("kernel_rows must be positive")
+        try:
+            first = self._cache_group_num_blocks[group_name]
+        except KeyError as exc:
+            raise ValueError(f"unknown DeepSeekV4 cache group: {group_name}") from exc
+        if self._physical_cache_num_blocks(group_name) < first + kernel_rows:
             raise ValueError("cache pool must provide one scratch page per kernel row")
-        first = max_blocks - kernel_rows
         return tuple((first + row,) for row in range(kernel_rows))
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
@@ -2035,15 +2272,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 self._ensure_l3_shared_buffers(model)
             with profile_span("DeepSeekV4ModelRunner.prefill.prepare_inputs", cat="executor"):
                 inputs = self.prepare_prefill_inputs(model, batch)
-        group_rows = self._normalize_group_block_ids(
-            batch.block_ids_by_group,
-            actual_batch=len(inputs.request_ids),
-        )
-        self._initialize_decode_cache_blocks(
-            inputs.request_ids,
-            inputs.ranks,
-            group_rows,
-        )
         with profile_span(
             "DeepSeekV4ModelRunner.prefill.prepare_fwd_args",
             cat="executor",
@@ -2182,11 +2410,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run the mode-independent packed main-model decode kernel."""
         with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
             inputs = self._stage_decode_inputs(prepared)
-        self._seed_decode_work_cache_from_group_ids(
-            inputs.request_ids,
-            inputs.ranks,
-            inputs.block_ids_by_group,
-        )
         decode_buffers = self._require_decode_buffers()
         x_hc = decode_buffers.x_hc_a
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
@@ -2299,8 +2522,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._ensure_decode_buffers(model.config.hidden_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
             self._ensure_mtp_buffers(model.config.hidden_size)
-        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_work_cache", cat="executor"):
-            self._ensure_decode_work_cache()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_outputs", cat="executor"):
             self._require_prefill_output_buffer(model.config.hidden_size)
             self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
@@ -2345,7 +2566,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "freqs_sin": self._static_freqs_sin,
             "prefill_fwd_buffers": self._prefill_fwd_buffers,
             "decode_buffers": self._decode_buffers,
-            "decode_work_cache": self._decode_work_cache,
             "stacked_weights": self._stacked_host_weights or self._stacked_device_weights,
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
@@ -2758,7 +2978,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 ]
                 padded_blocks = self._pad_group_block_ids(
                     active_blocks,
-                    max_blocks=layout.prefill_ori_max_blocks,
+                    group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
@@ -2769,7 +2989,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     padded_positions.append(tuple(int(value) for value in fallback_positions.tolist()))
             else:
                 padded_blocks = self._scratch_group_block_ids(
-                    max_blocks=layout.prefill_ori_max_blocks,
+                    group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
@@ -3155,10 +3375,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         hidden = int(hidden_size)
         loaded = self.load_mtp_weights()
         weights = dict(loaded.tensors)
+        # The real MTP pool is allocated directly on each worker after runtime
+        # HBM sizing. Keep only a one-page shared placeholder here so legacy
+        # buffer consumers retain the unified prefill/decode object contract.
         mtp_kv_cache = self._shared_empty(
-            (ranks, layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
+            (ranks, 1, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
             torch.bfloat16,
-            name="mtp_unified_kv_cache",
+            name="mtp_kv_cache_placeholder",
         )
         self._mtp_buffers = _DeepSeekV4MtpSharedBuffers(
             weights=weights,
@@ -3512,157 +3735,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._ensure_shared_host_allocation_before_worker("freqs_sin")
             self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
-
-    def _seed_decode_work_cache_from_group_ids(
-        self,
-        request_ids: Sequence[str],
-        ranks: Sequence[int],
-        block_ids_by_group: Sequence[dict[str, tuple[int, ...]]],
-    ) -> None:
-        """Initialize scheduler-grown blocks; prefill already wrote the cache in place."""
-        self._initialize_decode_cache_blocks(request_ids, ranks, block_ids_by_group)
-
-    def _initialize_decode_cache_blocks(
-        self,
-        request_ids: Sequence[str],
-        ranks: Sequence[int],
-        block_ids_by_group: Sequence[dict[str, tuple[int, ...]]],
-    ) -> None:
-        """Clear newly owned physical blocks without disturbing resident cache state."""
-        if len(request_ids) != len(ranks) or len(ranks) != len(block_ids_by_group):
-            raise ValueError("decode request IDs, ranks, and grouped KV rows must have the same length")
-        if len(set(request_ids)) != len(request_ids):
-            raise ValueError("decode request IDs must be unique")
-        cache = self._require_decode_work_cache()
-        dirty: dict[int, dict[str, set[int]]] = {}
-        for request_id, rank, groups in zip(
-            request_ids,
-            ranks,
-            block_ids_by_group,
-            strict=True,
-        ):
-            initialized = self._decode_cache_block_ids.setdefault(request_id, {})
-            new_blocks = {
-                name: tuple(
-                    block_id
-                    for block_id in (int(value) for value in block_ids)
-                    if block_id not in initialized.get(name, set())
-                )
-                for name, block_ids in groups.items()
-            }
-            self._zero_decode_work_cache_blocks(cache, int(rank), new_blocks)
-            rank_dirty = dirty.setdefault(int(rank), {})
-            for name, block_ids in new_blocks.items():
-                rank_dirty.setdefault(name, set()).update(block_ids)
-            for name, block_ids in groups.items():
-                initialized.setdefault(name, set()).update(int(value) for value in block_ids)
-        self._sync_decode_work_cache_blocks(cache, dirty)
-
-    def _zero_decode_work_cache_blocks(
-        self,
-        cache: DeepSeekV4LayerCache,
-        rank: int,
-        block_ids_by_group: dict[str, Sequence[int]],
-    ) -> None:
-        """Clear newly assigned rank-local pages across every stacked layer."""
-        layout = self._compiled.layout
-        if not 0 <= rank < layout.ranks:
-            raise ValueError(f"DeepSeekV4 cache rank must be in [0, {layout.ranks - 1}]")
-        tensors_by_group = {
-            "ori": ((cache.kv_cache, DEEPSEEK_V4_FWD_NUM_LAYERS, layout.decode_ori_max_blocks),),
-            "cmp": ((cache.cmp_kv, DEEPSEEK_V4_FWD_NUM_LAYERS, layout.cmp_max_blocks),),
-            "idx": (
-                (cache.idx_kv_cache, DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-                (cache.idx_kv_scale, DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-            ),
-            "hca_state": (
-                (cache.hca_compress_state, DEEPSEEK_V4_HCA_NUM_LAYERS, layout.hca_state_max_blocks),
-            ),
-            "csa_state": (
-                (cache.csa_compress_state, DEEPSEEK_V4_CSA_NUM_LAYERS, layout.csa_state_max_blocks),
-            ),
-            "csa_inner_state": (
-                (
-                    cache.csa_inner_compress_state,
-                    DEEPSEEK_V4_CSA_NUM_LAYERS,
-                    layout.csa_inner_state_max_blocks,
-                ),
-            ),
-        }
-        unknown = sorted(set(block_ids_by_group) - set(tensors_by_group))
-        if unknown:
-            raise ValueError("unknown DeepSeekV4 cache groups: " + ", ".join(unknown))
-        for name, block_ids in block_ids_by_group.items():
-            ids = tuple(dict.fromkeys(int(block_id) for block_id in block_ids))
-            if not ids:
-                continue
-            for tensor, layer_count, blocks_per_layer in tensors_by_group[name]:
-                if any(block_id < 0 or block_id >= blocks_per_layer for block_id in ids):
-                    raise ValueError(
-                        f"DeepSeekV4 {name} block IDs must be in [0, {blocks_per_layer})"
-                    )
-                pages = tensor[rank].reshape(
-                    layer_count,
-                    blocks_per_layer,
-                    *tensor.shape[2:],
-                )
-                pages.index_fill_(1, torch.tensor(ids, dtype=torch.long), 0)
-
-    def _sync_decode_work_cache_blocks(
-        self,
-        host: DeepSeekV4LayerCache,
-        dirty_by_rank: dict[int, dict[str, set[int]]],
-    ) -> None:
-        """Upload only newly cleared pages when the cache is already resident."""
-        device = self._decode_device_cache
-        worker = self._l3_worker
-        if device is None:
-            return
-        if worker is None:
-            raise RuntimeError("DeepSeekV4 resident cache exists without an L3 worker")
-        layout = self._compiled.layout
-        tensors_by_group = {
-            "ori": ((host.kv_cache, device.kv_cache, DEEPSEEK_V4_FWD_NUM_LAYERS, layout.decode_ori_max_blocks),),
-            "cmp": ((host.cmp_kv, device.cmp_kv, DEEPSEEK_V4_FWD_NUM_LAYERS, layout.cmp_max_blocks),),
-            "idx": (
-                (host.idx_kv_cache, device.idx_kv_cache, DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-                (host.idx_kv_scale, device.idx_kv_scale, DEEPSEEK_V4_CSA_NUM_LAYERS, layout.idx_max_blocks),
-            ),
-            "hca_state": ((
-                host.hca_compress_state,
-                device.hca_compress_state,
-                DEEPSEEK_V4_HCA_NUM_LAYERS,
-                layout.hca_state_max_blocks,
-            ),),
-            "csa_state": ((
-                host.csa_compress_state,
-                device.csa_compress_state,
-                DEEPSEEK_V4_CSA_NUM_LAYERS,
-                layout.csa_state_max_blocks,
-            ),),
-            "csa_inner_state": ((
-                host.csa_inner_compress_state,
-                device.csa_inner_compress_state,
-                DEEPSEEK_V4_CSA_NUM_LAYERS,
-                layout.csa_inner_state_max_blocks,
-            ),),
-        }
-        for rank, groups in dirty_by_rank.items():
-            for name, block_ids in groups.items():
-                for host_tensor, stacked, layer_count, blocks_per_layer in tensors_by_group[name]:
-                    shard = stacked.shards[rank]
-                    worker_id = stacked.worker_ids[rank]
-                    page_nbytes = host_tensor[rank, 0].numel() * host_tensor.element_size()
-                    for layer in range(layer_count):
-                        for block_id in block_ids:
-                            flat_index = layer * blocks_per_layer + int(block_id)
-                            page = host_tensor[rank, flat_index]
-                            worker.copy_to(
-                                shard.data_ptr + flat_index * page_nbytes,
-                                page.data_ptr(),
-                                page_nbytes,
-                                worker_id=worker_id,
-                            )
 
     def _logits_for_hidden(
         self,
@@ -4036,6 +4108,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 worker = DistributedWorker(
                     compiled,
                     persistent=True,
+                    reset_persistent_windows=False,
                     inherited_host_tensors=self._inherited_host_weights(),
                 )
             self._l3_worker = worker
@@ -4048,135 +4121,114 @@ class DeepSeekV4ModelRunner(ModelRunner):
             tensors.extend(self._mtp_buffers.weights.values())
         return tensors
 
-    def _ensure_decode_work_cache(self) -> DeepSeekV4LayerCache:
-        cache = self._decode_work_cache
-        if cache is not None:
-            return cache
-        self._ensure_shared_host_allocation_before_worker("decode work cache")
-        layout = self._compiled.layout
-        fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
-        csa_layers = DEEPSEEK_V4_CSA_NUM_LAYERS
-        hca_layers = DEEPSEEK_V4_HCA_NUM_LAYERS
-        cache = DeepSeekV4LayerCache(
-            kv_cache=self._shared_empty(
-                (
-                    layout.ranks,
-                    fwd_layers * layout.decode_ori_max_blocks,
-                    layout.block_size,
-                    1,
-                    DEEPSEEK_V4_HEAD_DIM,
-                ),
-                torch.bfloat16,
-                name="decode_work_kv_cache",
-            ),
-            cmp_kv=self._shared_empty(
-                (
-                    layout.ranks,
-                    fwd_layers * layout.cmp_max_blocks,
-                    layout.block_size,
-                    1,
-                    DEEPSEEK_V4_HEAD_DIM,
-                ),
-                torch.bfloat16,
-                name="decode_work_cmp_kv",
-            ),
-            idx_kv_cache=self._shared_empty(
-                (
-                    layout.ranks,
-                    csa_layers * layout.idx_max_blocks,
-                    layout.block_size,
-                    1,
-                    DEEPSEEK_V4_IDX_HEAD_DIM,
-                ),
-                torch.int8,
-                name="decode_work_idx_kv_cache",
-            ),
-            idx_kv_scale=self._shared_empty(
-                (
-                    layout.ranks,
-                    csa_layers * layout.idx_max_blocks,
-                    layout.block_size,
-                    1,
-                    1,
-                ),
-                torch.float32,
-                name="decode_work_idx_kv_scale",
-            ),
-            hca_compress_state=self._shared_empty(
-                (
-                    layout.ranks,
-                    hca_layers * layout.hca_state_max_blocks,
-                    layout.c128_state_block_size,
-                    DEEPSEEK_V4_HCA_STATE_DIM,
-                ),
-                torch.float32,
-                name="decode_work_hca_compress_state",
-            ),
-            csa_compress_state=self._shared_empty(
-                (
-                    layout.ranks,
-                    csa_layers * layout.csa_state_max_blocks,
-                    layout.c4_state_block_size,
-                    DEEPSEEK_V4_CSA_STATE_DIM,
-                ),
-                torch.float32,
-                name="decode_work_csa_compress_state",
-            ),
-            csa_inner_compress_state=self._shared_empty(
-                (
-                    layout.ranks,
-                    csa_layers * layout.csa_inner_state_max_blocks,
-                    layout.c4_state_block_size,
-                    DEEPSEEK_V4_CSA_INNER_STATE_DIM,
-                ),
-                torch.float32,
-                name="decode_work_csa_inner_compress_state",
-            ),
-        )
-        for tensor in (
-            cache.kv_cache,
-            cache.cmp_kv,
-            cache.idx_kv_cache,
-            cache.idx_kv_scale,
-            cache.hca_compress_state,
-            cache.csa_compress_state,
-            cache.csa_inner_compress_state,
-        ):
-            tensor.zero_()
-        self._decode_work_cache = cache
-        return cache
-
-    def _require_decode_work_cache(self) -> DeepSeekV4LayerCache:
-        if self._decode_work_cache is None:
-            raise RuntimeError("DeepSeekV4 decode work cache was not allocated before the L3 worker started")
-        return self._decode_work_cache
+    def _alloc_empty_stacked_tensor(
+        self,
+        full_shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> StackedDeviceTensor:
+        """Allocate an uninitialized shard directly on every chip worker."""
+        worker = self._shared_l3_worker()
+        worker_ids = tuple(range(self._compiled.layout.ranks))
+        shards: list[DeviceTensor] = []
+        try:
+            for worker_id in worker_ids:
+                shards.append(
+                    worker.alloc_tensor(
+                        full_shape[1:],
+                        dtype,
+                        worker_id=worker_id,
+                    )
+                )
+        except Exception:
+            for shard, worker_id in zip(shards, worker_ids, strict=False):
+                worker.free_tensor(shard, worker_id=worker_id)
+            raise
+        return StackedDeviceTensor(shards, full_shape, worker_ids)
 
     def _materialize_decode_device_cache(self) -> DeepSeekV4DeviceCache:
-        """Upload one shard per rank once and keep all cache pools worker-resident."""
+        """Allocate dynamically sized cache shards directly on each NPU."""
         cache = self._decode_device_cache
         if cache is not None:
             return cache
-        host = self._require_decode_work_cache()
         worker = self._shared_l3_worker()
         allocated: list[StackedDeviceTensor] = []
+        layout = self._compiled.layout
 
-        def resident(tensor: torch.Tensor) -> StackedDeviceTensor:
-            stacked = worker.alloc_stacked_tensor(
-                tensor,
-                worker_ids=range(self._compiled.layout.ranks),
-            )
+        def resident(shape: tuple[int, ...], dtype: torch.dtype) -> StackedDeviceTensor:
+            stacked = self._alloc_empty_stacked_tensor(shape, dtype)
             allocated.append(stacked)
             return stacked
 
         try:
             cache = DeepSeekV4DeviceCache(
-                kv_cache=resident(host.kv_cache),
-                cmp_kv=resident(host.cmp_kv),
-                idx_kv_cache=resident(host.idx_kv_cache),
-                idx_kv_scale=resident(host.idx_kv_scale),
-                hca_compress_state=resident(host.hca_compress_state),
-                csa_compress_state=resident(host.csa_compress_state),
-                csa_inner_compress_state=resident(host.csa_inner_compress_state),
+                kv_cache=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_FWD_NUM_LAYERS * self._physical_cache_num_blocks("ori"),
+                        layout.block_size,
+                        1,
+                        DEEPSEEK_V4_HEAD_DIM,
+                    ),
+                    torch.bfloat16,
+                ),
+                cmp_kv=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_FWD_NUM_LAYERS * self._physical_cache_num_blocks("cmp"),
+                        layout.block_size,
+                        1,
+                        DEEPSEEK_V4_HEAD_DIM,
+                    ),
+                    torch.bfloat16,
+                ),
+                idx_kv_cache=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS * self._physical_cache_num_blocks("idx"),
+                        layout.block_size,
+                        1,
+                        DEEPSEEK_V4_IDX_HEAD_DIM,
+                    ),
+                    torch.int8,
+                ),
+                idx_kv_scale=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS * self._physical_cache_num_blocks("idx"),
+                        layout.block_size,
+                        1,
+                        1,
+                    ),
+                    torch.float32,
+                ),
+                hca_compress_state=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_HCA_NUM_LAYERS * self._physical_cache_num_blocks("hca_state"),
+                        layout.c128_state_block_size,
+                        DEEPSEEK_V4_HCA_STATE_DIM,
+                    ),
+                    torch.float32,
+                ),
+                csa_compress_state=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS * self._physical_cache_num_blocks("csa_state"),
+                        layout.c4_state_block_size,
+                        DEEPSEEK_V4_CSA_STATE_DIM,
+                    ),
+                    torch.float32,
+                ),
+                csa_inner_compress_state=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS
+                        * self._physical_cache_num_blocks("csa_inner_state"),
+                        layout.c4_state_block_size,
+                        DEEPSEEK_V4_CSA_INNER_STATE_DIM,
+                    ),
+                    torch.float32,
+                ),
             )
         except Exception:
             for tensor in allocated:
@@ -4193,12 +4245,42 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers = self._mtp_buffers
         if buffers is None:
             return None
-        cache = self._shared_l3_worker().alloc_stacked_tensor(
-            buffers.prefill_kv_cache,
-            worker_ids=range(self._compiled.layout.ranks),
+        layout = self._compiled.layout
+        cache = self._alloc_empty_stacked_tensor(
+            (
+                layout.ranks,
+                self._physical_cache_num_blocks("ori"),
+                layout.block_size,
+                1,
+                DEEPSEEK_V4_HEAD_DIM,
+            ),
+            torch.bfloat16,
         )
         self._mtp_device_kv_cache = cache
         return cache
+
+    def _free_device_caches(self) -> None:
+        worker = self._l3_worker
+        if worker is None:
+            self._decode_device_cache = None
+            self._mtp_device_kv_cache = None
+            return
+        cache = self._decode_device_cache
+        if cache is not None:
+            for tensor in (
+                cache.kv_cache,
+                cache.cmp_kv,
+                cache.idx_kv_cache,
+                cache.idx_kv_scale,
+                cache.hca_compress_state,
+                cache.csa_compress_state,
+                cache.csa_inner_compress_state,
+            ):
+                worker.free_stacked_tensor(tensor)
+        if self._mtp_device_kv_cache is not None:
+            worker.free_stacked_tensor(self._mtp_device_kv_cache)
+        self._decode_device_cache = None
+        self._mtp_device_kv_cache = None
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -4226,7 +4308,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 worker.close()
         finally:
             self._l3_worker = None
-            self._decode_work_cache = None
+            self._cache_group_num_blocks.clear()
             self._stacked_host_weights = None
             self._stacked_device_weights = None
             self._mtp_device_weights = None
@@ -4234,7 +4316,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._global_weights = None
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
-            self._decode_cache_block_ids.clear()
             self._mtp_request_states.clear()
             self._l3_static_tensors.clear()
             self._l3_cache_tensor_keys.clear()
