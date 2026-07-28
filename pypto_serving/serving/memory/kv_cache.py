@@ -489,9 +489,10 @@ class KvCacheManager:
         """Initialize independent physical pools for model-specific caches.
 
         ``primary_num_blocks`` is the device-reported capacity of the first
-        group. Unspecified groups are scaled to the same number of
+        group. All groups are scaled to the same number of
         ``max_blocks_per_seq`` capacity slots, keeping heterogeneous physical
-        pools in lockstep with the runner's allocation.
+        pools in lockstep with the runner's allocation. Explicit ``num_blocks``
+        values must agree with the device-reported capacity.
         """
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
@@ -515,17 +516,39 @@ class KvCacheManager:
                     "KV cache group's max_blocks_per_seq"
                 )
             capacity_slots = primary_num_blocks // primary_stride
-        requested_sizes = {
-            group.name: (
-                group.num_blocks
-                or (
-                    capacity_slots * group.max_blocks_per_seq
-                    if capacity_slots is not None
+        if capacity_slots is not None:
+            requested_sizes = {
+                group.name: capacity_slots * group.max_blocks_per_seq
+                for group in group_specs
+            }
+            conflicting_sizes = [
+                (
+                    group.name,
+                    group.num_blocks,
+                    requested_sizes[group.name],
+                )
+                for group in group_specs
+                if group.num_blocks is not None
+                and group.num_blocks != requested_sizes[group.name]
+            ]
+            if conflicting_sizes:
+                details = ", ".join(
+                    f"{name} configured={configured}, device={device}"
+                    for name, configured, device in conflicting_sizes
+                )
+                raise ValueError(
+                    "KV cache group num_blocks conflicts with device-reported capacity: "
+                    + details
+                )
+        else:
+            requested_sizes = {
+                group.name: (
+                    group.num_blocks
+                    if group.num_blocks is not None
                     else max_batch_size * group.max_blocks_per_seq
                 )
-            )
-            for group in group_specs
-        }
+                for group in group_specs
+            }
         undersized = [
             group.name
             for group in group_specs

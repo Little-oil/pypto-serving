@@ -1412,7 +1412,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return tuple(specs)
 
     def _fallback_cache_group_num_blocks(self) -> dict[str, int]:
-        """Return the old fixed capacities for shape-only/non-runtime callers."""
+        """Return aligned fixed capacities for shape-only/non-runtime callers."""
         layout = self._compiled.layout
         physical_limits = {
             "ori": layout.decode_ori_max_blocks,
@@ -1422,10 +1422,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "csa_state": layout.csa_state_max_blocks,
             "csa_inner_state": layout.csa_inner_state_max_blocks,
         }
-        return {
-            name: max(1, physical_limits[name] - layout.decode_batch)
+        specs = {spec.name: spec for spec in self._cache_group_specs}
+        capacity_slots = min(
+            (physical_limits[name] - layout.decode_batch)
+            // specs[name].max_blocks_per_seq
             for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-        }
+        )
+        if capacity_slots <= 0:
+            raise RuntimeError(
+                "DeepSeekV4 fixed fallback cache cannot hold one maximum-length "
+                "sequence after reserving decode scratch blocks"
+            )
+        return deepseek_v4_cache_blocks_for_slots(
+            self._cache_group_specs,
+            capacity_slots,
+        )
 
     def _compute_kv_cache_capacity_slots(self, runtime: RuntimeConfig) -> int:
         """Compute common cache slots using Qwen's utilization-budget formula."""
@@ -1469,7 +1480,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
         scratch_bytes += self._compiled.layout.decode_batch * mtp_page_bytes
 
         kv_budget = min(budgets)
-        capacity_slots = max((kv_budget - scratch_bytes) // bytes_per_slot, 1)
+        minimum_bytes = scratch_bytes + bytes_per_slot
+        if kv_budget < minimum_bytes:
+            device_id, free_bytes, total_bytes, budget = min(
+                memory_rows,
+                key=lambda row: row[3],
+            )
+            raise RuntimeError(
+                "DeepSeekV4 KV cache cannot fit one capacity slot within "
+                f"npu_memory_utilization={utilization:.2f} on npu:{device_id}: "
+                f"post-weight budget={budget} bytes, requires at least "
+                f"{minimum_bytes} bytes ({scratch_bytes} scratch + "
+                f"{bytes_per_slot} one slot); total={total_bytes} bytes, "
+                f"free={free_bytes} bytes"
+            )
+        capacity_slots = (kv_budget - scratch_bytes) // bytes_per_slot
         logger.info(
             "DeepSeekV4 KV cache sizing: utilization=%.2f, limiting_budget=%.2f GB, "
             "slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
