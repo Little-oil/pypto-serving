@@ -178,6 +178,31 @@ class KvCacheManager:
         """Return the total number of physical KV blocks."""
         return len(self.blocks)
 
+    def initialize(
+        self,
+        runtime: RuntimeConfig,
+        *,
+        num_blocks: int,
+    ) -> None:
+        """Initialize scheduler-visible pools from the runtime cache topology.
+
+        ``num_blocks`` is the device-reported capacity of the primary cache
+        group, or the complete capacity for a generic single cache pool.
+        """
+        num_blocks = int(num_blocks)
+        if num_blocks <= 0:
+            raise RuntimeError(
+                f"Worker reported invalid KV cache block count: {num_blocks}"
+            )
+        if runtime.kv_cache_groups:
+            self.init_groups(
+                runtime.kv_cache_groups,
+                max_batch_size=runtime.max_batch_size,
+                primary_num_blocks=num_blocks,
+            )
+            return
+        self._init_blocks(num_blocks, runtime.page_size)
+
     def _init_blocks(self, num_blocks: int, block_size: int) -> None:
         if self.blocks:
             if len(self.blocks) != num_blocks or self.block_size != block_size:

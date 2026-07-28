@@ -234,16 +234,11 @@ class ReplicaEngineCore:
             # size. Grouped runners report the first group's rank-local block
             # count; generic runners report their single-pool page count.
             reported_num_blocks = num_pages_value.value
-            if reported_num_blocks <= 0:
-                raise RuntimeError(
-                    f"Worker reported invalid KV cache block count: {reported_num_blocks}"
-                )
-            if self._runtime.kv_cache_groups:
-                self.kv_cache_manager.init_groups(
-                    self._runtime.kv_cache_groups,
-                    max_batch_size=self._runtime.max_batch_size,
-                    primary_num_blocks=reported_num_blocks,
-                )
+            self.kv_cache_manager.initialize(
+                self._runtime,
+                num_blocks=reported_num_blocks,
+            )
+            if self.kv_cache_manager.has_groups:
                 logger.info(
                     "Grouped KV cache pools initialised: %s",
                     ", ".join(
@@ -252,7 +247,6 @@ class ReplicaEngineCore:
                     ),
                 )
             else:
-                self.kv_cache_manager._init_blocks(reported_num_blocks, self._runtime.page_size)
                 logger.info(
                     "KV cache block pool initialised: num_blocks=%d, block_size=%d",
                     reported_num_blocks,
