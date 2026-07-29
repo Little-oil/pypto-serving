@@ -923,10 +923,18 @@ class DeepSeekV4InputBuilder:
         *,
         ranks: Sequence[int],
         local_rows: Sequence[int],
+        out: torch.Tensor | None = None,
+        fill_all: bool = True,
     ) -> torch.Tensor:
         """Pack one autoregressive token per request into rank-local rows."""
         token_rows = embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1)
-        return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
+        return self._pack_decode_x_hc(
+            token_rows,
+            ranks=ranks,
+            local_rows=local_rows,
+            out=out,
+            fill_all=fill_all,
+        )
 
     def mtp_decode_x_hc(
         self,
@@ -935,6 +943,8 @@ class DeepSeekV4InputBuilder:
         prev_embeddings: torch.Tensor,
         ranks: Sequence[int],
         local_rows: Sequence[int],
+        out: torch.Tensor | None = None,
+        fill_all: bool = True,
     ) -> torch.Tensor:
         """Pack the committed-token and draft-token pair used by MTP verification."""
         if self.layout.decode_seq != 2:
@@ -943,7 +953,13 @@ class DeepSeekV4InputBuilder:
             raise ValueError("MTP previous embeddings must align with draft embeddings")
         token_rows = prev_embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1).clone()
         token_rows[:, -1].copy_(embeddings)
-        return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
+        return self._pack_decode_x_hc(
+            token_rows,
+            ranks=ranks,
+            local_rows=local_rows,
+            out=out,
+            fill_all=fill_all,
+        )
 
     def _pack_decode_x_hc(
         self,
@@ -951,6 +967,8 @@ class DeepSeekV4InputBuilder:
         *,
         ranks: Sequence[int],
         local_rows: Sequence[int],
+        out: torch.Tensor | None,
+        fill_all: bool,
     ) -> torch.Tensor:
         """Pack explicit per-request token rows into the fixed decode tile."""
         if (
@@ -963,14 +981,53 @@ class DeepSeekV4InputBuilder:
         if len(ranks) != token_rows.shape[0] or len(local_rows) != token_rows.shape[0]:
             raise ValueError("decode token rows, ranks, and local rows must align")
         token_rows = token_rows.to(torch.float32)
-        rows = torch.zeros(
-            (self.layout.ranks, self.layout.decode_tokens, self.hidden_size),
-            dtype=token_rows.dtype,
-            device=token_rows.device,
+        if out is None:
+            rows = torch.zeros(
+                (self.layout.ranks, self.layout.decode_tokens, self.hidden_size),
+                dtype=token_rows.dtype,
+                device=token_rows.device,
+            )
+            fallback = token_rows[0, -1]
+            for rank in range(self.layout.ranks):
+                rows[rank].copy_(fallback.reshape(1, -1).expand(self.layout.decode_tokens, -1))
+            for index, (rank, local_row) in enumerate(zip(ranks, local_rows, strict=True)):
+                rank = int(rank)
+                local_row = int(local_row)
+                if not 0 <= rank < self.layout.ranks:
+                    raise ValueError(f"decode rank {rank} is out of range")
+                if not 0 <= local_row < self.layout.decode_batch:
+                    raise ValueError(f"decode local row {local_row} is out of range")
+                start = local_row * self.layout.decode_seq
+                rows[rank, start : start + self.layout.decode_seq].copy_(token_rows[index])
+            return self._expand_hc(rows)
+
+        expected_shape = (
+            self.layout.ranks,
+            self.layout.decode_tokens,
+            self.layout.hc_mult,
+            self.hidden_size,
         )
+        if tuple(out.shape) != expected_shape or out.dtype != torch.float32:
+            raise ValueError(
+                "decode x_hc output must have "
+                f"shape={expected_shape} dtype=torch.float32, "
+                f"got shape={tuple(out.shape)} dtype={out.dtype}"
+            )
+        if out.device.type != "cpu":
+            raise ValueError("decode x_hc shared output must be on CPU")
+
         fallback = token_rows[0, -1]
-        for rank in range(self.layout.ranks):
-            rows[rank].copy_(fallback.reshape(1, -1).expand(self.layout.decode_tokens, -1))
+        fill_tokens = self.layout.decode_tokens
+        if not fill_all:
+            fill_tokens = (max(int(row) for row in local_rows) + 1) * self.layout.decode_seq
+        out[:, :fill_tokens].copy_(
+            fallback.reshape(1, 1, 1, -1).expand(
+                self.layout.ranks,
+                fill_tokens,
+                self.layout.hc_mult,
+                self.hidden_size,
+            )
+        )
         for index, (rank, local_row) in enumerate(zip(ranks, local_rows, strict=True)):
             rank = int(rank)
             local_row = int(local_row)
@@ -979,8 +1036,12 @@ class DeepSeekV4InputBuilder:
             if not 0 <= local_row < self.layout.decode_batch:
                 raise ValueError(f"decode local row {local_row} is out of range")
             start = local_row * self.layout.decode_seq
-            rows[rank, start : start + self.layout.decode_seq].copy_(token_rows[index])
-        return self._expand_hc(rows)
+            out[rank, start : start + self.layout.decode_seq].copy_(
+                token_rows[index]
+                .unsqueeze(1)
+                .expand(self.layout.decode_seq, self.layout.hc_mult, self.hidden_size)
+            )
+        return out
 
     def _expand_hc(self, rank_rows: torch.Tensor) -> torch.Tensor:
         if (
@@ -1106,7 +1167,11 @@ class DeepSeekV4PreparedPrefillInputs:
 
 @dataclass(frozen=True)
 class DeepSeekV4PreparedDecodeInputs:
-    """Fixed-shape host tensors derived from one decode scheduler batch."""
+    """Fixed-shape shared tensors derived from one decode scheduler batch.
+
+    The tensor fields are views over runner-owned reusable buffers and remain
+    valid only until the next decode batch is prepared.
+    """
 
     request_ids: tuple[str, ...]
     ranks: tuple[int, ...]
@@ -1339,6 +1404,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
         self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
+        self._decode_x_hc_initialized = False
+        self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
+            None
+        ] * compiled.layout.ranks
         self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
@@ -1348,6 +1417,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._prefill_logits_buffer: torch.Tensor | None = None
         self._decode_logits_buffer: torch.Tensor | None = None
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
+        self._mtp_decode_inputs_initialized = False
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_proposed_tokens = 0
@@ -1869,20 +1939,29 @@ class DeepSeekV4ModelRunner(ModelRunner):
         builder = self._require_input_builder()
         actual_batch = len(batch.request_ids)
         positions = self._autoregressive_decode_positions(batch, actual_batch)
-        embeddings = hidden_states.to(torch.float32).cpu()
-        return self._prepare_decode_inputs(
-            model,
-            batch,
-            assignment=assignment,
-            active_seq=1,
-            positions=positions,
-            token_rows=self._autoregressive_decode_token_rows(batch.token_ids, actual_batch),
-            x_hc=builder.decode_x_hc(
+        buffers = self._ensure_decode_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_embeddings", cat="executor"):
+            embeddings = hidden_states.to(torch.float32).cpu()
+        with profile_span("DeepSeekV4ModelRunner.decode.pack_x_hc", cat="executor"):
+            token_rows = self._autoregressive_decode_token_rows(batch.token_ids, actual_batch)
+            x_hc = builder.decode_x_hc(
                 embeddings,
                 ranks=assignment.ranks,
                 local_rows=assignment.local_rows,
-            ),
-        )
+                out=buffers.x_hc_a,
+                fill_all=not self._decode_x_hc_initialized,
+            )
+            self._decode_x_hc_initialized = True
+        with profile_span("DeepSeekV4ModelRunner.decode.build_metadata", cat="executor"):
+            return self._prepare_decode_inputs(
+                model,
+                batch,
+                assignment=assignment,
+                active_seq=1,
+                positions=positions,
+                token_rows=token_rows,
+                x_hc=x_hc,
+            )
 
     def prepare_mtp_decode_inputs(
         self,
@@ -1897,26 +1976,35 @@ class DeepSeekV4ModelRunner(ModelRunner):
         builder = self._require_input_builder()
         actual_batch = len(batch.request_ids)
         positions = self._mtp_decode_positions(batch, actual_batch)
-        embeddings = hidden_states.to(torch.float32).cpu()
-        previous_embeddings = batch.prev_hidden_states.to(torch.float32).cpu()
-        return self._prepare_decode_inputs(
-            model,
-            batch,
-            assignment=assignment,
-            active_seq=self._compiled.layout.decode_seq,
-            positions=positions,
-            token_rows=self._mtp_decode_token_rows(
+        buffers = self._ensure_decode_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_embeddings", cat="executor"):
+            embeddings = hidden_states.to(torch.float32).cpu()
+            previous_embeddings = batch.prev_hidden_states.to(torch.float32).cpu()
+        with profile_span("DeepSeekV4ModelRunner.decode.pack_x_hc", cat="executor"):
+            token_rows = self._mtp_decode_token_rows(
                 batch.token_ids,
                 batch.prev_token_ids,
                 actual_batch,
-            ),
-            x_hc=builder.mtp_decode_x_hc(
+            )
+            x_hc = builder.mtp_decode_x_hc(
                 embeddings,
                 prev_embeddings=previous_embeddings,
                 ranks=assignment.ranks,
                 local_rows=assignment.local_rows,
-            ),
-        )
+                out=buffers.x_hc_a,
+                fill_all=not self._decode_x_hc_initialized,
+            )
+            self._decode_x_hc_initialized = True
+        with profile_span("DeepSeekV4ModelRunner.decode.build_metadata", cat="executor"):
+            return self._prepare_decode_inputs(
+                model,
+                batch,
+                assignment=assignment,
+                active_seq=self._compiled.layout.decode_seq,
+                positions=positions,
+                token_rows=token_rows,
+                x_hc=x_hc,
+            )
 
     def _prepare_decode_inputs(
         self,
@@ -1944,32 +2032,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if max_position >= model.runtime.max_seq_len:
             raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
 
-        field_rows: dict[str, list[torch.Tensor]] = {
-            name: []
-            for name in (
-                "input_ids",
-                "position_ids",
-                "kv_seq_lens",
-                "block_table",
-                "ori_slot_mapping",
-                "window_swa_indices",
-                "window_swa_lens",
-                "swa_slot_mapping",
-                "swa_indices",
-                "swa_lens",
-                "cmp_block_table",
-                "idx_block_table",
-                "hca_compress_state_block_table",
-                "csa_compress_state_block_table",
-                "csa_inner_compress_state_block_table",
-                "hca_cmp_slot_mapping",
-                "hca_state_slot_mapping",
-                "csa_cmp_slot_mapping",
-                "csa_idx_slot_mapping",
-                "csa_state_slot_mapping",
-                "csa_inner_state_slot_mapping",
-            )
-        }
+        buffers = self._ensure_decode_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.decode.stage_x_hc", cat="executor"):
+            self._copy_shared(buffers.x_hc_a, x_hc, name="decode_x_hc")
+        staged = buffers.tensors
+        staged["num_tokens_per_owner"].zero_()
+        staged["logit_row_indices"].fill_(-1)
+
         for rank, request_indices in enumerate(indices_by_rank):
             if request_indices:
                 local_positions = [positions[index] for index in request_indices]
@@ -2005,125 +2074,150 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         kernel_rows=layout.decode_batch,
                     )
 
-            field_rows["input_ids"].append(
+            self._copy_shared(
+                staged["input_ids"][rank],
                 self._pad_decode_token_rows(
                     local_token_rows,
                     local_count,
                     vocab_size=model.config.vocab_size,
-                )
+                ),
+                name=f"decode_input_ids_rank{rank}",
             )
-            field_rows["position_ids"].append(
-                torch.tensor(padded_positions, dtype=torch.int32).reshape(-1)
+            self._copy_shared(
+                staged["position_ids"][rank],
+                torch.tensor(padded_positions, dtype=torch.int32).reshape(-1),
+                name=f"decode_position_ids_rank{rank}",
             )
-            field_rows["kv_seq_lens"].append(
-                self._decode_kv_seq_lens(local_seq_lens, local_count)
+            self._copy_shared(
+                staged["kv_seq_lens"][rank],
+                self._decode_kv_seq_lens(local_seq_lens, local_count),
+                name=f"decode_kv_seq_lens_rank{rank}",
             )
-            field_rows["block_table"].append(
-                self.cache_metadata.paged_ori_block_table_from_ids(padded_group_ids["ori"])
+
+            static_key = tuple(
+                (name, padded_group_ids[name])
+                for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
             )
-            field_rows["cmp_block_table"].append(
-                self.cache_metadata.block_table_from_ids(
-                    padded_group_ids["cmp"], max_blocks=layout.cmp_max_blocks
-                )
-            )
-            field_rows["idx_block_table"].append(
-                self.cache_metadata.block_table_from_ids(
-                    padded_group_ids["idx"], max_blocks=layout.idx_max_blocks
-                )
-            )
-            field_rows["hca_compress_state_block_table"].append(
-                self.cache_metadata.ring_block_table_from_ids(
-                    padded_group_ids["hca_state"],
-                    max_blocks=layout.prefill_hca_state_max_blocks,
-                )
-            )
-            field_rows["csa_compress_state_block_table"].append(
-                self.cache_metadata.ring_block_table_from_ids(
-                    padded_group_ids["csa_state"],
-                    max_blocks=layout.prefill_csa_state_max_blocks,
-                )
-            )
-            field_rows["csa_inner_compress_state_block_table"].append(
-                self.cache_metadata.ring_block_table_from_ids(
-                    padded_group_ids["csa_inner_state"],
-                    max_blocks=layout.prefill_csa_inner_state_max_blocks,
-                )
-            )
-            field_rows["ori_slot_mapping"].append(
+            if self._decode_static_metadata_keys[rank] != static_key:
+                static_values = {
+                    "block_table": self.cache_metadata.paged_ori_block_table_from_ids(
+                        padded_group_ids["ori"]
+                    ),
+                    "cmp_block_table": self.cache_metadata.block_table_from_ids(
+                        padded_group_ids["cmp"],
+                        max_blocks=layout.cmp_max_blocks,
+                    ),
+                    "idx_block_table": self.cache_metadata.block_table_from_ids(
+                        padded_group_ids["idx"],
+                        max_blocks=layout.idx_max_blocks,
+                    ),
+                    "hca_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
+                        padded_group_ids["hca_state"],
+                        max_blocks=layout.prefill_hca_state_max_blocks,
+                    ),
+                    "csa_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
+                        padded_group_ids["csa_state"],
+                        max_blocks=layout.prefill_csa_state_max_blocks,
+                    ),
+                    "csa_inner_compress_state_block_table": (
+                        self.cache_metadata.ring_block_table_from_ids(
+                            padded_group_ids["csa_inner_state"],
+                            max_blocks=layout.prefill_csa_inner_state_max_blocks,
+                        )
+                    ),
+                }
+                for name, value in static_values.items():
+                    self._copy_shared(
+                        staged[name][rank],
+                        value,
+                        name=f"decode_{name}_rank{rank}",
+                    )
+                self._decode_static_metadata_keys[rank] = static_key
+
+            self._copy_shared(
+                staged["ori_slot_mapping"][rank],
                 self.cache_metadata.sliding_window_slot_mapping_from_ids(
-                    padded_group_ids["ori"], padded_positions
-                ).reshape(-1)
+                    padded_group_ids["ori"],
+                    padded_positions,
+                ).reshape(-1),
+                name=f"decode_ori_slot_mapping_rank{rank}",
             )
-            field_rows["swa_slot_mapping"].append(
+            self._copy_shared(
+                staged["swa_slot_mapping"][rank],
                 self.cache_metadata.paged_decode_slot_mapping_from_ids(
-                    padded_group_ids["ori"], padded_positions
-                ).reshape(-1)
+                    padded_group_ids["ori"],
+                    padded_positions,
+                ).reshape(-1),
+                name=f"decode_swa_slot_mapping_rank{rank}",
             )
             swa_indices, swa_lens = self.cache_metadata.swa_window_indices_and_lens_from_ids(
                 padded_group_ids["ori"], padded_positions
             )
-            field_rows["swa_indices"].append(swa_indices)
-            field_rows["swa_lens"].append(swa_lens)
-            # Current pypto-lib uses a cache-first contract for HCA/CSA: the
-            # current decode rows are written before sparse attention.
-            window_swa_indices, window_swa_lens = swa_indices, swa_lens
-            field_rows["window_swa_indices"].append(window_swa_indices)
-            field_rows["window_swa_lens"].append(window_swa_lens)
-            field_rows["hca_cmp_slot_mapping"].append(
-                self.cache_metadata.compressed_slot_mapping_from_ids(
-                    padded_group_ids["cmp"],
-                    padded_positions,
-                    block_size=layout.block_size,
-                    compress_ratio=128,
-                ).reshape(-1)
-            )
-            field_rows["hca_state_slot_mapping"].append(
-                self.cache_metadata.state_slot_mapping_from_ids(
-                    padded_group_ids["hca_state"],
-                    padded_positions,
-                    state_block_size=layout.c128_state_block_size,
-                ).reshape(-1)
-            )
-            field_rows["csa_cmp_slot_mapping"].append(
-                self.cache_metadata.compressed_slot_mapping_from_ids(
-                    padded_group_ids["cmp"],
-                    padded_positions,
-                    block_size=layout.block_size,
-                    compress_ratio=4,
-                ).reshape(-1)
-            )
-            field_rows["csa_idx_slot_mapping"].append(
-                self.cache_metadata.compressed_slot_mapping_from_ids(
-                    padded_group_ids["idx"],
-                    padded_positions,
-                    block_size=layout.block_size,
-                    compress_ratio=4,
-                ).reshape(-1)
-            )
-            field_rows["csa_state_slot_mapping"].append(
-                self.cache_metadata.state_slot_mapping_from_ids(
-                    padded_group_ids["csa_state"],
-                    padded_positions,
-                    state_block_size=layout.c4_state_block_size,
-                ).reshape(-1)
-            )
-            field_rows["csa_inner_state_slot_mapping"].append(
-                self.cache_metadata.state_slot_mapping_from_ids(
-                    padded_group_ids["csa_inner_state"],
-                    padded_positions,
-                    state_block_size=layout.c4_state_block_size,
-                ).reshape(-1)
-            )
+            for name, value in (
+                ("swa_indices", swa_indices),
+                ("window_swa_indices", swa_indices),
+                ("swa_lens", swa_lens),
+                ("window_swa_lens", swa_lens),
+            ):
+                self._copy_shared(
+                    staged[name][rank],
+                    value,
+                    name=f"decode_{name}_rank{rank}",
+                )
+            dynamic_mappings = {
+                "hca_cmp_slot_mapping": (
+                    self.cache_metadata.compressed_slot_mapping_from_ids(
+                        padded_group_ids["cmp"],
+                        padded_positions,
+                        block_size=layout.block_size,
+                        compress_ratio=128,
+                    ).reshape(-1)
+                ),
+                "hca_state_slot_mapping": (
+                    self.cache_metadata.state_slot_mapping_from_ids(
+                        padded_group_ids["hca_state"],
+                        padded_positions,
+                        state_block_size=layout.c128_state_block_size,
+                    ).reshape(-1)
+                ),
+                "csa_cmp_slot_mapping": (
+                    self.cache_metadata.compressed_slot_mapping_from_ids(
+                        padded_group_ids["cmp"],
+                        padded_positions,
+                        block_size=layout.block_size,
+                        compress_ratio=4,
+                    ).reshape(-1)
+                ),
+                "csa_idx_slot_mapping": (
+                    self.cache_metadata.compressed_slot_mapping_from_ids(
+                        padded_group_ids["idx"],
+                        padded_positions,
+                        block_size=layout.block_size,
+                        compress_ratio=4,
+                    ).reshape(-1)
+                ),
+                "csa_state_slot_mapping": (
+                    self.cache_metadata.state_slot_mapping_from_ids(
+                        padded_group_ids["csa_state"],
+                        padded_positions,
+                        state_block_size=layout.c4_state_block_size,
+                    ).reshape(-1)
+                ),
+                "csa_inner_state_slot_mapping": (
+                    self.cache_metadata.state_slot_mapping_from_ids(
+                        padded_group_ids["csa_inner_state"],
+                        padded_positions,
+                        state_block_size=layout.c4_state_block_size,
+                    ).reshape(-1)
+                ),
+            }
+            for name, value in dynamic_mappings.items():
+                self._copy_shared(
+                    staged[name][rank],
+                    value,
+                    name=f"decode_{name}_rank{rank}",
+                )
 
-        num_tokens_per_owner = torch.tensor(
-            tuple(count * active_seq for count in per_rank_counts),
-            dtype=torch.int32,
-        )
-        logit_row_indices = torch.full(
-            (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
-            -1,
-            dtype=torch.int32,
-        )
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
             if row_count > DEEPSEEK_V4_MAX_LOGIT_ROWS:
@@ -2131,8 +2225,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     f"rank {rank} requires {row_count} logit rows, "
                     f"capacity is {DEEPSEEK_V4_MAX_LOGIT_ROWS}"
                 )
+            staged["num_tokens_per_owner"][rank] = row_count
             if row_count:
-                logit_row_indices[rank, :row_count] = torch.arange(
+                staged["logit_row_indices"][rank, :row_count] = torch.arange(
                     row_count,
                     dtype=torch.int32,
                 )
@@ -2143,39 +2238,33 @@ class DeepSeekV4ModelRunner(ModelRunner):
             local_rows=tuple(local_rows),
             per_rank_counts=per_rank_counts,
             actual_batch=actual_batch,
-            x_hc=x_hc,
-            input_ids=torch.stack(field_rows["input_ids"]),
-            position_ids=torch.stack(field_rows["position_ids"]),
-            kv_seq_lens=torch.stack(field_rows["kv_seq_lens"]),
-            block_table=torch.stack(field_rows["block_table"]),
-            ori_slot_mapping=torch.stack(field_rows["ori_slot_mapping"]),
-            window_swa_indices=torch.stack(field_rows["window_swa_indices"]),
-            window_swa_lens=torch.stack(field_rows["window_swa_lens"]),
-            swa_slot_mapping=torch.stack(field_rows["swa_slot_mapping"]),
-            swa_indices=torch.stack(field_rows["swa_indices"]),
-            swa_lens=torch.stack(field_rows["swa_lens"]),
-            cmp_block_table=torch.stack(field_rows["cmp_block_table"]),
-            idx_block_table=torch.stack(field_rows["idx_block_table"]),
-            hca_compress_state_block_table=torch.stack(
-                field_rows["hca_compress_state_block_table"]
-            ),
-            csa_compress_state_block_table=torch.stack(
-                field_rows["csa_compress_state_block_table"]
-            ),
-            csa_inner_compress_state_block_table=torch.stack(
-                field_rows["csa_inner_compress_state_block_table"]
-            ),
-            hca_cmp_slot_mapping=torch.stack(field_rows["hca_cmp_slot_mapping"]),
-            hca_state_slot_mapping=torch.stack(field_rows["hca_state_slot_mapping"]),
-            csa_cmp_slot_mapping=torch.stack(field_rows["csa_cmp_slot_mapping"]),
-            csa_idx_slot_mapping=torch.stack(field_rows["csa_idx_slot_mapping"]),
-            csa_state_slot_mapping=torch.stack(field_rows["csa_state_slot_mapping"]),
-            csa_inner_state_slot_mapping=torch.stack(
-                field_rows["csa_inner_state_slot_mapping"]
-            ),
+            x_hc=buffers.x_hc_a,
+            input_ids=staged["input_ids"],
+            position_ids=staged["position_ids"],
+            kv_seq_lens=staged["kv_seq_lens"],
+            block_table=staged["block_table"],
+            ori_slot_mapping=staged["ori_slot_mapping"],
+            window_swa_indices=staged["window_swa_indices"],
+            window_swa_lens=staged["window_swa_lens"],
+            swa_slot_mapping=staged["swa_slot_mapping"],
+            swa_indices=staged["swa_indices"],
+            swa_lens=staged["swa_lens"],
+            cmp_block_table=staged["cmp_block_table"],
+            idx_block_table=staged["idx_block_table"],
+            hca_compress_state_block_table=staged["hca_compress_state_block_table"],
+            csa_compress_state_block_table=staged["csa_compress_state_block_table"],
+            csa_inner_compress_state_block_table=staged[
+                "csa_inner_compress_state_block_table"
+            ],
+            hca_cmp_slot_mapping=staged["hca_cmp_slot_mapping"],
+            hca_state_slot_mapping=staged["hca_state_slot_mapping"],
+            csa_cmp_slot_mapping=staged["csa_cmp_slot_mapping"],
+            csa_idx_slot_mapping=staged["csa_idx_slot_mapping"],
+            csa_state_slot_mapping=staged["csa_state_slot_mapping"],
+            csa_inner_state_slot_mapping=staged["csa_inner_state_slot_mapping"],
             block_ids_by_group=active_group_ids,
-            num_tokens_per_owner=num_tokens_per_owner,
-            logit_row_indices=logit_row_indices,
+            num_tokens_per_owner=staged["num_tokens_per_owner"],
+            logit_row_indices=staged["logit_row_indices"],
         )
 
     @staticmethod
@@ -2344,9 +2433,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Verify request-local MTP drafts and advance the accepted windows."""
         if not batch.allow_device_greedy_sampling:
             raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
-        self._initialize_mtp_drafts(batch)
-        draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
-        speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
+        with profile_span("DeepSeekV4ModelRunner.decode.mtp_initialize", cat="executor"):
+            self._initialize_mtp_drafts(batch)
+        with profile_span("DeepSeekV4ModelRunner.decode.mtp_build_speculative_batch", cat="executor"):
+            draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
+            speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
         output = self._execute_main_decode(
             model,
             self.prepare_mtp_decode_inputs(model, speculative_batch),
@@ -2354,33 +2445,34 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         inputs = output.inputs
         decode_seq = self._compiled.layout.decode_seq
-        pair_logits = torch.stack(
-            tuple(
-                output.logits[rank, local_row * decode_seq + offset]
-                for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
-                for offset in range(decode_seq)
+        with profile_span("DeepSeekV4ModelRunner.decode.mtp_accept", cat="executor"):
+            pair_logits = torch.stack(
+                tuple(
+                    output.logits[rank, local_row * decode_seq + offset]
+                    for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
+                    for offset in range(decode_seq)
+                )
+            ).float()
+            main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
+            accepted = accept_mtp_tokens(main_ids, draft_token_ids)
+            self._mtp_proposed_tokens += inputs.actual_batch
+            self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
+            for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
+                state = self._require_mtp_request_state(request_id)
+                state.proposed_tokens += 1
+                state.accepted_tokens += int(len(tokens) == decode_seq)
+            logger.info(
+                "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
+                self._mtp_accepted_tokens,
+                self._mtp_proposed_tokens,
+                100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
             )
-        ).float()
-        main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
-        accepted = accept_mtp_tokens(main_ids, draft_token_ids)
-        self._mtp_proposed_tokens += inputs.actual_batch
-        self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
-        for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
-            state = self._require_mtp_request_state(request_id)
-            state.proposed_tokens += 1
-            state.accepted_tokens += int(len(tokens) == decode_seq)
-        logger.info(
-            "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
-            self._mtp_accepted_tokens,
-            self._mtp_proposed_tokens,
-            100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "DeepSeekV4 MTP step: draft=%s main=%s",
-                draft_token_ids.detach().cpu().tolist(),
-                main_ids.detach().cpu().tolist(),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DeepSeekV4 MTP step: draft=%s main=%s",
+                    draft_token_ids.detach().cpu().tolist(),
+                    main_ids.detach().cpu().tolist(),
+                )
         # Match the reference accepted_num flow: update the MTP window from
         # committed main-model outputs immediately, even after rejection.
         with profile_span(
@@ -2418,15 +2510,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = decode_buffers.pre_hc_hidden_out
         logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
-        hidden_buffer.zero_()
-        pre_hc_hidden_buffer.zero_()
+        # The active hidden/pre-HC rows are pl.Out tensors and the grouped LM
+        # head overwrites every logits row, including rows selected with -1.
+        # Pre-clearing these reusable buffers only adds host memory bandwidth.
         num_tokens = active_decode_tokens
         with profile_span(
             "DeepSeekV4ModelRunner.decode.prepare_fwd_args",
             cat="executor",
             args={"actual_tokens": num_tokens},
         ):
-            logits_buffer.zero_()
             args = self._decode_fwd_args(
                 inputs,
                 x_hc,
@@ -2936,103 +3028,20 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError("MTP accepted counts must align with active requests")
         buffers = self._require_mtp_buffers()
         layout = self._compiled.layout
-        committed = [
-            self._mtp_committed_window(
-                inputs,
-                main_ids,
-                main_pre_hc,
-                request_index=index,
-                accepted_count=int(accepted_counts[index]),
-            )
-            for index in range(inputs.actual_batch)
-        ]
-
-        fallback_ids, fallback_hidden, fallback_positions = committed[0]
-        kernel_ids = fallback_ids.repeat(layout.ranks, layout.decode_batch)
-        kernel_positions = fallback_positions.repeat(layout.ranks, layout.decode_batch)
-        kernel_prev_hidden = fallback_hidden.repeat(
-            layout.ranks,
-            layout.decode_batch,
-            1,
-            1,
-        )
-        slot_mappings = []
-        swa_indices_by_rank = []
-        swa_lens_by_rank = []
-        for rank in range(layout.ranks):
-            request_indices = [
-                index for index, owner_rank in enumerate(inputs.ranks) if owner_rank == rank
+        with profile_span("DeepSeekV4ModelRunner.mtp.commit_windows", cat="executor"):
+            committed = [
+                self._mtp_committed_window(
+                    inputs,
+                    main_ids,
+                    main_pre_hc,
+                    request_index=index,
+                    accepted_count=int(accepted_counts[index]),
+                )
+                for index in range(inputs.actual_batch)
             ]
-            for request_index in request_indices:
-                local_row = inputs.local_rows[request_index]
-                row_start = local_row * layout.decode_seq
-                row_slice = slice(row_start, row_start + layout.decode_seq)
-                ids, hidden, positions = committed[request_index]
-                kernel_ids[rank, row_slice].copy_(ids)
-                kernel_positions[rank, row_slice].copy_(positions)
-                kernel_prev_hidden[rank, row_slice].copy_(hidden)
-
-            if request_indices:
-                active_blocks = [
-                    inputs.block_ids_by_group[index]["ori"] for index in request_indices
-                ]
-                padded_blocks = self._pad_group_block_ids(
-                    active_blocks,
-                    group_name="ori",
-                    kernel_rows=layout.decode_batch,
-                )
-                padded_positions = [
-                    tuple(int(value) for value in committed[index][2].tolist())
-                    for index in request_indices
-                ]
-                while len(padded_positions) < layout.decode_batch:
-                    padded_positions.append(tuple(int(value) for value in fallback_positions.tolist()))
-            else:
-                padded_blocks = self._scratch_group_block_ids(
-                    group_name="ori",
-                    kernel_rows=layout.decode_batch,
-                )
-                padded_positions = [
-                    tuple(int(value) for value in fallback_positions.tolist())
-                    for _ in range(layout.decode_batch)
-                ]
-            slot_mappings.append(
-                self.cache_metadata.paged_decode_slot_mapping_from_ids(
-                    padded_blocks,
-                    padded_positions,
-                ).reshape(-1)
-            )
-            rank_swa_indices, rank_swa_lens = (
-                self.cache_metadata.swa_window_indices_and_lens_from_ids(
-                    padded_blocks,
-                    padded_positions,
-                )
-            )
-            swa_indices_by_rank.append(rank_swa_indices)
-            swa_lens_by_rank.append(rank_swa_lens)
-
-        buffers.decode_input_ids.copy_(kernel_ids)
-        buffers.decode_hidden_in.copy_(
-            self._embedding_rows(kernel_ids.reshape(-1), torch.bfloat16).reshape(
-                layout.ranks,
-                layout.decode_tokens,
-                -1,
-            )
-        )
-        buffers.decode_prev_hidden_in.copy_(kernel_prev_hidden)
-        buffers.decode_position_ids.copy_(kernel_positions)
-        buffers.decode_slot_mapping.copy_(torch.stack(slot_mappings))
-        buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
-        buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
-        buffers.decode_hidden_out.zero_()
-        buffers.decode_pre_hc_out.zero_()
-        buffers.decode_logits.zero_()
-        buffers.decode_logit_row_indices.fill_(-1)
-        for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True):
-            buffers.decode_logit_row_indices[rank, local_row] = (
-                local_row * layout.decode_seq + layout.decode_seq - 1
-            )
-        active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
+        active_tokens = self._stage_mtp_decode_inputs(inputs, committed)
+        # The MTP pl.Out tensors follow the same overwrite contract as the main
+        # decode outputs, so no host-side clear is required before dispatch.
         with profile_span(
             "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
             cat="executor",
@@ -3052,6 +3061,116 @@ class DeepSeekV4ModelRunner(ModelRunner):
             state.tail_token_id = int(committed[request_index][0][-1].item())
             state.tail_pre_hc_hidden = committed_hidden[-1].clone()
             state.tail_position = int(committed_positions[-1].item())
+
+    def _stage_mtp_decode_inputs(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        committed: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> int:
+        """Stage compact committed windows into persistent MTP decode buffers."""
+        buffers = self._require_mtp_buffers()
+        layout = self._compiled.layout
+        fallback_ids, fallback_hidden, fallback_positions = committed[0]
+        active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
+        fill_tokens = (
+            layout.decode_tokens
+            if not self._mtp_decode_inputs_initialized
+            else active_tokens
+        )
+        fill_rows = fill_tokens // layout.decode_seq
+
+        with profile_span("DeepSeekV4ModelRunner.mtp.pack_inputs", cat="executor"):
+            fallback_id_rows = fallback_ids.repeat(fill_rows)
+            fallback_position_rows = fallback_positions.repeat(fill_rows)
+            fallback_hidden_rows = fallback_hidden.repeat(fill_rows, 1, 1)
+            buffers.decode_input_ids[:, :fill_tokens].copy_(
+                fallback_id_rows.unsqueeze(0).expand(layout.ranks, -1)
+            )
+            buffers.decode_position_ids[:, :fill_tokens].copy_(
+                fallback_position_rows.unsqueeze(0).expand(layout.ranks, -1)
+            )
+            buffers.decode_prev_hidden_in[:, :fill_tokens].copy_(
+                fallback_hidden_rows.unsqueeze(0).expand(layout.ranks, -1, -1, -1)
+            )
+            for request_index, (rank, local_row) in enumerate(
+                zip(inputs.ranks, inputs.local_rows, strict=True)
+            ):
+                row_start = local_row * layout.decode_seq
+                row_slice = slice(row_start, row_start + layout.decode_seq)
+                ids, hidden, positions = committed[request_index]
+                buffers.decode_input_ids[rank, row_slice].copy_(ids)
+                buffers.decode_position_ids[rank, row_slice].copy_(positions)
+                buffers.decode_prev_hidden_in[rank, row_slice].copy_(hidden)
+
+        slot_mappings = []
+        swa_indices_by_rank = []
+        swa_lens_by_rank = []
+        with profile_span("DeepSeekV4ModelRunner.mtp.build_metadata", cat="executor"):
+            for rank in range(layout.ranks):
+                request_indices = [
+                    index for index, owner_rank in enumerate(inputs.ranks) if owner_rank == rank
+                ]
+                if request_indices:
+                    active_blocks = [
+                        inputs.block_ids_by_group[index]["ori"] for index in request_indices
+                    ]
+                    padded_blocks = self._pad_group_block_ids(
+                        active_blocks,
+                        group_name="ori",
+                        kernel_rows=layout.decode_batch,
+                    )
+                    padded_positions = [
+                        tuple(int(value) for value in committed[index][2].tolist())
+                        for index in request_indices
+                    ]
+                    while len(padded_positions) < layout.decode_batch:
+                        padded_positions.append(
+                            tuple(int(value) for value in fallback_positions.tolist())
+                        )
+                else:
+                    padded_blocks = self._scratch_group_block_ids(
+                        group_name="ori",
+                        kernel_rows=layout.decode_batch,
+                    )
+                    padded_positions = [
+                        tuple(int(value) for value in fallback_positions.tolist())
+                        for _ in range(layout.decode_batch)
+                    ]
+                slot_mappings.append(
+                    self.cache_metadata.paged_decode_slot_mapping_from_ids(
+                        padded_blocks,
+                        padded_positions,
+                    ).reshape(-1)
+                )
+                rank_swa_indices, rank_swa_lens = (
+                    self.cache_metadata.swa_window_indices_and_lens_from_ids(
+                        padded_blocks,
+                        padded_positions,
+                    )
+                )
+                swa_indices_by_rank.append(rank_swa_indices)
+                swa_lens_by_rank.append(rank_swa_lens)
+
+            buffers.decode_slot_mapping.copy_(torch.stack(slot_mappings))
+            buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
+            buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
+
+        with profile_span("DeepSeekV4ModelRunner.mtp.lookup_embeddings", cat="executor"):
+            staged_ids = buffers.decode_input_ids[:, :fill_tokens]
+            buffers.decode_hidden_in[:, :fill_tokens].copy_(
+                self._embedding_rows(staged_ids.reshape(-1), torch.bfloat16).reshape(
+                    layout.ranks,
+                    fill_tokens,
+                    -1,
+                )
+            )
+        buffers.decode_logit_row_indices.fill_(-1)
+        for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True):
+            buffers.decode_logit_row_indices[rank, local_row] = (
+                local_row * layout.decode_seq + layout.decode_seq - 1
+            )
+        self._mtp_decode_inputs_initialized = True
+        return active_tokens
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
         tensors = self._stacked_device_weights or self._stacked_host_weights
@@ -3360,6 +3479,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 },
             )
             self._decode_buffers = buffers
+            self._decode_x_hc_initialized = False
+            self._decode_static_metadata_keys = [None] * layout.ranks
         return buffers
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
@@ -3464,16 +3585,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
         )
         self._mtp_buffers.prefill_kv_cache.zero_()
+        self._mtp_decode_inputs_initialized = False
         return self._mtp_buffers
 
     def _stage_decode_inputs(self, inputs: DeepSeekV4PreparedDecodeInputs) -> DeepSeekV4PreparedDecodeInputs:
         buffers = self._ensure_decode_buffers(inputs.x_hc.shape[-1])
-        self._copy_shared(buffers.x_hc_a, inputs.x_hc, name="decode_x_hc")
+        with profile_span("DeepSeekV4ModelRunner.decode.stage_x_hc", cat="executor"):
+            self._copy_shared(buffers.x_hc_a, inputs.x_hc, name="decode_x_hc")
         staged_values: dict[str, torch.Tensor] = {}
-        for name in _DECODE_INPUT_TENSOR_FIELDS:
-            dst = buffers.tensors[name]
-            self._copy_shared(dst, getattr(inputs, name), name=f"decode_{name}")
-            staged_values[name] = dst
+        with profile_span("DeepSeekV4ModelRunner.decode.stage_metadata", cat="executor"):
+            for name in _DECODE_INPUT_TENSOR_FIELDS:
+                dst = buffers.tensors[name]
+                self._copy_shared(dst, getattr(inputs, name), name=f"decode_{name}")
+                staged_values[name] = dst
         return replace(inputs, x_hc=buffers.x_hc_a, **staged_values)
 
     def _ensure_prefill_fwd_buffers(self, hidden_size: int) -> _DeepSeekV4PrefillFwdSharedBuffers:
@@ -3944,6 +4068,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 f"buffer shape={tuple(dst.shape)} dtype={dst.dtype}, "
                 f"source shape={tuple(src.shape)} dtype={src.dtype}"
             )
+        if dst.data_ptr() == src.data_ptr():
+            return
         dst.copy_(src)
 
     @staticmethod
@@ -4313,10 +4439,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._stacked_device_weights = None
             self._mtp_device_weights = None
             self._mtp_buffers = None
+            self._mtp_decode_inputs_initialized = False
             self._global_weights = None
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
             self._mtp_request_states.clear()
+            self._decode_x_hc_initialized = False
+            self._decode_static_metadata_keys = [None] * self._compiled.layout.ranks
             self._l3_static_tensors.clear()
             self._l3_cache_tensor_keys.clear()
 
