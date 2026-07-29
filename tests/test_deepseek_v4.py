@@ -1187,6 +1187,144 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
         assert getattr(staged, name).is_shared()
 
 
+def test_deepseek_prepare_decode_inputs_reuses_static_metadata():
+    runner, model = _runner_for_prepared_inputs()
+    original_metadata = runner.cache_metadata
+
+    class CountingMetadata:
+        def __init__(self):
+            self.ring_table_calls = 0
+
+        def ring_block_table_from_ids(self, *args, **kwargs):
+            self.ring_table_calls += 1
+            return original_metadata.ring_block_table_from_ids(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(original_metadata, name)
+
+    counting_metadata = CountingMetadata()
+    runner.cache_metadata = counting_metadata
+
+    def prepare(seq_len, grouped_rows):
+        return runner.prepare_decode_inputs(
+            model,
+            DecodeBatch(
+                request_ids=["req-a"],
+                token_ids=torch.tensor([[5]], dtype=torch.long),
+                hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+                block_ids_by_group=grouped_rows,
+                cache_partitions=[0],
+            ),
+        )
+
+    first = prepare(128, _grouped_cache_rows(1))
+    first_ring_table_calls = counting_metadata.ring_table_calls
+    assert first_ring_table_calls == 3 * runner._compiled.layout.ranks
+    assert first.block_table.is_shared()
+
+    second = prepare(129, _grouped_cache_rows(1))
+    assert counting_metadata.ring_table_calls == first_ring_table_calls
+    assert second.block_table.data_ptr() == first.block_table.data_ptr()
+    assert second.position_ids[0, 0].item() == 128
+
+    changed_rows = _grouped_cache_rows(1)
+    changed_rows[0]["ori"] = [10]
+    prepare(130, changed_rows)
+    assert counting_metadata.ring_table_calls == first_ring_table_calls + 3
+
+
+def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first_step():
+    runner, model = _runner_for_prepared_inputs()
+    layout = runner._compiled.layout
+    runner._compiled.embedding_weight = torch.arange(
+        model.config.vocab_size * model.config.hidden_size,
+        dtype=torch.float32,
+    ).reshape(model.config.vocab_size, model.config.hidden_size)
+    runner._mtp_buffers = SimpleNamespace(
+        decode_hidden_in=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            model.config.hidden_size,
+            dtype=torch.bfloat16,
+        ),
+        decode_prev_hidden_in=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            layout.hc_mult,
+            model.config.hidden_size,
+            dtype=torch.float32,
+        ),
+        decode_input_ids=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.long,
+        ),
+        decode_position_ids=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.int32,
+        ),
+        decode_slot_mapping=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.long,
+        ),
+        decode_swa_indices=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            layout.sliding_window,
+            dtype=torch.int32,
+        ),
+        decode_swa_lens=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.int32,
+        ),
+        decode_logit_row_indices=torch.empty(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.int32,
+        ),
+    )
+    inputs = runner.prepare_mtp_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[5]], dtype=torch.long),
+            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
+            prev_token_ids=torch.tensor([3], dtype=torch.long),
+            prev_hidden_states=torch.arange(4, 8, dtype=torch.bfloat16).reshape(1, 4),
+        ),
+    )
+    committed_hidden = torch.arange(
+        layout.decode_seq * layout.hc_mult * model.config.hidden_size,
+        dtype=torch.float32,
+    ).reshape(layout.decode_seq, layout.hc_mult, model.config.hidden_size)
+    committed = [
+        (
+            torch.tensor([3, 5], dtype=torch.long),
+            committed_hidden,
+            torch.tensor([126, 127], dtype=torch.int32),
+        )
+    ]
+
+    assert runner._stage_mtp_decode_inputs(inputs, committed) == 2
+    assert runner._mtp_buffers.decode_input_ids[0, :2].tolist() == [3, 5]
+    assert runner._mtp_buffers.decode_input_ids[1, :2].tolist() == [3, 5]
+    torch.testing.assert_close(
+        runner._mtp_buffers.decode_hidden_in[0, :2],
+        runner._compiled.embedding_weight[torch.tensor([3, 5])].to(torch.bfloat16),
+    )
+
+    runner._mtp_buffers.decode_prev_hidden_in[:, 2:].fill_(99)
+    runner._stage_mtp_decode_inputs(inputs, committed)
+    assert torch.all(runner._mtp_buffers.decode_prev_hidden_in[:, 2:] == 99)
+
+
 def test_deepseek_run_decode_dispatches_active_token_count():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode")
