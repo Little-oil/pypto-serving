@@ -102,11 +102,13 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_attention_hca",
     "decode_attention_swa",
     "decode_fwd",
+    "decode_input_pack",
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
     "decode_metadata_device",
     "decode_mtp",
+    "lookup_embedding",
     "decode_sparse_attn",
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
@@ -329,6 +331,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
     def supports_device_sampling(self) -> bool:
         """Enable executor-provided greedy token acceptance for MTP only."""
         return self._enable_mtp
+
+    @property
+    def supports_device_decode_embedding(self) -> bool:
+        """Use token IDs directly in the packed DeepSeek decode kernels."""
+        return True
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Lookup token embeddings from the lazily loaded DeepSeekV4 embedding table."""
@@ -842,7 +849,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
         values.update(
             {
-                "x_hc": torch.empty((ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32),
+                "embed_weight": torch.empty(
+                    (ranks, model.config.vocab_size, hidden), dtype=torch.bfloat16
+                ),
                 # FWD-stacked work caches (x43).
                 "kv_cache": torch.empty(
                     (
