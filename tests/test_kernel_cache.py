@@ -25,6 +25,9 @@ from pypto_serving.model.qwen.kernel_cache import (
     canonical_source,
     compute_params_fingerprint,
 )
+from pypto_serving.model.deepseek.kernel_cache import (
+    compute_params_fingerprint as compute_deepseek_params_fingerprint,
+)
 
 
 class _FakeTensor:
@@ -109,6 +112,58 @@ def test_params_fingerprint_tracks_every_distinguishing_dimension():
     assert base != _pf("decode_fwd", [_FakeTensor((16, 512), "float32")])
     assert base != _pf("decode_fwd", args, platform="a2a3sim")
     assert base != _pf("prefill_fwd", args)
+
+
+def test_deepseek_params_fingerprint_tracks_deployment_layout():
+    def kernel(x: tuple[int, int]):
+        pass
+
+    jit_fn = types.SimpleNamespace(_func=kernel)
+    kwargs = {
+        "platform": "a2a3",
+        "block_dim": None,
+        "prefill_seq": 128,
+        "decode_batch": 4,
+        "decode_seq": 2,
+        "decode_tokens": 8,
+    }
+    base = compute_deepseek_params_fingerprint("deepseek_v4_decode", jit_fn, **kwargs)
+
+    for dimension in ("prefill_seq", "decode_batch", "decode_seq", "decode_tokens"):
+        changed = {**kwargs, dimension: kwargs[dimension] + 1}
+        assert base != compute_deepseek_params_fingerprint(
+            "deepseek_v4_decode",
+            jit_fn,
+            **changed,
+        )
+
+
+def test_deepseek_params_fingerprint_tracks_signature_annotations():
+    def small(x: tuple[int, int]):
+        pass
+
+    def large(x: tuple[int, int, int]):
+        pass
+
+    kwargs = {
+        "platform": "a2a3",
+        "block_dim": None,
+        "prefill_seq": 128,
+        "decode_batch": 4,
+        "decode_seq": 2,
+        "decode_tokens": 8,
+    }
+    small_fingerprint = compute_deepseek_params_fingerprint(
+        "deepseek_v4_decode",
+        types.SimpleNamespace(_func=small),
+        **kwargs,
+    )
+    large_fingerprint = compute_deepseek_params_fingerprint(
+        "deepseek_v4_decode",
+        types.SimpleNamespace(_func=large),
+        **kwargs,
+    )
+    assert small_fingerprint != large_fingerprint
 
 
 # --- AST-canonical source hashing -----------------------------------------
