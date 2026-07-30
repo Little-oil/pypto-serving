@@ -118,8 +118,14 @@ class ShutdownCommand(msgspec.Struct, tag="shutdown"):
     """Signals the worker to exit its busy-loop cleanly."""
 
 
+class ProfileCommand(msgspec.Struct, tag="profile"):
+    """Starts or stops the process-local SA profiler."""
+
+    active: bool
+
+
 # Union used for the decoder — tag field ("type") discriminates.
-Command = Union[StepCommand, ShutdownCommand]
+Command = Union[StepCommand, ShutdownCommand, ProfileCommand]
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +149,13 @@ class StepResult(msgspec.Struct):
     step_id: int = 0
 
 
+class ProfileResult(msgspec.Struct):
+    """Acknowledges a profile command after the worker has applied it."""
+
+    active: bool
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Codec — thin wrappers so call sites are transport-agnostic
 # ---------------------------------------------------------------------------
@@ -151,6 +164,8 @@ _cmd_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _cmd_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(Command)
 _result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(StepResult)
+_profile_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
+_profile_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ProfileResult)
 
 
 def encode_command(cmd: Command) -> bytes:
@@ -171,3 +186,13 @@ def encode_result(result: StepResult) -> bytes:
 def decode_result(data: bytes) -> StepResult:
     """Decode bytes from the output queue into a typed step result."""
     return _result_decoder.decode(data)
+
+
+def encode_profile_result(result: ProfileResult) -> bytes:
+    """Encode a profile-control acknowledgement."""
+    return _profile_result_encoder.encode(result)
+
+
+def decode_profile_result(data: bytes) -> ProfileResult:
+    """Decode a profile-control acknowledgement."""
+    return _profile_result_decoder.decode(data)

@@ -5,7 +5,7 @@ description: Test and analyze the ONLINE serving performance of Qwen3-14B on the
 
 # Qwen3-14B online serving performance profiling
 
-`SA_PROFILE` is the built-in Chrome trace-event recorder in `pypto_serving.tools.profile`. It is disabled by default with low overhead, and when enabled it records duration spans from the HTTP API, scheduler, engine, executor, worker, and NPU kernel-dispatch paths. Each process writes its own JSON Lines fragment; on a graceful shutdown the entry point merges them into a single `trace.json` that can be opened in a trace viewer such as Perfetto.
+`SA_PROFILE` is the built-in Chrome trace-event recorder in `pypto_serving.tools.profile`. It is disabled by default with low overhead. In HTTP serving, `--profile` configures the recorder and exposes vLLM-compatible `/start_profile` and `/stop_profile` endpoints; recording begins only after `/start_profile`. It records duration spans from the HTTP API, scheduler, engine, executor, worker, and NPU kernel-dispatch paths. Each process writes its own JSON Lines fragment; `/stop_profile` flushes all processes and merges them into a single `trace.json` that can be opened in a trace viewer such as Perfetto.
 
 This skill measures **where time goes** at operator granularity during a real **online serving** run — the complement of `vllm-bench-perf` (end-to-end serving latency/throughput) and `ais-bench-eval` (accuracy). It profiles the HTTP server only; for offline single-generation profiling use the `qwen3-14b-offline-perf-test` skill instead. The canonical reference is `docs/dev/profile.md`; re-read it if the env semantics below disagree with the checkout.
 
@@ -22,19 +22,20 @@ Do not hard-code a specific commit, user directory, device id, port, or one-off 
 
 ## 2. Enable profiling
 
-Profiling turns on when **either** `SA_PROFILE_OUTPUT` or `SA_PROFILE_LEVEL` is present. For operator timing use:
+Configure HTTP profiling with these server options:
 
-| Variable | Value for this skill |
+| Option | Value for this skill |
 | --- | --- |
-| `SA_PROFILE_OUTPUT` | An **absolute** directory path, fresh per run. A new main process clears stale `trace.*.jsonl` in its `fragments/` dir, so reusing a path overwrites the prior run. |
-| `SA_PROFILE_LEVEL` | `verbose` (all levels) or `e2e,kernel`. The `kernel` level is required — without it no `kernel.*_fwd` spans are recorded and there is no operator breakdown. |
+| `--profile` | Required. Enables the HTTP control endpoints. |
+| `--profile-output` | An **absolute** directory path, fresh per run. A new main process clears stale `trace.*.jsonl` in its `fragments/` dir, so reusing a path overwrites the prior run. |
+| `--profile-level` | `verbose` (all levels) or `e2e,kernel`. The `kernel` level is required — without it no `kernel.*_fwd` spans are recorded and there is no operator breakdown. |
 
 Output layout for a directory output:
 
 ```text
-<SA_PROFILE_OUTPUT>/
+<PROFILE_OUTPUT>/
 ├── fragments/trace.<pid>.jsonl   # one JSONL fragment per process (API + worker)
-└── trace.json                    # merged trace, written on graceful shutdown
+└── trace.json                    # merged trace, written by /stop_profile
 ```
 
 Keep whatever `PTO2_*` runtime env vars the run template uses (ring heap, op-execute/stream-sync timeouts). They are unrelated to profiling but required for the NPU runtime on this box.
@@ -45,25 +46,24 @@ Run the server with profiling on. Template (queue-wrapped; the `--devices {}` pl
 
 ```bash
 task-submit --device auto --run --max-time 0 --timeout 0 \
-"SA_PROFILE_OUTPUT=/abs/path/profile-out \
-SA_PROFILE_LEVEL=verbose \
-PTO2_OP_EXECUTE_TIMEOUT_US=50000000 PTO2_STREAM_SYNC_TIMEOUT_MS=55000 \
+"PTO2_OP_EXECUTE_TIMEOUT_US=50000000 PTO2_STREAM_SYNC_TIMEOUT_MS=55000 \
 PTO2_RING_HEAP=2147483648 PTO2_RING_TASK_WINDOW=262144 PTO2_RING_DEP_POOL=262144 \
 pypto-serving \
     --model /path/to/Qwen3-14B \
     --platform a2a3 \
     --port 8899 \
+    --profile --profile-output /abs/path/profile-out --profile-level verbose \
     --devices {} \
     --max-num-batched-tokens 4096 --max-num-seqs 16 \
     --npu-memory-utilization 0.9 --max-model-len 4096 \
     --no-enable-prefix-caching --long-prefill-token-threshold 2048"
 ```
 
-The same `SA_PROFILE_*` env vars also work for the offline entry `python examples/model/qwen3_14b/npu_generate.py`, but this skill is scoped to the **online HTTP server**; do not use the offline entry here.
+The `SA_PROFILE_*` environment variables remain available to the offline entry `python examples/model/qwen3_14b/npu_generate.py`, but HTTP serving uses the CLI options above. This skill is scoped to the **online HTTP server**; do not use the offline entry here.
 
 Wait for `INFO: Application startup complete.` / `Uvicorn running on http://0.0.0.0:<port>` before sending traffic. The worker prints `Worker entering busy loop` and the engine prints `Engine loop started` once the model and KV cache are ready.
 
-## 4. Confirm ready, then drive workload
+## 4. Confirm ready, start the capture, then drive workload
 
 **Workload spec — two configs.** Each config is `input/output/num-prompts` (token lengths and request count). With all requests firing at once the load reaches ~16 concurrent and fills the `--max-num-seqs 16` batch, so `kernel.decode_fwd` spans reflect batched decode.
 
@@ -78,10 +78,17 @@ Confirm the endpoint serves (a healthy `/v1/models` alone does not prove generat
 
 ```bash
 PORT=<your-port>
-curl -sf http://localhost:$PORT/health                                # {"status":"ok"}
-curl -sf http://localhost:$PORT/v1/models | grep -o '"id":"[^"]*"'    # the served-model-name
-curl -sf http://localhost:$PORT/v1/completions -H 'Content-Type: application/json' \
+curl --noproxy "*" -sf http://localhost:$PORT/health                                # {"status":"ok"}
+curl --noproxy "*" -sf http://localhost:$PORT/v1/models | grep -o '"id":"[^"]*"'    # the served-model-name
+curl --noproxy "*" -sf http://localhost:$PORT/v1/completions -H 'Content-Type: application/json' \
   -d "{\"model\":\"<served-model-name>\",\"prompt\":\"ping\",\"max_tokens\":4,\"temperature\":0}" >/dev/null && echo gen OK
+```
+
+Start profiling only after all readiness checks and the completion smoke test
+pass, so they are excluded from the captured workload:
+
+```bash
+curl --noproxy "*" -sf -X POST http://localhost:$PORT/start_profile
 ```
 
 Drive the workload with **`tests/bench_serving.py` (default — no install)**. The repo's own async benchmark drives the endpoint with aiohttp (already in the env) and prints TTFT, per-token decode interval, throughput (req/s, tok/s), and latency p50/p99. Its `--input-len` builds a fixed-length synthetic prompt. Run both configs:
@@ -108,12 +115,17 @@ vllm bench serve --backend vllm --model <served-model-name> \
 
 Either driver works; prefer `tests/bench_serving.py` (repo-native, no install).
 
-## 5. Flush and merge fragments
+## 5. Stop, flush, and merge
 
-The recorder writes fragments with default buffering and flushes on process close. To get a complete merged `trace.json`:
+After the workload finishes, stop profiling without stopping the server:
 
-- **Preferred:** stop the server gracefully (`SIGTERM`/`SIGINT` to the `pypto-serving` process). The application-shutdown path waits for the worker and calls `merge_profile()`, producing `<SA_PROFILE_OUTPUT>/trace.json`.
-- **If the server was killed ungracefully:** run `./scripts/merge_profile.sh <SA_PROFILE_OUTPUT>` (or `SA_PROFILE_OUTPUT=<dir> ./scripts/merge_profile.sh`). Stop all profiled processes first so buffered events are flushed.
+```bash
+curl --noproxy "*" -sf -X POST http://localhost:$PORT/stop_profile
+```
+
+`/stop_profile` waits for all replica workers to apply the stop command and flush their process-local files, then merges the fragments into `<PROFILE_OUTPUT>/trace.json`. A graceful server shutdown performs the same final merge as a fallback.
+
+If the server was killed ungracefully, run `./scripts/merge_profile.sh <PROFILE_OUTPUT>`. Stop all profiled processes first so buffered events are flushed.
 
 Fragments are retained after merging, so aggregation also works directly on `fragments/trace.*.jsonl` without a merged file — useful for an interim read while the server is still running (some recent events may still be buffered).
 
@@ -139,11 +151,12 @@ Compact aggregator (writes nothing into the repo; run from anywhere):
 ```python
 import glob, json, os
 from collections import defaultdict
-D="<SA_PROFILE_OUTPUT>"; tot=defaultdict(lambda:[0.0,0,"",0.0,0])  # dur,count,cat,dev_us,dev_n
+D="<PROFILE_OUTPUT>"; tot=defaultdict(lambda:[0.0,0,"",0.0,0])  # dur,count,cat,dev_us,dev_n
 def events():
     m=os.path.join(D,"trace.json")
     if os.path.isfile(m):
         for e in json.load(open(m)).get("traceEvents",[]): yield e
+        return
     for f in sorted(glob.glob(os.path.join(D,"fragments","trace.*.jsonl"))):
         for line in open(f):
             line=line.strip()
@@ -175,20 +188,21 @@ for name,(d,n,c,dev,dn) in sorted(tot.items(),key=lambda kv:kv[1][0],reverse=Tru
 
 **b) `[Errno 98] address already in use` on bind.** The default port 8000 is taken (often by a teammate's server). Re-run with `--port <other>` and point the workload at the new port.
 
-**c) No `kernel.*_fwd` events, only `e2e`/scheduler spans.** `SA_PROFILE_LEVEL` does not include `kernel`. Set it to `verbose` or `e2e,kernel`, and confirm the env is exported **before** launching the server so the worker process inherits it.
+**c) No `kernel.*_fwd` events, only `e2e`/scheduler spans.** `--profile-level` does not include `kernel`. Set it to `verbose` or `e2e,kernel`.
 
-**d) `trace.json` is missing or much smaller than the fragments.** The server was killed ungracefully so the merge did not run. Stop all profiled processes, then run `./scripts/merge_profile.sh <SA_PROFILE_OUTPUT>`, or aggregate the fragments directly.
+**d) `trace.json` is missing or much smaller than the fragments.** `/stop_profile` was not called, or the server was killed before it completed. Stop all profiled processes, then run `./scripts/merge_profile.sh <PROFILE_OUTPUT>`, or aggregate the fragments directly.
 
 **e) Every request returns 422.** The `model` field does not match the served-model-name from `/v1/models`, or `prompt_tokens + max_tokens > --max-model-len`. A single isolated 422 under concurrency is usually transient — retry that request.
 
-**f) Stale results from a previous run.** Reusing `SA_PROFILE_OUTPUT` is fine (a new main process clears old fragments), but a leftover `trace.json` from before the clear can confuse an interim read. Use a fresh path per run, or merge after the new run completes.
+**f) Stale results from a previous run.** Reusing `--profile-output` is fine (a new main process clears old fragments), but a leftover `trace.json` from before the clear can confuse an interim read. Use a fresh path per run, or merge after the new run completes.
 
 ## 9. Checklist
 
-1. Pick a fresh absolute `SA_PROFILE_OUTPUT` and set `SA_PROFILE_LEVEL=verbose` (must include `kernel`).
+1. Add `--profile`, pick a fresh absolute `--profile-output`, and set `--profile-level verbose` (must include `kernel`).
 2. Start `pypto-serving` (queue-wrapped if needed) with `--port` chosen to avoid collisions; wait for `Application startup complete`.
 3. Confirm `/health`, the served-model-name from `/v1/models`, and that one `/v1/completions` returns a completion.
-4. Drive the workload with `tests/bench_serving.py` (default, no install): run both spec configs `3338/128/16` and `128/128/16` via `--input-len` / `--max-tokens` / `-n` / `-c` / `--stream`. `vllm bench serve` is an optional alternative.
-5. Stop the server gracefully (or run `scripts/merge_profile.sh`) to produce `trace.json`.
-6. Aggregate `ph=X` spans by `name`; for kernel rows prefer `args.device_wall_us`; exclude the one-time startup spans.
-7. Report: per-kernel total/count/mean (prefill vs decode vs sample), TPOT ≈ mean `decode_fwd`, the device-vs-host gap, and the port/model/workload actually used.
+4. Call `POST /start_profile`.
+5. Drive the workload with `tests/bench_serving.py` (default, no install): run both spec configs `3338/128/16` and `128/128/16` via `--input-len` / `--max-tokens` / `-n` / `-c` / `--stream`. `vllm bench serve` is an optional alternative.
+6. Call `POST /stop_profile` to flush all workers and produce `trace.json`.
+7. Aggregate `ph=X` spans by `name`; for kernel rows prefer `args.device_wall_us`; exclude the one-time startup spans.
+8. Report: per-kernel total/count/mean (prefill vs decode vs sample), TPOT ≈ mean `decode_fwd`, the device-vs-host gap, and the port/model/workload actually used.

@@ -9,24 +9,31 @@
 
 from __future__ import annotations
 
+from .env import ProfileConfig, create_profile_config
 from .recorder import (
-    ProfileConfig,
     ProfileRecorder,
+    configure_profiler,
     get_profiler,
     is_enabled,
     merge_profile,
     profile_duration,
     profile_instant,
     profile_span,
+    start_profile,
+    stop_profile,
 )
 
 __all__ = [
     "ProfileConfig",
     "ProfileRecorder",
+    "configure_profiler",
+    "create_profile_config",
     "get_profiler",
     "is_enabled",
     "merge_profile",
     "profile_duration",
     "profile_instant",
     "profile_span",
+    "start_profile",
+    "stop_profile",
 ]

@@ -39,13 +39,20 @@ from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
+    ProfileCommand,
     ShutdownCommand,
     StepCommand,
+    decode_profile_result,
     decode_result,
     encode_command,
 )
 from pypto_serving.serving.server.serving_worker import spawn_worker
-from pypto_serving.tools.profile import profile_instant, profile_span
+from pypto_serving.tools.profile import (
+    ProfileConfig,
+    create_profile_config,
+    profile_instant,
+    profile_span,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +74,9 @@ class EngineConfig:
 
     # Runtime
     runtime_config: RuntimeConfig | None = None
+    profile_config: ProfileConfig = field(
+        default_factory=lambda: create_profile_config(enabled=False)
+    )
 
     # Scheduler / serving
     max_num_running_reqs: int = 32
@@ -187,6 +197,8 @@ class ReplicaEngineCore:
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
+        self._profile_output_queue = None
+        self._profile_lock = asyncio.Lock()
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
@@ -212,10 +224,18 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
-            process, input_q, output_q, ready_event, num_pages_value = spawn_worker(self.config)
+            (
+                process,
+                input_q,
+                output_q,
+                profile_output_q,
+                ready_event,
+                num_pages_value,
+            ) = spawn_worker(self.config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
+            self._profile_output_queue = profile_output_q
 
             logger.info("Waiting for worker to initialize model...")
             try:
@@ -272,6 +292,43 @@ class ReplicaEngineCore:
 
         await asyncio.to_thread(self._shutdown_worker, timeout=30)
         logger.info("ReplicaEngineCore stopped")
+
+    async def start_profile(self) -> None:
+        """Start SA profiling in this replica's worker."""
+        await self._set_profile_active(True)
+
+    async def stop_profile(self) -> None:
+        """Flush and stop SA profiling in this replica's worker."""
+        await self._set_profile_active(False)
+
+    async def _set_profile_active(self, active: bool) -> None:
+        """Send an ordered worker profile command and wait for its acknowledgement."""
+        async with self._profile_lock:
+            input_queue = self._input_queue
+            output_queue = self._profile_output_queue
+            if input_queue is None or output_queue is None:
+                raise RuntimeError("Serving worker is not running")
+
+            input_queue.put(encode_command(ProfileCommand(active=active)))
+            try:
+                raw_result = await asyncio.to_thread(
+                    output_queue.get,
+                    timeout=self._step_timeout,
+                )
+            except queue.Empty as exc:
+                action = "start" if active else "stop"
+                raise RuntimeError(
+                    f"Worker profile {action} timed out ({self._step_timeout:g}s)"
+                ) from exc
+
+            result = decode_profile_result(raw_result)
+            if result.error:
+                raise RuntimeError(result.error)
+            if result.active != active:
+                raise RuntimeError(
+                    f"Worker profile state mismatch: requested active={active}, "
+                    f"received active={result.active}"
+                )
 
     def generate_request_id(self) -> str:
         self._request_counter += 1
@@ -829,6 +886,7 @@ class ReplicaEngineCore:
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
+        self._profile_output_queue = None
 
 
 class AsyncLLMEngine:
@@ -900,6 +958,30 @@ class AsyncLLMEngine:
     async def stop(self) -> None:
         """Stop all DP engine cores."""
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+
+    async def start_profile(self) -> None:
+        """Start SA profiling in every replica worker."""
+        results = await asyncio.gather(
+            *(core.start_profile() for core in self._cores),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            await asyncio.gather(
+                *(core.stop_profile() for core in self._cores),
+                return_exceptions=True,
+            )
+            raise RuntimeError(f"Failed to start profiling in a worker: {errors[0]}")
+
+    async def stop_profile(self) -> None:
+        """Flush and stop SA profiling in every replica worker."""
+        results = await asyncio.gather(
+            *(core.stop_profile() for core in self._cores),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"Failed to stop profiling in a worker: {errors[0]}")
 
     def generate_request_id(self) -> str:
         self._request_counter += 1

@@ -14,12 +14,21 @@ trace viewer such as [Perfetto](https://ui.perfetto.dev/).
 
 ## Configuration
 
-Profiling is enabled when either of these environment variables is present:
+HTTP serving profiling is configured with CLI options:
 
-| Variable | Description |
+| Option | Description |
 | --- | --- |
-| `SA_PROFILE_OUTPUT` | Output directory or a path ending in `.json`. Defaults to `./profile_out` when only `SA_PROFILE_LEVEL` is set. |
-| `SA_PROFILE_LEVEL` | Comma-separated event levels. Supported values are `e2e`, `kernel`, and `verbose`. Defaults to `e2e,kernel`. |
+| `--profile` | Enable the vLLM-compatible `/start_profile` and `/stop_profile` endpoints. |
+| `--profile-output PATH` | Output directory or path ending in `.json`. Defaults to `./profile_out`. |
+| `--profile-level LEVELS` | Comma-separated event levels. Defaults to `e2e,kernel`. |
+
+Recording begins only after `POST /start_profile`. The CLI resolves
+`--profile-output` to an absolute path before spawning workers, so every process
+writes to the same location.
+
+Offline generation continues to use `SA_PROFILE_OUTPUT` and
+`SA_PROFILE_LEVEL`; setting either variable starts offline recording
+immediately.
 
 The event levels are:
 
@@ -38,9 +47,9 @@ For a directory output, the module creates:
 └── trace.json
 ```
 
-When `SA_PROFILE_OUTPUT` ends in `.json`, that path is used for the merged
-trace and the fragments are stored in a sibling directory. For example,
-`SA_PROFILE_OUTPUT=/tmp/run.json` produces `/tmp/run.json` and
+When the output ends in `.json`, that path is used for the merged trace and the
+fragments are stored in a sibling directory. For example,
+`--profile-output=/tmp/run.json` produces `/tmp/run.json` and
 `/tmp/run.json.fragments/`.
 
 Use a different output path for each run. Starting a new main process removes
@@ -78,29 +87,45 @@ without either CLI option.
 
 ## Profile HTTP Serving
 
-Start the server with profiling enabled:
+Start the server with profiling configured:
 
 ```bash
-SA_PROFILE_OUTPUT=/tmp/pypto-profile-serving \
-SA_PROFILE_LEVEL=e2e,kernel \
 pypto-serving \
   --model /path/to/Qwen3-14B \
   --backend npu \
   --platform a2a3 \
   --device 0 \
   --max-model-len 512 \
-  --port 8899
+  --port 8899 \
+  --profile \
+  --profile-output /tmp/pypto-profile-serving \
+  --profile-level e2e,kernel
 ```
 
-Send the workload to profile, then stop the server gracefully. The API process
-waits for its worker processes to stop and merges all process fragments into
-`/tmp/pypto-profile-serving/trace.json` during application shutdown.
+Wait for the server to become ready, start profiling, send the workload, and
+then stop profiling:
+
+```bash
+curl --noproxy "*" -X POST http://localhost:8899/start_profile
+# Send the requests to profile.
+curl --noproxy "*" -X POST http://localhost:8899/stop_profile
+```
+
+The endpoints follow the vLLM profiling API. `start_profile` starts recording
+in the API process and every replica worker. `stop_profile` waits for every
+worker to flush its fragment and then atomically writes the merged trace to
+`/tmp/pypto-profile-serving/trace.json`; the serving process keeps running.
+Repeated `start_profile` calls while active and `stop_profile` calls while
+inactive are safe.
+
+A graceful server shutdown also stops all recorders and merges their fragments,
+so it remains a fallback when profiling was left active.
 
 ## Merge Profile Fragments Manually
 
 Use `scripts/merge_profile.sh` when automatic merging did not run, for example
-after an interrupted serving process. Pass the same output path that was used
-for `SA_PROFILE_OUTPUT`:
+after an interrupted serving process. Pass the same path used for
+`--profile-output`:
 
 ```bash
 ./scripts/merge_profile.sh /tmp/pypto-profile-serving
@@ -166,7 +191,11 @@ profile_duration(
 - `is_enabled(level)` can guard expensive argument construction or optional
   instrumentation.
 - `get_profiler(process_name=...)` initializes the process-local recorder and
-  sets the process name shown in the trace viewer.
+  sets the process name shown in the trace viewer. Pass
+  `initially_active=False` when the process must wait for an external control
+  signal.
+- `start_profile()` starts a fresh process-local recording session.
+- `stop_profile()` flushes and stops the process-local recording session.
 - `merge_profile()` closes the current process recorder and builds the final
   trace. Call it only after child processes have stopped and flushed their
   fragments.

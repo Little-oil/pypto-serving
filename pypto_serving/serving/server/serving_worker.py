@@ -28,14 +28,17 @@ from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
+    ProfileCommand,
+    ProfileResult,
     ShutdownCommand,
     StepCommand,
     StepResult,
     decode_command,
+    encode_profile_result,
     encode_result,
 )
 from pypto_serving.serving.utils.prefill import pack_prefill_batch
-from pypto_serving.tools.profile import get_profiler, profile_span
+from pypto_serving.tools.profile import configure_profiler, get_profiler, profile_span
 
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
@@ -55,10 +58,12 @@ class WorkerProcess:
         config: EngineConfig,
         input_queue: mp.Queue,
         output_queue: mp.Queue,
+        profile_output_queue: mp.Queue | None = None,
     ):
         self.config = config
         self.input_queue = input_queue
         self.output_queue = output_queue
+        self.profile_output_queue = profile_output_queue
 
         self.executor = None
         self.sampler = None
@@ -81,8 +86,11 @@ class WorkerProcess:
         device_ids = self.config.worker_device_ids()
         device_label = ",".join(str(device_id) for device_id in device_ids)
         pypto_build_dir = self._configure_pypto_build_dir(device_ids)
-        if mp.current_process().name != "MainProcess":
-            get_profiler(process_name=f"serving-worker-{device_label}")
+        configure_profiler(
+            self.config.profile_config,
+            process_name=f"serving-worker-{device_label}",
+            initially_active=False,
+        )
         with profile_span(
             "WorkerProcess.init_device_and_model",
             cat="worker",
@@ -174,9 +182,33 @@ class WorkerProcess:
                 logger.info("Worker received shutdown command")
                 break
 
+            if isinstance(cmd, ProfileCommand):
+                self._handle_profile_command(cmd)
+                continue
+
             self._handle_step_command(cmd)
 
         logger.info("Worker exiting")
+
+    def _handle_profile_command(self, cmd: ProfileCommand) -> None:
+        """Apply a profile command and acknowledge it after the file is flushed."""
+        profiler = get_profiler(initially_active=False)
+        error = None
+        try:
+            if cmd.active:
+                profiler.start()
+            else:
+                profiler.stop()
+            if profiler.active != cmd.active:
+                error = "SA profiling is not configured in the worker process"
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Worker profile command failed: %s", exc, exc_info=True)
+
+        if self.profile_output_queue is not None:
+            self.profile_output_queue.put(
+                encode_profile_result(ProfileResult(active=profiler.active, error=error))
+            )
 
     def _handle_step_command(self, cmd: StepCommand) -> None:
         """Handle a StepCommand and push an encoded StepResult.
@@ -483,6 +515,7 @@ def _worker_entry(
     output_queue: mp.Queue,
     ready_event,
     num_pages_value,
+    profile_output_queue: mp.Queue | None = None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -501,7 +534,7 @@ def _worker_entry(
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
 
-    worker = WorkerProcess(config, input_queue, output_queue)
+    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
     try:
         num_pages = worker.init_device_and_model()
         num_pages_value.value = num_pages
@@ -520,26 +553,43 @@ def _worker_entry(
             worker.close()
         except Exception:
             logger.exception("Worker process cleanup failed")
+        get_profiler(initially_active=False).stop()
 
 
 def spawn_worker(config: EngineConfig):
-    """Spawn a worker process and return (process, input_queue, output_queue, ready_event, num_pages_value).
+    """Spawn a worker process and return its process, queues, and ready state.
 
     ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
     worker writes after ``init_device_and_model()`` completes.  The main
     process reads it to synchronise the ``KvCacheManager`` block metadata with
-    the actual device-side KV cache size.
+    the actual device-side KV cache size. Profile acknowledgements use a
+    dedicated output queue so they cannot be mistaken for inference results.
     """
     ctx = mp.get_context("spawn")
     input_queue = ctx.Queue()
     output_queue = ctx.Queue()
+    profile_output_queue = ctx.Queue()
     ready_event = ctx.Event()
     num_pages_value = ctx.Value("i", 0)
 
     process = ctx.Process(
         target=_worker_entry,
-        args=(config, input_queue, output_queue, ready_event, num_pages_value),
+        args=(
+            config,
+            input_queue,
+            output_queue,
+            ready_event,
+            num_pages_value,
+            profile_output_queue,
+        ),
         daemon=False,
     )
     process.start()
-    return process, input_queue, output_queue, ready_event, num_pages_value
+    return (
+        process,
+        input_queue,
+        output_queue,
+        profile_output_queue,
+        ready_event,
+        num_pages_value,
+    )
