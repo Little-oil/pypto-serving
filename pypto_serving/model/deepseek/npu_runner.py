@@ -110,6 +110,7 @@ DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
 DEEPSEEK_V4_LM_HEAD_TP_SIZE = 4
 DEEPSEEK_V4_MAX_LOGIT_ROWS = 8
+DEEPSEEK_V4_SAMPLED_IDS_PAD = 8
 
 # Policy values indicate whether a resident argument contains mutable request
 # cache state and therefore must be invalidated before its Host backing is
@@ -469,18 +470,6 @@ _DECODE_FWD_TENSOR_ORDER = (
     "freqs_cos",
     "freqs_sin",
     "block_table",
-    "ori_slot_mapping",
-    "window_swa_indices",
-    "window_swa_lens",
-    "swa_slot_mapping",
-    "swa_indices",
-    "swa_lens",
-    "hca_cmp_slot_mapping",
-    "hca_state_slot_mapping",
-    "csa_cmp_slot_mapping",
-    "csa_idx_slot_mapping",
-    "csa_state_slot_mapping",
-    "csa_inner_state_slot_mapping",
     "position_ids",
     "kv_seq_lens",
     "hca_compress_state_block_table",
@@ -488,6 +477,7 @@ _DECODE_FWD_TENSOR_ORDER = (
     "csa_inner_compress_state_block_table",
     "cmp_block_table",
     "idx_block_table",
+    "block_counts",
     "input_ids",
     "hc_head_fn",
     "hc_head_scale",
@@ -497,6 +487,7 @@ _DECODE_FWD_TENSOR_ORDER = (
     "lm_head_weight",
     "hidden_out",
     "logits",
+    "sampled_ids",
     "num_tokens_per_owner",
     "logit_row_indices",
 )
@@ -524,7 +515,7 @@ _MTP_DECODE_TENSOR_ORDER = (
     "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "freqs_cos", "freqs_sin", "kv_cache", "swa_slot_mapping", "swa_indices", "swa_lens",
+    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table",
     "attn_sink", "wo_a", "wo_b", "wo_b_scale",
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid", "input_ids",
@@ -532,7 +523,8 @@ _MTP_DECODE_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "logit_row_indices",
+    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
+    "logit_row_indices",
 )
 
 _DECODE_INPUT_TENSOR_FIELDS = (
@@ -540,23 +532,12 @@ _DECODE_INPUT_TENSOR_FIELDS = (
     "position_ids",
     "kv_seq_lens",
     "block_table",
-    "ori_slot_mapping",
-    "window_swa_indices",
-    "window_swa_lens",
-    "swa_slot_mapping",
-    "swa_indices",
-    "swa_lens",
     "cmp_block_table",
     "idx_block_table",
     "hca_compress_state_block_table",
     "csa_compress_state_block_table",
     "csa_inner_compress_state_block_table",
-    "hca_cmp_slot_mapping",
-    "hca_state_slot_mapping",
-    "csa_cmp_slot_mapping",
-    "csa_idx_slot_mapping",
-    "csa_state_slot_mapping",
-    "csa_inner_state_slot_mapping",
+    "block_counts",
     "num_tokens_per_owner",
     "logit_row_indices",
 )
@@ -1183,23 +1164,12 @@ class DeepSeekV4PreparedDecodeInputs:
     position_ids: torch.Tensor
     kv_seq_lens: torch.Tensor
     block_table: torch.Tensor
-    ori_slot_mapping: torch.Tensor
-    window_swa_indices: torch.Tensor
-    window_swa_lens: torch.Tensor
-    swa_slot_mapping: torch.Tensor
-    swa_indices: torch.Tensor
-    swa_lens: torch.Tensor
     cmp_block_table: torch.Tensor
     idx_block_table: torch.Tensor
     hca_compress_state_block_table: torch.Tensor
     csa_compress_state_block_table: torch.Tensor
     csa_inner_compress_state_block_table: torch.Tensor
-    hca_cmp_slot_mapping: torch.Tensor
-    hca_state_slot_mapping: torch.Tensor
-    csa_cmp_slot_mapping: torch.Tensor
-    csa_idx_slot_mapping: torch.Tensor
-    csa_state_slot_mapping: torch.Tensor
-    csa_inner_state_slot_mapping: torch.Tensor
+    block_counts: torch.Tensor
     block_ids_by_group: tuple[dict[str, tuple[int, ...]], ...]
     num_tokens_per_owner: torch.Tensor
     logit_row_indices: torch.Tensor
@@ -1223,6 +1193,7 @@ class _DeepSeekV4MainDecodeOutput:
     hidden: torch.Tensor
     pre_hc_hidden: torch.Tensor
     logits: torch.Tensor
+    sampled_ids: torch.Tensor
 
 
 @dataclass
@@ -1233,6 +1204,7 @@ class _DeepSeekV4DecodeSharedBuffers:
     x_hc_b: torch.Tensor
     pre_hc_hidden_out: torch.Tensor
     x_out: torch.Tensor
+    sampled_ids: torch.Tensor
     tensors: dict[str, torch.Tensor]
 
 
@@ -1273,9 +1245,6 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_prev_hidden_in: torch.Tensor
     decode_input_ids: torch.Tensor
     decode_position_ids: torch.Tensor
-    decode_slot_mapping: torch.Tensor
-    decode_swa_indices: torch.Tensor
-    decode_swa_lens: torch.Tensor
     decode_kv_cache: torch.Tensor
     prefill_hidden_out: torch.Tensor
     prefill_pre_hc_out: torch.Tensor
@@ -1284,6 +1253,7 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_hidden_out: torch.Tensor
     decode_pre_hc_out: torch.Tensor
     decode_logits: torch.Tensor
+    decode_sampled_ids: torch.Tensor
     decode_logit_row_indices: torch.Tensor
 
 
@@ -1952,7 +1922,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 fill_all=not self._decode_x_hc_initialized,
             )
             self._decode_x_hc_initialized = True
-        with profile_span("DeepSeekV4ModelRunner.decode.build_metadata", cat="executor"):
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_metadata_sources", cat="executor"):
             return self._prepare_decode_inputs(
                 model,
                 batch,
@@ -1995,7 +1965,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 fill_all=not self._decode_x_hc_initialized,
             )
             self._decode_x_hc_initialized = True
-        with profile_span("DeepSeekV4ModelRunner.decode.build_metadata", cat="executor"):
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_metadata_sources", cat="executor"):
             return self._prepare_decode_inputs(
                 model,
                 batch,
@@ -2125,6 +2095,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
                             max_blocks=layout.prefill_csa_inner_state_max_blocks,
                         )
                     ),
+                    "block_counts": torch.tensor(
+                        [
+                            [
+                                len(padded_group_ids[name][row])
+                                for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
+                            ]
+                            for row in range(layout.decode_batch)
+                        ],
+                        dtype=torch.int32,
+                    ),
                 }
                 for name, value in static_values.items():
                     self._copy_shared(
@@ -2133,90 +2113,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         name=f"decode_{name}_rank{rank}",
                     )
                 self._decode_static_metadata_keys[rank] = static_key
-
-            self._copy_shared(
-                staged["ori_slot_mapping"][rank],
-                self.cache_metadata.sliding_window_slot_mapping_from_ids(
-                    padded_group_ids["ori"],
-                    padded_positions,
-                ).reshape(-1),
-                name=f"decode_ori_slot_mapping_rank{rank}",
-            )
-            self._copy_shared(
-                staged["swa_slot_mapping"][rank],
-                self.cache_metadata.paged_decode_slot_mapping_from_ids(
-                    padded_group_ids["ori"],
-                    padded_positions,
-                ).reshape(-1),
-                name=f"decode_swa_slot_mapping_rank{rank}",
-            )
-            swa_indices, swa_lens = self.cache_metadata.swa_window_indices_and_lens_from_ids(
-                padded_group_ids["ori"], padded_positions
-            )
-            for name, value in (
-                ("swa_indices", swa_indices),
-                ("window_swa_indices", swa_indices),
-                ("swa_lens", swa_lens),
-                ("window_swa_lens", swa_lens),
-            ):
-                self._copy_shared(
-                    staged[name][rank],
-                    value,
-                    name=f"decode_{name}_rank{rank}",
-                )
-            dynamic_mappings = {
-                "hca_cmp_slot_mapping": (
-                    self.cache_metadata.compressed_slot_mapping_from_ids(
-                        padded_group_ids["cmp"],
-                        padded_positions,
-                        block_size=layout.block_size,
-                        compress_ratio=128,
-                    ).reshape(-1)
-                ),
-                "hca_state_slot_mapping": (
-                    self.cache_metadata.state_slot_mapping_from_ids(
-                        padded_group_ids["hca_state"],
-                        padded_positions,
-                        state_block_size=layout.c128_state_block_size,
-                    ).reshape(-1)
-                ),
-                "csa_cmp_slot_mapping": (
-                    self.cache_metadata.compressed_slot_mapping_from_ids(
-                        padded_group_ids["cmp"],
-                        padded_positions,
-                        block_size=layout.block_size,
-                        compress_ratio=4,
-                    ).reshape(-1)
-                ),
-                "csa_idx_slot_mapping": (
-                    self.cache_metadata.compressed_slot_mapping_from_ids(
-                        padded_group_ids["idx"],
-                        padded_positions,
-                        block_size=layout.block_size,
-                        compress_ratio=4,
-                    ).reshape(-1)
-                ),
-                "csa_state_slot_mapping": (
-                    self.cache_metadata.state_slot_mapping_from_ids(
-                        padded_group_ids["csa_state"],
-                        padded_positions,
-                        state_block_size=layout.c4_state_block_size,
-                    ).reshape(-1)
-                ),
-                "csa_inner_state_slot_mapping": (
-                    self.cache_metadata.state_slot_mapping_from_ids(
-                        padded_group_ids["csa_inner_state"],
-                        padded_positions,
-                        state_block_size=layout.c4_state_block_size,
-                    ).reshape(-1)
-                ),
-            }
-            for name, value in dynamic_mappings.items():
-                self._copy_shared(
-                    staged[name][rank],
-                    value,
-                    name=f"decode_{name}_rank{rank}",
-                )
 
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
@@ -2243,12 +2139,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             position_ids=staged["position_ids"],
             kv_seq_lens=staged["kv_seq_lens"],
             block_table=staged["block_table"],
-            ori_slot_mapping=staged["ori_slot_mapping"],
-            window_swa_indices=staged["window_swa_indices"],
-            window_swa_lens=staged["window_swa_lens"],
-            swa_slot_mapping=staged["swa_slot_mapping"],
-            swa_indices=staged["swa_indices"],
-            swa_lens=staged["swa_lens"],
             cmp_block_table=staged["cmp_block_table"],
             idx_block_table=staged["idx_block_table"],
             hca_compress_state_block_table=staged["hca_compress_state_block_table"],
@@ -2256,12 +2146,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             csa_inner_compress_state_block_table=staged[
                 "csa_inner_compress_state_block_table"
             ],
-            hca_cmp_slot_mapping=staged["hca_cmp_slot_mapping"],
-            hca_state_slot_mapping=staged["hca_state_slot_mapping"],
-            csa_cmp_slot_mapping=staged["csa_cmp_slot_mapping"],
-            csa_idx_slot_mapping=staged["csa_idx_slot_mapping"],
-            csa_state_slot_mapping=staged["csa_state_slot_mapping"],
-            csa_inner_state_slot_mapping=staged["csa_inner_state_slot_mapping"],
+            block_counts=staged["block_counts"],
             block_ids_by_group=active_group_ids,
             num_tokens_per_owner=staged["num_tokens_per_owner"],
             logit_row_indices=staged["logit_row_indices"],
@@ -2446,14 +2331,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         inputs = output.inputs
         decode_seq = self._compiled.layout.decode_seq
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_accept", cat="executor"):
-            pair_logits = torch.stack(
+            main_ids = torch.stack(
                 tuple(
-                    output.logits[rank, local_row * decode_seq + offset]
+                    output.sampled_ids[rank, local_row * decode_seq + offset, 0]
                     for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
                     for offset in range(decode_seq)
                 )
-            ).float()
-            main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
+            ).to(torch.long).reshape(inputs.actual_batch, decode_seq)
             accepted = accept_mtp_tokens(main_ids, draft_token_ids)
             self._mtp_proposed_tokens += inputs.actual_batch
             self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
@@ -2488,7 +2372,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         return DecodeResult(
             hidden_states=None,
-            logits=pair_logits[::decode_seq],
+            logits=None,
             accepted_token_ids=accepted,
         )
 
@@ -2510,6 +2394,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = decode_buffers.pre_hc_hidden_out
         logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
+        sampled_ids_buffer = decode_buffers.sampled_ids
         # The active hidden/pre-HC rows are pl.Out tensors and the grouped LM
         # head overwrites every logits row, including rows selected with -1.
         # Pre-clearing these reusable buffers only adds host memory bandwidth.
@@ -2525,6 +2410,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 pre_hc_hidden_buffer,
                 hidden_buffer,
                 logits_buffer,
+                sampled_ids_buffer,
             )
         self._debug_decode_dispatch(inputs, args)
         try:
@@ -2552,6 +2438,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             hidden=hidden_buffer,
             pre_hc_hidden=pre_hc_hidden_buffer,
             logits=logits_buffer,
+            sampled_ids=sampled_ids_buffer,
         )
 
     @staticmethod
@@ -2719,6 +2606,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         pre_hc_hidden_out: torch.Tensor,
         hidden_out: torch.Tensor,
         logits: torch.Tensor,
+        sampled_ids: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
         cache = self._materialize_decode_device_cache()
@@ -2732,18 +2620,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "freqs_sin": self._static_freqs_sin_tensor(),
                 "kv_cache": cache.kv_cache,
                 "block_table": inputs.block_table,
-                "ori_slot_mapping": inputs.ori_slot_mapping,
-                "window_swa_indices": inputs.window_swa_indices,
-                "window_swa_lens": inputs.window_swa_lens,
-                "swa_slot_mapping": inputs.swa_slot_mapping,
-                "swa_indices": inputs.swa_indices,
-                "swa_lens": inputs.swa_lens,
-                "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
-                "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
-                "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
-                "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
-                "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
-                "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
                 "position_ids": inputs.position_ids,
                 "kv_seq_lens": inputs.kv_seq_lens,
                 "hca_compress_state": cache.hca_compress_state,
@@ -2757,6 +2633,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "idx_kv_cache": cache.idx_kv_cache,
                 "idx_kv_scale": cache.idx_kv_scale,
                 "idx_block_table": inputs.idx_block_table,
+                "block_counts": inputs.block_counts,
                 "input_ids": inputs.input_ids,
                 "hc_head_fn": hc_head["hc_head_fn"],
                 "hc_head_scale": hc_head["hc_head_scale"],
@@ -2766,6 +2643,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
                 "hidden_out": hidden_out,
                 "logits": logits,
+                "sampled_ids": sampled_ids,
                 "num_tokens_per_owner": inputs.num_tokens_per_owner,
                 "logit_row_indices": inputs.logit_row_indices,
             }
@@ -2827,14 +2705,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "freqs_cos": self._static_freqs_cos_tensor(),
                 "freqs_sin": self._static_freqs_sin_tensor(),
                 "kv_cache": kv_cache,
-                "swa_slot_mapping": buffers.decode_slot_mapping,
-                "swa_indices": buffers.decode_swa_indices,
-                "swa_lens": buffers.decode_swa_lens,
+                "ori_block_table": self._require_decode_buffers().tensors["block_table"],
                 "input_ids": buffers.decode_input_ids,
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
                 "hidden_out": buffers.decode_hidden_out,
                 "next_pre_hc_hidden": buffers.decode_pre_hc_out,
                 "logits": buffers.decode_logits,
+                "sampled_ids": buffers.decode_sampled_ids,
                 "logit_row_indices": buffers.decode_logit_row_indices,
             }
         )
@@ -3056,7 +2933,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             state = self._require_mtp_request_state(request_id)
             _, committed_hidden, committed_positions = committed[request_index]
             state.draft_token_id = int(
-                buffers.decode_logits[inputs.ranks[request_index], inputs.local_rows[request_index]].argmax().item()
+                buffers.decode_sampled_ids[
+                    inputs.ranks[request_index],
+                    inputs.local_rows[request_index],
+                    0,
+                ].item()
             )
             state.tail_token_id = int(committed[request_index][0][-1].item())
             state.tail_pre_hc_hidden = committed_hidden[-1].clone()
@@ -3101,59 +2982,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 buffers.decode_input_ids[rank, row_slice].copy_(ids)
                 buffers.decode_position_ids[rank, row_slice].copy_(positions)
                 buffers.decode_prev_hidden_in[rank, row_slice].copy_(hidden)
-
-        slot_mappings = []
-        swa_indices_by_rank = []
-        swa_lens_by_rank = []
-        with profile_span("DeepSeekV4ModelRunner.mtp.build_metadata", cat="executor"):
-            for rank in range(layout.ranks):
-                request_indices = [
-                    index for index, owner_rank in enumerate(inputs.ranks) if owner_rank == rank
-                ]
-                if request_indices:
-                    active_blocks = [
-                        inputs.block_ids_by_group[index]["ori"] for index in request_indices
-                    ]
-                    padded_blocks = self._pad_group_block_ids(
-                        active_blocks,
-                        group_name="ori",
-                        kernel_rows=layout.decode_batch,
-                    )
-                    padded_positions = [
-                        tuple(int(value) for value in committed[index][2].tolist())
-                        for index in request_indices
-                    ]
-                    while len(padded_positions) < layout.decode_batch:
-                        padded_positions.append(
-                            tuple(int(value) for value in fallback_positions.tolist())
-                        )
-                else:
-                    padded_blocks = self._scratch_group_block_ids(
-                        group_name="ori",
-                        kernel_rows=layout.decode_batch,
-                    )
-                    padded_positions = [
-                        tuple(int(value) for value in fallback_positions.tolist())
-                        for _ in range(layout.decode_batch)
-                    ]
-                slot_mappings.append(
-                    self.cache_metadata.paged_decode_slot_mapping_from_ids(
-                        padded_blocks,
-                        padded_positions,
-                    ).reshape(-1)
-                )
-                rank_swa_indices, rank_swa_lens = (
-                    self.cache_metadata.swa_window_indices_and_lens_from_ids(
-                        padded_blocks,
-                        padded_positions,
-                    )
-                )
-                swa_indices_by_rank.append(rank_swa_indices)
-                swa_lens_by_rank.append(rank_swa_lens)
-
-            buffers.decode_slot_mapping.copy_(torch.stack(slot_mappings))
-            buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
-            buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
 
         with profile_span("DeepSeekV4ModelRunner.mtp.lookup_embeddings", cat="executor"):
             staged_ids = buffers.decode_input_ids[:, :fill_tokens]
@@ -3250,17 +3078,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "x_hc",
             "kv_cache",
             "block_table",
-            "ori_slot_mapping",
             "cmp_kv",
             "cmp_block_table",
             "idx_kv_cache",
             "idx_block_table",
+            "block_counts",
             "hca_compress_state",
-            "hca_state_slot_mapping",
             "csa_compress_state",
-            "csa_state_slot_mapping",
             "csa_inner_compress_state",
-            "csa_inner_state_slot_mapping",
             "position_ids",
             "kv_seq_lens",
             "input_ids",
@@ -3316,24 +3141,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "kv_cache",
             "ori_block_table",
             "block_table",
-            "ori_slot_mapping",
             "cmp_kv",
             "cmp_block_table",
             "idx_kv_cache",
             "idx_kv_scale",
             "idx_block_table",
+            "block_counts",
             "position_ids",
-            "window_swa_indices",
-            "window_swa_lens",
-            "swa_slot_mapping",
-            "swa_indices",
-            "swa_lens",
-            "hca_cmp_slot_mapping",
-            "hca_state_slot_mapping",
-            "csa_cmp_slot_mapping",
-            "csa_idx_slot_mapping",
-            "csa_state_slot_mapping",
-            "csa_inner_state_slot_mapping",
             "hca_compress_state",
             "csa_compress_state",
             "csa_inner_compress_state",
@@ -3372,6 +3186,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     torch.bfloat16,
                     name="decode_x_out",
                 ),
+                sampled_ids=self._shared_empty(
+                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                    torch.int32,
+                    name="decode_sampled_ids",
+                ),
                 tensors={
                     "input_ids": self._shared_empty((ranks, tokens), torch.long, name="decode_input_ids"),
                     "position_ids": self._shared_empty((ranks, tokens), torch.int32, name="decode_position_ids"),
@@ -3380,36 +3199,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         (ranks, batch, layout.ori_table_max_blocks),
                         torch.int32,
                         name="decode_block_table",
-                    ),
-                    "ori_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_ori_slot_mapping",
-                    ),
-                    "window_swa_indices": self._shared_empty(
-                        (ranks, tokens, layout.sliding_window),
-                        torch.int32,
-                        name="decode_window_swa_indices",
-                    ),
-                    "window_swa_lens": self._shared_empty(
-                        (ranks, tokens),
-                        torch.int32,
-                        name="decode_window_swa_lens",
-                    ),
-                    "swa_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_swa_slot_mapping",
-                    ),
-                    "swa_indices": self._shared_empty(
-                        (ranks, tokens, layout.sliding_window),
-                        torch.int32,
-                        name="decode_swa_indices",
-                    ),
-                    "swa_lens": self._shared_empty(
-                        (ranks, tokens),
-                        torch.int32,
-                        name="decode_swa_lens",
                     ),
                     "cmp_block_table": self._shared_empty(
                         (ranks, batch, layout.cmp_max_blocks),
@@ -3436,35 +3225,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         torch.int32,
                         name="decode_csa_inner_compress_state_block_table",
                     ),
-                    "hca_cmp_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_hca_cmp_slot_mapping",
-                    ),
-                    "hca_state_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_hca_state_slot_mapping",
-                    ),
-                    "csa_cmp_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_csa_cmp_slot_mapping",
-                    ),
-                    "csa_idx_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_csa_idx_slot_mapping",
-                    ),
-                    "csa_state_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_csa_state_slot_mapping",
-                    ),
-                    "csa_inner_state_slot_mapping": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name="decode_csa_inner_state_slot_mapping",
+                    "block_counts": self._shared_empty(
+                        (ranks, batch, len(DEEPSEEK_V4_CACHE_GROUP_NAMES)),
+                        torch.int32,
+                        name="decode_block_counts",
                     ),
                     "num_tokens_per_owner": self._shared_empty(
                         (ranks,),
@@ -3541,15 +3305,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             decode_position_ids=self._shared_empty(
                 (ranks, tokens), torch.int32, name="mtp_decode_position_ids"
             ),
-            decode_slot_mapping=self._shared_empty(
-                (ranks, tokens), torch.long, name="mtp_decode_slot_mapping"
-            ),
-            decode_swa_indices=self._shared_empty(
-                (ranks, tokens, layout.sliding_window), torch.int32, name="mtp_decode_swa_indices"
-            ),
-            decode_swa_lens=self._shared_empty(
-                (ranks, tokens), torch.int32, name="mtp_decode_swa_lens"
-            ),
             decode_kv_cache=mtp_kv_cache,
             prefill_hidden_out=self._shared_empty(
                 (ranks, layout.prefill_seq, hidden), torch.bfloat16, name="mtp_prefill_hidden_out"
@@ -3579,6 +3334,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
                 torch.float32,
                 name="mtp_decode_logits",
+            ),
+            decode_sampled_ids=self._shared_empty(
+                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                torch.int32,
+                name="mtp_decode_sampled_ids",
             ),
             decode_logit_row_indices=self._shared_empty(
                 (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), torch.int32, name="mtp_decode_logit_row_indices"

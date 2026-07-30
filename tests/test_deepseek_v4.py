@@ -406,9 +406,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hidden_out")].shape == (8, 8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("sampled_ids")].shape == (8, 8, 8)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Prefill and decode share the same runtime-sized physical pool.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (
@@ -419,13 +419,12 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert decode_args[decode_order.index("idx_kv_scale")].shape == (
         8, 21 * cache_blocks["idx"], 128, 1, 1
     )
-    # SWA/HCA/CSA metadata all use the cache-first full window, plus the paged
-    # write slot mapping.
-    assert decode_args[decode_order.index("swa_slot_mapping")].shape == (8, 8)
-    assert decode_args[decode_order.index("swa_indices")].shape == (8, 8, 128)
-    assert decode_args[decode_order.index("swa_lens")].shape == (8, 8)
-    assert decode_args[decode_order.index("window_swa_indices")].shape == (8, 8, 128)
-    assert decode_args[decode_order.index("window_swa_lens")].shape == (8, 8)
+    # Position-dependent SWA/HCA/CSA metadata is lowered on device. The host
+    # ABI retains only allocator-owned tables and their active block counts.
+    assert decode_args[decode_order.index("block_counts")].shape == (8, 8, 6)
+    assert "swa_slot_mapping" not in decode_order
+    assert "swa_indices" not in decode_order
+    assert "hca_state_slot_mapping" not in decode_order
 
 
 def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
@@ -1067,7 +1066,7 @@ def test_deepseek_prepare_decode_inputs_requires_hidden_states():
         )
 
 
-def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
+def test_deepseek_prepare_mtp_decode_inputs_stages_device_metadata_sources():
     runner, model = _runner_for_prepared_inputs()
 
     prepared = runner.prepare_mtp_decode_inputs(
@@ -1088,22 +1087,11 @@ def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
     assert prepared.block_table.shape == (8, 4, 128)
     assert prepared.block_table[0, 0, :4].tolist() == [0, 0, 0, 0]
     assert prepared.block_table[1, 0, :4].tolist() == [6, 6, 6, 6]
-    # SWA full window includes the current position and lowers through the
-    # request's physical ori page.
-    assert prepared.swa_lens[0, 0].item() == 127
-    assert prepared.swa_lens[0, 1].item() == 128
-    assert prepared.swa_lens[1, 1].item() == 5
-    assert prepared.swa_indices[0, 1, :4].tolist() == [0, 1, 2, 3]
-    assert prepared.swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
-    # Paged write slot for the current token.
-    assert prepared.swa_slot_mapping[0, 1].item() == 127
-    assert prepared.swa_slot_mapping[1, 1].item() == 772
-    # HCA/CSA follow pypto-lib's cache-first contract: their window contains
-    # historical rows and the current decode position after KV writeback.
-    assert prepared.window_swa_lens[0, 0].item() == 127
-    assert prepared.window_swa_lens[0, 1].item() == 128
-    assert prepared.window_swa_lens[1, 1].item() == 5
-    assert prepared.window_swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
+    assert prepared.position_ids[0, :2].tolist() == [126, 127]
+    assert prepared.position_ids[1, :2].tolist() == [3, 4]
+    assert prepared.block_counts.shape == (8, 4, 6)
+    assert prepared.block_counts[0, 0].tolist() == [1, 1, 1, 1, 1, 1]
+    assert prepared.block_counts[1, 0].tolist() == [1, 1, 1, 1, 1, 1]
     assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
 
@@ -1166,23 +1154,12 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
         "position_ids",
         "kv_seq_lens",
         "block_table",
-        "ori_slot_mapping",
-        "window_swa_indices",
-        "window_swa_lens",
-        "swa_slot_mapping",
-        "swa_indices",
-        "swa_lens",
         "cmp_block_table",
         "idx_block_table",
         "hca_compress_state_block_table",
         "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
-        "hca_cmp_slot_mapping",
-        "hca_state_slot_mapping",
-        "csa_cmp_slot_mapping",
-        "csa_idx_slot_mapping",
-        "csa_state_slot_mapping",
-        "csa_inner_state_slot_mapping",
+        "block_counts",
     ):
         assert getattr(staged, name).is_shared()
 
@@ -1265,22 +1242,6 @@ def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first
             layout.decode_tokens,
             dtype=torch.int32,
         ),
-        decode_slot_mapping=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.long,
-        ),
-        decode_swa_indices=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            layout.sliding_window,
-            dtype=torch.int32,
-        ),
-        decode_swa_lens=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
         decode_logit_row_indices=torch.empty(
             layout.ranks,
             layout.decode_tokens,
@@ -1334,13 +1295,13 @@ def test_deepseek_run_decode_dispatches_active_token_count():
         captured["prepared"] = inputs
         return inputs
 
-    def fake_decode_fwd_args(inputs, x_hc, pre_hc_hidden_out, hidden_out, logits):
+    def fake_decode_fwd_args(inputs, x_hc, pre_hc_hidden_out, hidden_out, logits, sampled_ids):
         captured["x_hc_shape"] = tuple(x_hc.shape)
         captured["num_tokens_per_owner"] = inputs.num_tokens_per_owner
-        return (x_hc, pre_hc_hidden_out, hidden_out, logits)
+        return (x_hc, pre_hc_hidden_out, hidden_out, logits, sampled_ids)
 
     def fake_run_l3(_callable, *args):
-        args[-1].fill_(1)
+        args[-2].fill_(1)
 
     hidden_out = torch.empty(
         runner._compiled.layout.ranks,
@@ -1358,6 +1319,12 @@ def test_deepseek_run_decode_dispatches_active_token_count():
             runner._compiled.layout.hc_mult,
             model.config.hidden_size,
             dtype=torch.float32,
+        ),
+        sampled_ids=torch.empty(
+            runner._compiled.layout.ranks,
+            runner._compiled.layout.decode_tokens,
+            8,
+            dtype=torch.int32,
         ),
     )
     runner._require_decode_output_buffer = lambda _hidden_size: hidden_out
