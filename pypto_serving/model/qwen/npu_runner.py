@@ -254,7 +254,14 @@ class Qwen314BModelRunner(ModelRunner):
 
         # -- phase 2: real KV cache, halve-and-retry on OOM -----------------
         logger.info("[init_kv_cache] computing KV cache pages …")
-        num_pages = self._compute_kv_cache_pages(config, runtime, self._device_id)
+        simpler_committed = self._query_simpler_committed()
+        if simpler_committed:
+            logger.info("[init_kv_cache] using simpler committed_device_memory=%.2f GB", simpler_committed / 1e9)
+        else:
+            logger.info("[init_kv_cache] committed_device_memory unavailable; using driver-only peak_non_kv sizing")
+        num_pages = self._compute_kv_cache_pages(
+            config, runtime, self._device_id, simpler_committed=simpler_committed,
+        )
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
         self._print_memory_breakdown("after KV cache alloc", config, runtime, num_pages, self._device_id)
         logger.info("[init_kv_cache] done")
@@ -295,16 +302,44 @@ class Qwen314BModelRunner(ModelRunner):
             f"KV cache allocation failed even at floor {floor} pages"
         )
 
+    def _query_simpler_committed(self) -> int:
+        """simpler's committed device HBM for the device being sized (self._device_id).
+
+        ``committed_device_memory`` is simpler's authoritative MemoryAllocator
+        total (weights + pooled arenas + runtime buffers). KV sizing is per
+        device, so query only this device's chip child - not the sum across all
+        chips (which would over-subtract on a multi-device worker).
+        ``_compute_kv_cache_pages`` takes ``max(peak_non_kv, this)``, so the
+        budget never over-provisions whether or not ``aclrtGetMemInfo`` sees
+        simpler's ``rtMalloc`` pool. Returns 0 if the worker isn't ready or the
+        query fails (falls back to the old sizing + halve-retry).
+        """
+        worker = self._l3_worker
+        if worker is None:
+            return 0
+        try:
+            device_ids = tuple(getattr(worker, "device_ids", ()) or (self._device_id,))
+            chip = device_ids.index(self._device_id) if self._device_id in device_ids else 0
+            return int(worker.committed_device_memory(chip))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("committed_device_memory unavailable; KV sizing ignores it: %s", e)
+            return 0
+
     @staticmethod
-    def _compute_kv_cache_pages(config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0) -> int:
-        """Compute KV cache pages, vLLM-style: total x utilization − peak_non_kv.
+    def _compute_kv_cache_pages(
+        config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0, simpler_committed: int = 0,
+    ) -> int:
+        """Compute KV cache pages, vLLM-style: total x utilization - peak_non_kv.
 
         Called AFTER the profile warm-up, so weights, the simpler ring-heap
         arena, compiled buffers and any persistent scratch are already
-        allocated — ``peak_non_kv = total − free`` captures all of it. The KV
-        budget is ``total x utilization − peak_non_kv``, leaving
-        ``total x (1 − utilization)`` as a fixed absolute headroom (more robust
-        than ``free x fraction`` whose headroom shrinks when free is small).
+        allocated -- ``peak_non_kv = total - free`` captures all of it. The KV
+        budget is ``total x utilization - max(peak_non_kv, simpler_committed)``,
+        leaving ``total x (1 - utilization)`` as a fixed absolute headroom. The
+        driver-visible ``peak_non_kv`` and simpler's authoritative
+        ``simpler_committed`` (``Worker.committed_device_memory``; 0 if unknown)
+        overlap (both include weights + arenas); taking the max never
+        over-provisions whether or not the driver sees simpler's ``rtMalloc`` pool.
         """
         free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
         dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
@@ -314,12 +349,19 @@ class Qwen314BModelRunner(ModelRunner):
         )
         utilization = getattr(runtime, "npu_memory_utilization", 0.90)
         peak_non_kv = total_bytes - free_bytes
-        kv_budget = int(total_bytes * utilization - peak_non_kv)
+        # Two overlapping views of non-KV usage: peak_non_kv (driver-visible via
+        # aclrtGetMemInfo) and simpler_committed (simpler's authoritative
+        # MemoryAllocator total — weights + arenas + buffers). Take the max so we
+        # never over-provision whether or not the driver sees simpler's rtMalloc
+        # pool; they usually agree, and max is robust to either undercounting.
+        non_kv = max(peak_non_kv, simpler_committed)
+        kv_budget = int(total_bytes * utilization - non_kv)
         num_pages = max(kv_budget // bytes_per_page, 1)
         logger.info(
             "KV cache sizing (vLLM-style): total=%.2f GB, utilization=%.2f, "
-            "peak_non_kv=%.2f GB, kv_budget=%.2f GB, requested_pages=%d (%.1f MB/page)",
-            total_bytes / 1e9, utilization, peak_non_kv / 1e9,
+            "peak_non_kv=%.2f GB, simpler_committed=%.2f GB, kv_budget=%.2f GB, "
+            "requested_pages=%d (%.1f MB/page)",
+            total_bytes / 1e9, utilization, peak_non_kv / 1e9, simpler_committed / 1e9,
             kv_budget / 1e9, num_pages, bytes_per_page / 1e6,
         )
         return num_pages
