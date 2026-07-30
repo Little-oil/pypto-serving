@@ -208,6 +208,170 @@ def test_async_reconciliation_matches_sync_end_state():
     assert async_tokens == sync_tokens == [10, 11, 12]
 
 
+def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1):
+    """Scheduler configured like an MTP (speculative) decoder."""
+    manager = KvCacheManager(num_blocks=32, block_size=2, enable_prefix_cache=False)
+    return Scheduler(
+        SchedulerConfig(
+            enable_prefix_cache=False,
+            async_scheduling=async_mode,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        manager,
+    )
+
+
+def _mtp_request():
+    """A greedy (temperature 0) decode-ready request — MTP only runs greedy."""
+    request = _running_decode_request()
+    request.temperature = 0.0
+    return request
+
+
+def test_async_mtp_reserves_max_tokens_per_step():
+    """A speculative step can emit 1+num_speculative_tokens, so the optimistic
+    advance must reserve that upper bound (block allocation already did)."""
+    scheduler = _mtp_scheduler(async_mode=True, num_speculative_tokens=1)
+    request = _mtp_request()
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    out = scheduler.schedule()
+    assert out.scheduled_requests
+    scheduler.advance_after_schedule(out)
+
+    # Upper bound reserved: 1 base + 1 speculative.
+    assert request.num_output_placeholders == 2
+    # computed advanced by num_new_tokens (1) + the extra speculative slot (1).
+    assert request.num_computed_tokens == 4
+
+
+def test_async_mtp_matches_sync_when_all_tokens_accepted():
+    """Both MTP tokens accepted: async end-state must equal the sync path."""
+    def run(async_mode: bool):
+        scheduler = _mtp_scheduler(async_mode)
+        request = _mtp_request()
+        scheduler.running.append(request)
+        scheduler.requests[request.request_id] = request
+        collected = []
+        for pair in ([10, 11], [12, 13]):
+            out = scheduler.schedule()
+            if not out.scheduled_requests:
+                break
+            if async_mode:
+                scheduler.advance_after_schedule(out)
+            outs = scheduler.update_from_output(out, {request.request_id: pair})
+            collected.extend(o.new_token_id for o in outs if o.new_token_id is not None)
+        return request.output_token_ids, request.num_computed_tokens, collected, request
+
+    sync_out, sync_comp, sync_tok, _ = run(False)
+    async_out, async_comp, async_tok, async_req = run(True)
+
+    assert async_out == sync_out == [99, 10, 11, 12, 13]
+    assert async_comp == sync_comp
+    assert async_tok == sync_tok
+    assert async_req.num_output_placeholders == 0  # fully released
+
+
+def test_async_mtp_subtracts_shortfall_on_rejection():
+    """When the speculative token is REJECTED (only 1 token returned), the
+    optimistically-advanced position must be given back so async == sync."""
+    def run(async_mode: bool):
+        scheduler = _mtp_scheduler(async_mode)
+        request = _mtp_request()
+        scheduler.running.append(request)
+        scheduler.requests[request.request_id] = request
+        for tok in ([10], [11]):        # 1 token per step = draft rejected
+            out = scheduler.schedule()
+            if not out.scheduled_requests:
+                break
+            if async_mode:
+                scheduler.advance_after_schedule(out)
+            scheduler.update_from_output(out, {request.request_id: tok})
+        return request.output_token_ids, request.num_computed_tokens, request
+
+    sync_out, sync_comp, _ = run(False)
+    async_out, async_comp, async_req = run(True)
+
+    assert async_out == sync_out == [99, 10, 11]
+    # The rejected speculative slot was reclaimed — no permanent desync.
+    assert async_comp == sync_comp
+    assert async_req.num_output_placeholders == 0
+
+
+def test_async_completing_prefill_keeps_its_computed_tokens():
+    """A prefill chunk's own KV work must never be reverted by the shortfall.
+
+    Regression: the shortfall reclaimed `reserved - retained`, which for a
+    completing prefill chunk that returned no token clawed back the chunk's own
+    num_new_tokens. The chunk was then re-scheduled and prefilled twice, and the
+    model sampled the same token twice (seen on device as duplicated tokens with
+    chunked prefill).
+    """
+    for returned_tokens in ([], [100]):
+        manager = KvCacheManager(num_blocks=64, block_size=2, enable_prefix_cache=False)
+        scheduler = Scheduler(
+            SchedulerConfig(
+                enable_prefix_cache=False,
+                async_scheduling=True,
+                long_prefill_token_threshold=2,
+                enable_chunk_prefill=True,
+            ),
+            manager,
+        )
+        # 4 of 5 prompt tokens already computed: this chunk completes the prompt.
+        request = Request(
+            request_id="r",
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            max_new_tokens=4,
+            num_computed_tokens=4,
+            temperature=0.0,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running.append(request)
+        scheduler.requests[request.request_id] = request
+
+        out = scheduler.schedule()
+        assert out.scheduled_requests and out.scheduled_requests[0].is_prefill
+        scheduler.advance_after_schedule(out)
+        assert request.num_computed_tokens == 5      # prompt fully computed
+
+        payload = {request.request_id: returned_tokens} if returned_tokens else {}
+        scheduler.update_from_output(out, payload)
+
+        # The chunk's KV work is retained either way — never reverted to 4.
+        assert request.num_computed_tokens == 5, (
+            f"completing prefill reverted its own computed tokens "
+            f"(returned_tokens={returned_tokens})"
+        )
+        assert request.num_output_placeholders == 0
+        # And it is NOT re-scheduled as prefill again.
+        again = scheduler.schedule()
+        if again.scheduled_requests:
+            assert not again.scheduled_requests[0].is_prefill
+
+
+def test_async_mtp_shortfall_on_eos_mid_pair():
+    """EOS in the first of two returned tokens: the second is dropped (as in the
+    sync path) and its optimistic position reclaimed."""
+    scheduler = _mtp_scheduler(async_mode=True)
+    request = _mtp_request()
+    request.eos_token_id = 7
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    out = scheduler.schedule()
+    scheduler.advance_after_schedule(out)
+    assert request.num_output_placeholders == 2
+
+    # Worker returns [EOS, extra]: only EOS is retained.
+    scheduler.update_from_output(out, {request.request_id: [7, 8]})
+
+    assert request.output_token_ids == [99, 7]     # 8 dropped after EOS
+    assert request.status is RequestStatus.FINISHED_EOS
+    assert request.num_output_placeholders == 0
+
+
 def test_async_placeholder_released_and_no_leak_after_reconcile():
     """After the real token is applied, the placeholder is fully released so the
     request can be scheduled again for the next token."""
@@ -457,6 +621,7 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
         "req": NewRequestData("req", [0], 0.0, 1.0, None),
     }
     worker._last_tokens = {}
+    worker._committed_output_counts = {}
     worker.output_queue = SimpleNamespace(put=results.append)
     worker._execute_step = lambda _cmd: StepResult(new_tokens={})
     replacement = NewRequestData("req", [1, 2], 0.0, 1.0, None)
@@ -1378,6 +1543,7 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     substitute the token(s) it last sampled for that request."""
     worker = WorkerProcess.__new__(WorkerProcess)
     worker._last_tokens = {}
+    worker._committed_output_counts = {}
 
     # Record two sampled tokens (simulating two prior decode steps).
     worker._record_last_tokens("r", [11])
@@ -1413,6 +1579,54 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     )
     with pytest.raises(RuntimeError):
         worker._resolve_decode_token(orphan)
+
+
+def test_worker_recomputes_seq_len_for_speculative_placeholder_step():
+    """The worker must correct seq_len on the placeholder path.
+
+    With a speculative decoder the engine optimistically assumes the maximum
+    tokens per step, so the seq_len it sends is too large once a draft is
+    rejected. The worker has already executed those steps (FIFO command queue),
+    so its committed-token count gives the exact context length. An inflated
+    seq_len shifts MTP's verification positions (seq_len - decode_seq) and drops
+    a token — the DeepSeek accuracy-guard failure.
+    """
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._last_tokens = {}
+    worker._committed_output_counts = {}
+    worker._req_cache = {"r": NewRequestData("r", [1, 2, 3], 0.0, 1.0, None)}  # prompt=3
+
+    placeholder = lambda seq_len: DecodeRequest(  # noqa: E731
+        request_id="r",
+        last_token=PLACEHOLDER_TOKEN,
+        prev_token=PLACEHOLDER_TOKEN,
+        seq_len=seq_len,
+        block_ids=[0],
+    )
+
+    # Step A commits 2 tokens (draft accepted): the engine's assumption held.
+    worker._record_last_tokens("r", [100, 101])
+    assert worker._committed_output_counts["r"] == 2
+    assert worker._resolve_seq_len(placeholder(6)) == 6      # 3 prompt + 2 + 1
+
+    # Step B commits only 1 token (draft rejected) while the engine still assumed
+    # the maximum, so it over-counted. The worker corrects to the true length.
+    worker._record_last_tokens("r", [102])
+    assert worker._committed_output_counts["r"] == 3
+    assert worker._resolve_seq_len(placeholder(9)) == 7      # 3 prompt + 3 + 1
+
+    # A step carrying a real token is the synchronous path: trusted untouched.
+    real = DecodeRequest(
+        request_id="r", last_token=555, prev_token=554, seq_len=42, block_ids=[0]
+    )
+    assert worker._resolve_seq_len(real) == 42
+
+    # Unknown request (no committed count yet) falls back to the engine's value.
+    unknown = DecodeRequest(
+        request_id="other", last_token=PLACEHOLDER_TOKEN, prev_token=PLACEHOLDER_TOKEN,
+        seq_len=11, block_ids=[0],
+    )
+    assert worker._resolve_seq_len(unknown) == 11
 
 
 def test_incremental_detok_matches_full_decode_and_hides_partial_chars():
@@ -1805,6 +2019,37 @@ def test_async_pipeline_dispatches_two_steps_before_applying_first():
     asyncio.run(core._await_and_apply_oldest())
     assert req.output_token_ids == [50, 51, 52]
     assert req.num_output_placeholders == 0
+
+
+def test_async_decode_seq_len_excludes_inflight_placeholders():
+    """seq_len must be the context length for THIS step, not req.num_tokens.
+
+    Under async scheduling req.num_tokens also counts in-flight placeholders, so
+    using it inflates seq_len past the KV actually written — the kernel then
+    computes shifted positions (observed on device as duplicated/misplaced tokens
+    with chunked prefill at pipeline depth 2).
+    """
+    core, dispatched = _async_pipeline_core()
+    # prompt=2 tokens, one decoded token already -> next decode covers position 3.
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+
+    assert core._try_dispatch_step() is True
+    first = dispatched[0].decode_requests[0]
+    # 2 prompt positions computed + the 1 token this step decodes = 3. This is
+    # exactly what the synchronous path sent via req.num_tokens.
+    assert first.seq_len == 3
+
+    # Dispatch a second step while the first is still in flight: its seq_len must
+    # advance by exactly one position, NOT jump by the extra placeholder.
+    assert core._try_dispatch_step() is True
+    second = dispatched[1].decode_requests[0]
+    assert second.seq_len == 4
+    # Guard the specific regression: req.num_tokens is now inflated by the two
+    # in-flight placeholders, so seq_len must differ from it.
+    assert req.num_output_placeholders == 2
+    assert second.seq_len < req.num_tokens
 
 
 def test_async_pipeline_drains_stale_result_after_error():
