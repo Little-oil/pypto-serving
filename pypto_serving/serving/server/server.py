@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -16,13 +17,20 @@ import uuid
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
-from pypto_serving.tools.profile import profile_instant, profile_span
+from pypto_serving.tools.profile import (
+    get_profiler,
+    merge_profile,
+    profile_instant,
+    profile_span,
+    start_profile as start_sa_profile,
+    stop_profile as stop_sa_profile,
+)
 
 logger = logging.getLogger(__name__)
 
 try:
     from fastapi import FastAPI
-    from fastapi.responses import JSONResponse, StreamingResponse
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
     from pydantic import BaseModel
 except ImportError as e:
     raise ImportError(
@@ -104,6 +112,7 @@ class ServingServer:
         self.engine = async_engine
         self.model_id = model_id
         self.app = FastAPI(title="PyPTO Serving")
+        self._profile_lock = asyncio.Lock()
         self._register_exception_handlers()
         self._register_routes()
 
@@ -122,6 +131,9 @@ class ServingServer:
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
         self.app.add_api_route("/v1/completions", self._completions, methods=["POST"], response_model=None)
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"], response_model=None)
+        if get_profiler(initially_active=False).enabled:
+            self.app.add_api_route("/start_profile", self._start_profile, methods=["POST"])
+            self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
 
     async def _health(self) -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -131,6 +143,42 @@ class ServingServer:
             "object": "list",
             "data": [{"id": self.model_id, "object": "model", "owned_by": "pypto"}],
         })
+
+    async def _start_profile(self) -> Response:
+        async with self._profile_lock:
+            logger.info("Starting SA profiler...")
+            main_started = start_sa_profile()
+            try:
+                await self.engine.start_profile()
+            except Exception:
+                if main_started:
+                    stop_sa_profile()
+                raise
+            logger.info("SA profiler started")
+        return Response(status_code=200)
+
+    async def _stop_profile(self) -> Response:
+        async with self._profile_lock:
+            logger.info("Stopping SA profiler...")
+            stop_error = None
+            try:
+                await self.engine.stop_profile()
+            except Exception as exc:
+                stop_error = exc
+            stop_sa_profile()
+            try:
+                event_count = merge_profile()
+            except Exception:
+                if stop_error is None:
+                    raise
+                logger.exception(
+                    "Failed to merge SA profile after worker profile stop failed"
+                )
+            else:
+                logger.info("SA profiler stopped; merged %d events", event_count)
+            if stop_error is not None:
+                raise stop_error
+        return Response(status_code=200)
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"

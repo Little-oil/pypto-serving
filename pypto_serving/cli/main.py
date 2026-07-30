@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
-from pypto_serving.tools.profile import get_profiler, merge_profile
+from pypto_serving.tools.profile import (
+    ProfileConfig,
+    configure_profiler,
+    create_profile_config,
+    get_profiler,
+    merge_profile,
+)
 
 RuntimeConfig = None
 ParallelConfig = None
@@ -29,6 +35,7 @@ parse_device_ids = None
 
 
 _VALID_BACKENDS = {"npu"}
+_LEGACY_SERVING_PROFILE_ENV = ("SA_PROFILE_OUTPUT", "SA_PROFILE_LEVEL")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -140,6 +147,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
 
+    # Profiling
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Enable on-demand SA profiling through POST /start_profile and "
+            "POST /stop_profile."
+        ),
+    )
+    parser.add_argument(
+        "--profile-output",
+        default=None,
+        metavar="PATH",
+        help="Profile output directory or .json path (default: ./profile_out).",
+    )
+    parser.add_argument(
+        "--profile-level",
+        default=None,
+        metavar="LEVELS",
+        help="Comma-separated profile levels: e2e, kernel, or verbose (default: e2e,kernel).",
+    )
+
     # Misc
     parser.add_argument(
         "--show-startup-logs",
@@ -211,6 +240,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
             model_family=model_family,
             config_data=model_config_data,
         ),
+        profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
@@ -267,6 +297,33 @@ def _build_executor_kwargs() -> dict[str, object]:
     if save_kernels_dir:
         executor_kwargs["save_kernels_dir"] = save_kernels_dir
     return executor_kwargs
+
+
+def _build_profile_config(args: argparse.Namespace) -> ProfileConfig:
+    if not args.profile and (args.profile_output is not None or args.profile_level is not None):
+        raise ValueError("--profile-output and --profile-level require --profile")
+    output = Path(args.profile_output or "./profile_out").expanduser().resolve()
+    return create_profile_config(
+        enabled=args.profile,
+        output=output,
+        levels=args.profile_level or "e2e,kernel",
+    )
+
+
+def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
+    """Warn when legacy profile environment variables cannot enable HTTP profiling."""
+    if args.profile:
+        return
+    legacy_vars = [name for name in _LEGACY_SERVING_PROFILE_ENV if name in os.environ]
+    if not legacy_vars:
+        return
+    print(
+        "WARNING: "
+        f"{', '.join(legacy_vars)} are deprecated for HTTP serving and are ignored "
+        "without --profile. Use --profile with --profile-output/--profile-level instead.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _read_model_config(model_dir: Path) -> dict[str, object]:
@@ -369,7 +426,11 @@ def run_serve(
     from pypto_serving.serving.server.server import create_serving_app
 
     model_id = config.model_id
-    get_profiler(process_name="pypto-serving-api")
+    configure_profiler(
+        config.profile_config,
+        process_name="pypto-serving-api",
+        initially_active=False,
+    )
     tokenizer = load_tokenizer(config.model_dir)
     async_engine = AsyncLLMEngine(
         config=config,
@@ -396,7 +457,10 @@ def run_serve(
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
-    print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
+    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health"
+    if get_profiler().enabled:
+        endpoints += ", /start_profile, /stop_profile"
+    print(f"  Endpoints: {endpoints}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
@@ -426,7 +490,7 @@ def _validate_backend(backend: str) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    get_profiler(process_name="pypto-serving")
+    _warn_deprecated_serving_profile_env(args)
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)

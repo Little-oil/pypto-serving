@@ -41,15 +41,29 @@ def load_profile_config(env: dict[str, str] | None = None) -> ProfileConfig:
     """
     source = os.environ if env is None else env
     enabled = "SA_PROFILE_OUTPUT" in source or "SA_PROFILE_LEVEL" in source
-    output = Path(source.get("SA_PROFILE_OUTPUT", _DEFAULT_OUTPUT)).expanduser()
-    levels = _parse_levels(source.get("SA_PROFILE_LEVEL", _DEFAULT_LEVEL))
+    return create_profile_config(
+        enabled=enabled,
+        output=source.get("SA_PROFILE_OUTPUT", _DEFAULT_OUTPUT),
+        levels=source.get("SA_PROFILE_LEVEL", _DEFAULT_LEVEL),
+    )
+
+
+def create_profile_config(
+    *,
+    enabled: bool,
+    output: str | Path = _DEFAULT_OUTPUT,
+    levels: str = _DEFAULT_LEVEL,
+) -> ProfileConfig:
+    """Build an explicit profiler configuration."""
+    output = Path(output).expanduser()
+    parsed_levels = _parse_levels(levels)
     trace_file, fragments_dir = _resolve_output(output)
     return ProfileConfig(
         enabled=enabled,
         output=output,
         trace_file=trace_file,
         fragments_dir=fragments_dir,
-        levels=levels,
+        levels=parsed_levels,
     )
 
 

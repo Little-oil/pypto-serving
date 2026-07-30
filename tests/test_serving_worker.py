@@ -37,7 +37,7 @@ def test_worker_entry_always_closes_worker(monkeypatch, busy_loop_fails):
     calls = SimpleNamespace(close=0, ready=0)
 
     class FakeWorker:
-        def __init__(self, config, input_queue, output_queue):
+        def __init__(self, config, input_queue, output_queue, profile_output_queue=None):
             pass
 
         def init_device_and_model(self):

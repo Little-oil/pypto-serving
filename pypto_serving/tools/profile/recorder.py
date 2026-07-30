@@ -32,9 +32,16 @@ _profiler_pid: int | None = None
 class ProfileRecorder:
     """Chrome trace-event recorder backed by one JSONL fragment per process."""
 
-    def __init__(self, config: ProfileConfig, *, process_name: str | None = None) -> None:
+    def __init__(
+        self,
+        config: ProfileConfig,
+        *,
+        process_name: str | None = None,
+        initially_active: bool = True,
+    ) -> None:
         self.config = config
         self.enabled = config.enabled
+        self.active = False
         self.pid = os.getpid()
         self.process_name = process_name or _default_process_name()
         self._lock = threading.Lock()
@@ -44,20 +51,43 @@ class ProfileRecorder:
         if self.enabled:
             self.config.fragments_dir.mkdir(parents=True, exist_ok=True)
             self._fragment_file = self.config.fragments_dir / f"trace.{self.pid}.jsonl"
-            self._fh = self._fragment_file.open("a", encoding="utf-8")
-            self.metadata("process_name", self.process_name, tid=0)
-            atexit.register(self.close)
+            atexit.register(self.stop)
+            if initially_active:
+                self.start()
 
-    def close(self) -> None:
-        if self._fh is not None:
-            with self._lock:
-                if self._fh is not None:
-                    self._fh.flush()
-                    self._fh.close()
-                    self._fh = None
+    def start(self) -> bool:
+        """Start recording in this process.
+
+        Returns ``True`` when a new recording session was started and ``False``
+        when profiling is unavailable or was already active.
+        """
+        if not self.enabled or self._fragment_file is None:
+            return False
+        with self._lock:
+            if self._fh is not None:
+                return False
+            self._thread_names.clear()
+            self._fh = self._fragment_file.open("a", encoding="utf-8")
+            self.active = True
+        self.metadata("process_name", self.process_name, tid=0)
+        return True
+
+    def stop(self) -> bool:
+        """Flush and stop recording in this process."""
+        with self._lock:
+            if self._fh is None:
+                self.active = False
+                return False
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+            self.active = False
+        return True
+
+    close = stop
 
     def includes(self, level: str) -> bool:
-        return self.enabled and self.config.includes(level)
+        return self.active and self.config.includes(level)
 
     @contextmanager
     def span(
@@ -189,7 +219,11 @@ class ProfileRecorder:
             pass
 
 
-def get_profiler(*, process_name: str | None = None) -> ProfileRecorder:
+def get_profiler(
+    *,
+    process_name: str | None = None,
+    initially_active: bool = True,
+) -> ProfileRecorder:
     """Return the process-local recorder configured from SA_PROFILE_* envs."""
     global _profiler, _profiler_pid
     pid = os.getpid()
@@ -204,8 +238,36 @@ def get_profiler(*, process_name: str | None = None) -> ProfileRecorder:
     if config.enabled and is_main_process and _MAIN_PID_ENV not in os.environ:
         os.environ[_MAIN_PID_ENV] = str(pid)
         _prepare_run(config)
-    _profiler = ProfileRecorder(config, process_name=process_name)
+    _profiler = ProfileRecorder(
+        config,
+        process_name=process_name,
+        initially_active=initially_active,
+    )
     _profiler_pid = pid
+    return _profiler
+
+
+def configure_profiler(
+    config: ProfileConfig,
+    *,
+    process_name: str | None = None,
+    initially_active: bool = True,
+) -> ProfileRecorder:
+    """Replace the process-local recorder with an explicit configuration."""
+    global _profiler, _profiler_pid
+    if _profiler is not None and _profiler_pid == os.getpid():
+        _profiler.stop()
+
+    is_main_process = multiprocessing.current_process().name == "MainProcess"
+    if config.enabled and is_main_process:
+        _prepare_run(config)
+
+    _profiler = ProfileRecorder(
+        config,
+        process_name=process_name,
+        initially_active=initially_active,
+    )
+    _profiler_pid = os.getpid()
     return _profiler
 
 
@@ -248,9 +310,24 @@ def profile_duration(
     get_profiler().duration(name, dur_us=dur_us, cat=cat, level=level, args=args, ts_us=ts_us)
 
 
+def start_profile() -> bool:
+    """Start a fresh profile session in the current process."""
+    profiler = get_profiler(initially_active=False)
+    if not profiler.enabled or profiler.active:
+        return False
+    if multiprocessing.current_process().name == "MainProcess":
+        _prepare_run(profiler.config)
+    return profiler.start()
+
+
+def stop_profile() -> bool:
+    """Flush and stop the current process profile session."""
+    return get_profiler(initially_active=False).stop()
+
+
 def merge_profile() -> int:
-    profiler = get_profiler()
-    profiler.close()
+    profiler = get_profiler(initially_active=False)
+    profiler.stop()
     if not profiler.enabled:
         return 0
     return merge_fragments(profiler.config.fragments_dir, profiler.config.trace_file)
@@ -270,3 +347,5 @@ def _prepare_run(config: ProfileConfig) -> None:
     config.fragments_dir.mkdir(parents=True, exist_ok=True)
     for fragment in config.fragments_dir.glob("trace.*.jsonl"):
         fragment.unlink()
+    if config.trace_file.is_file():
+        config.trace_file.unlink()
