@@ -427,7 +427,7 @@ class WorkerProcess:
             seq_lens = [dr.seq_len for dr in scheduled]
 
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
-            if self.executor.supports_device_embedding:
+            if self.executor.supports_device_decode_embedding:
                 # Device kernel embeds directly from token ids — do not build
                 # host-side embedding tensors.
                 decode_embeddings = None
@@ -437,7 +437,7 @@ class WorkerProcess:
                 prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
                 prev_embeddings = self.executor.lookup_embeddings(runtime_model, prev_token_tensor)
 
-            if self.executor.supports_device_embedding:
+            if self.executor.supports_device_decode_embedding:
                 prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
 
             decode_result = self.executor.run_decode(

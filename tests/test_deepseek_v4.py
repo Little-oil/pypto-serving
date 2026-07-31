@@ -87,8 +87,8 @@ def test_deepseek_mtp_speculative_batch_feeds_current_then_draft():
     assert speculative.prev_token_ids.tolist() == [2]
     assert speculative.token_ids.tolist() == [[5]]
     assert speculative.seq_lens.tolist() == [130]
-    torch.testing.assert_close(speculative.prev_hidden_states, embed[2:3].to(torch.bfloat16))
-    torch.testing.assert_close(speculative.hidden_states, embed[5:6].to(torch.bfloat16))
+    assert speculative.prev_hidden_states is None
+    assert speculative.hidden_states is None
 
 
 def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
@@ -103,41 +103,31 @@ def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
         ),
     )
     main_ids = torch.tensor([[11, 12]], dtype=torch.long)
-    main_pre_hc = torch.arange(
-        runner._compiled.layout.ranks * runner._compiled.layout.decode_seq * 4,
-        dtype=torch.float32,
-    ).reshape(runner._compiled.layout.ranks, runner._compiled.layout.decode_seq, 4, 1)
-    tail_hidden = torch.full((4, 1), 99.0, dtype=torch.float32)
     runner._mtp_request_states["req-a"] = SimpleNamespace(
         tail_token_id=9,
-        tail_pre_hc_hidden=tail_hidden,
+        tail_slot_id=0,
         tail_position=6,
     )
 
-    committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
+    committed_ids, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
-        main_pre_hc,
         request_index=0,
         accepted_count=1,
     )
 
     assert committed_ids.tolist() == [9, 11]
     assert committed_positions.tolist() == [6, 7]
-    torch.testing.assert_close(committed_hidden[0], tail_hidden)
-    torch.testing.assert_close(committed_hidden[1], main_pre_hc[0, 0])
 
-    committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
+    committed_ids, committed_positions = runner._mtp_committed_window(
         inputs,
         main_ids,
-        main_pre_hc,
         request_index=0,
         accepted_count=2,
     )
 
     assert committed_ids.tolist() == [11, 12]
     assert committed_positions.tolist() == [7, 8]
-    torch.testing.assert_close(committed_hidden, main_pre_hc[0])
 
 
 def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
@@ -317,9 +307,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert len(compiled_args["deepseek_v4_prefill"]) == len(npu_executor._PREFILL_FWD_TENSOR_ORDER)
     assert len(compiled_args["deepseek_v4_decode"]) == len(npu_executor._DECODE_FWD_TENSOR_ORDER)
     assert compiled_args["deepseek_v4_prefill"][0].shape == (8, 128, 4, 4096)
-    assert compiled_args["deepseek_v4_decode"][0].shape == (8, 8, 4, 4096)
+    assert compiled_args["deepseek_v4_decode"][0].shape == (8, 129280, 4096)
     assert compiled_args["deepseek_v4_prefill"][0].dtype == torch.float32
-    assert compiled_args["deepseek_v4_decode"][0].dtype == torch.float32
+    assert compiled_args["deepseek_v4_decode"][0].dtype == torch.bfloat16
     cache_blocks = executor._compile_cache_blocks(
         loaded.runtime_model,
         DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8),
@@ -406,9 +396,9 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (8, 32320, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("hidden_out")].shape == (8, 8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("sampled_ids")].shape == (8, 8, 8)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Prefill and decode share the same runtime-sized physical pool.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (
@@ -419,13 +409,12 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert decode_args[decode_order.index("idx_kv_scale")].shape == (
         8, 21 * cache_blocks["idx"], 128, 1, 1
     )
-    # SWA/HCA/CSA metadata all use the cache-first full window, plus the paged
-    # write slot mapping.
-    assert decode_args[decode_order.index("swa_slot_mapping")].shape == (8, 8)
-    assert decode_args[decode_order.index("swa_indices")].shape == (8, 8, 128)
-    assert decode_args[decode_order.index("swa_lens")].shape == (8, 8)
-    assert decode_args[decode_order.index("window_swa_indices")].shape == (8, 8, 128)
-    assert decode_args[decode_order.index("window_swa_lens")].shape == (8, 8)
+    # Position-dependent SWA/HCA/CSA metadata is lowered on device. The host
+    # ABI retains only allocator-owned tables and their active block counts.
+    assert decode_args[decode_order.index("block_counts")].shape == (8, 8, 6)
+    assert "swa_slot_mapping" not in decode_order
+    assert "swa_indices" not in decode_order
+    assert "hca_state_slot_mapping" not in decode_order
 
 
 def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
@@ -779,6 +768,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._stacked_host_weights = {"main": main_weight}
     runner._stacked_device_weights = None
+    runner._global_weights = None
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._mtp_device_weights = None
     runner._shared_l3_worker = lambda: worker
@@ -1052,22 +1042,25 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
 
 
-def test_deepseek_prepare_decode_inputs_requires_hidden_states():
+def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
     runner, model = _runner_for_prepared_inputs()
 
-    with pytest.raises(ValueError, match="DeepSeek V4 decode requires host hidden states"):
-        runner.prepare_decode_inputs(
-            model,
-            DecodeBatch(
-                request_ids=["req-a"],
-                token_ids=torch.tensor([[5]], dtype=torch.long),
-                hidden_states=None,
-                seq_lens=torch.tensor([128], dtype=torch.int32),
-            ),
-        )
+    prepared = runner.prepare_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[5]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
+        ),
+    )
+    assert prepared.x_hc is None
+    assert prepared.input_ids[0, :2].tolist() == [5, 5]
 
 
-def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
+def test_deepseek_prepare_mtp_decode_inputs_stages_device_metadata_sources():
     runner, model = _runner_for_prepared_inputs()
 
     prepared = runner.prepare_mtp_decode_inputs(
@@ -1088,22 +1081,11 @@ def test_deepseek_prepare_mtp_decode_inputs_builds_sliding_window_metadata():
     assert prepared.block_table.shape == (8, 4, 128)
     assert prepared.block_table[0, 0, :4].tolist() == [0, 0, 0, 0]
     assert prepared.block_table[1, 0, :4].tolist() == [6, 6, 6, 6]
-    # SWA full window includes the current position and lowers through the
-    # request's physical ori page.
-    assert prepared.swa_lens[0, 0].item() == 127
-    assert prepared.swa_lens[0, 1].item() == 128
-    assert prepared.swa_lens[1, 1].item() == 5
-    assert prepared.swa_indices[0, 1, :4].tolist() == [0, 1, 2, 3]
-    assert prepared.swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
-    # Paged write slot for the current token.
-    assert prepared.swa_slot_mapping[0, 1].item() == 127
-    assert prepared.swa_slot_mapping[1, 1].item() == 772
-    # HCA/CSA follow pypto-lib's cache-first contract: their window contains
-    # historical rows and the current decode position after KV writeback.
-    assert prepared.window_swa_lens[0, 0].item() == 127
-    assert prepared.window_swa_lens[0, 1].item() == 128
-    assert prepared.window_swa_lens[1, 1].item() == 5
-    assert prepared.window_swa_indices[1, 1, :5].tolist() == [768, 769, 770, 771, 772]
+    assert prepared.position_ids[0, :2].tolist() == [126, 127]
+    assert prepared.position_ids[1, :2].tolist() == [3, 4]
+    assert prepared.block_counts.shape == (8, 4, 6)
+    assert prepared.block_counts[0, 0].tolist() == [1, 1, 1, 1, 1, 1]
+    assert prepared.block_counts[1, 0].tolist() == [1, 1, 1, 1, 1, 1]
     assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
 
@@ -1132,13 +1114,7 @@ def test_deepseek_prepare_mtp_decode_inputs_feeds_two_real_tokens():
     assert prepared.position_ids[1, :2].tolist() == [3, 4]
     assert prepared.kv_seq_lens[0, :4].tolist() == [128, 128, 128, 128]
     assert prepared.kv_seq_lens[1, :4].tolist() == [5, 5, 5, 5]
-    # slot 0 carries the prev-token embedding, slot 1 the last-token embedding.
-    assert prepared.x_hc[0, 0, 0].tolist() == [8, 9, 10, 11]
-    assert prepared.x_hc[0, 1, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.x_hc[1, 0, 0].tolist() == [12, 13, 14, 15]
-    assert prepared.x_hc[1, 1, 0].tolist() == [4, 5, 6, 7]
-    # Padding row keeps replicating row 0's last embedding.
-    assert prepared.x_hc[0, 4, 0].tolist() == [0, 1, 2, 3]
+    assert prepared.x_hc is None
 
 
 def test_deepseek_stage_decode_inputs_uses_shared_buffers():
@@ -1157,32 +1133,19 @@ def test_deepseek_stage_decode_inputs_uses_shared_buffers():
 
     staged = runner._stage_decode_inputs(prepared)
 
-    assert staged.x_hc.is_shared()
-    assert staged.x_hc.dtype == torch.float32
+    assert staged.x_hc is None
     assert runner._decode_buffers is not None
-    assert runner._decode_buffers.x_hc_b.is_shared()
     for name in (
         "input_ids",
         "position_ids",
         "kv_seq_lens",
         "block_table",
-        "ori_slot_mapping",
-        "window_swa_indices",
-        "window_swa_lens",
-        "swa_slot_mapping",
-        "swa_indices",
-        "swa_lens",
         "cmp_block_table",
         "idx_block_table",
         "hca_compress_state_block_table",
         "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
-        "hca_cmp_slot_mapping",
-        "hca_state_slot_mapping",
-        "csa_cmp_slot_mapping",
-        "csa_idx_slot_mapping",
-        "csa_state_slot_mapping",
-        "csa_inner_state_slot_mapping",
+        "block_counts",
     ):
         assert getattr(staged, name).is_shared()
 
@@ -1237,24 +1200,7 @@ def test_deepseek_prepare_decode_inputs_reuses_static_metadata():
 def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first_step():
     runner, model = _runner_for_prepared_inputs()
     layout = runner._compiled.layout
-    runner._compiled.embedding_weight = torch.arange(
-        model.config.vocab_size * model.config.hidden_size,
-        dtype=torch.float32,
-    ).reshape(model.config.vocab_size, model.config.hidden_size)
     runner._mtp_buffers = SimpleNamespace(
-        decode_hidden_in=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            model.config.hidden_size,
-            dtype=torch.bfloat16,
-        ),
-        decode_prev_hidden_in=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            layout.hc_mult,
-            model.config.hidden_size,
-            dtype=torch.float32,
-        ),
         decode_input_ids=torch.empty(
             layout.ranks,
             layout.decode_tokens,
@@ -1265,20 +1211,14 @@ def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first
             layout.decode_tokens,
             dtype=torch.int32,
         ),
-        decode_slot_mapping=torch.empty(
+        decode_accepted_counts=torch.empty(
             layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.long,
-        ),
-        decode_swa_indices=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            layout.sliding_window,
+            layout.decode_batch,
             dtype=torch.int32,
         ),
-        decode_swa_lens=torch.empty(
+        decode_tail_slot_ids=torch.empty(
             layout.ranks,
-            layout.decode_tokens,
+            layout.decode_batch,
             dtype=torch.int32,
         ),
         decode_logit_row_indices=torch.empty(
@@ -1300,29 +1240,20 @@ def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first
             prev_hidden_states=torch.arange(4, 8, dtype=torch.bfloat16).reshape(1, 4),
         ),
     )
-    committed_hidden = torch.arange(
-        layout.decode_seq * layout.hc_mult * model.config.hidden_size,
-        dtype=torch.float32,
-    ).reshape(layout.decode_seq, layout.hc_mult, model.config.hidden_size)
     committed = [
         (
             torch.tensor([3, 5], dtype=torch.long),
-            committed_hidden,
             torch.tensor([126, 127], dtype=torch.int32),
         )
     ]
+    runner._mtp_request_states["req-a"] = SimpleNamespace(tail_slot_id=2)
 
-    assert runner._stage_mtp_decode_inputs(inputs, committed) == 2
+    assert runner._stage_mtp_decode_inputs(inputs, committed, [1]) == 2
     assert runner._mtp_buffers.decode_input_ids[0, :2].tolist() == [3, 5]
     assert runner._mtp_buffers.decode_input_ids[1, :2].tolist() == [3, 5]
-    torch.testing.assert_close(
-        runner._mtp_buffers.decode_hidden_in[0, :2],
-        runner._compiled.embedding_weight[torch.tensor([3, 5])].to(torch.bfloat16),
-    )
-
-    runner._mtp_buffers.decode_prev_hidden_in[:, 2:].fill_(99)
-    runner._stage_mtp_decode_inputs(inputs, committed)
-    assert torch.all(runner._mtp_buffers.decode_prev_hidden_in[:, 2:] == 99)
+    assert runner._mtp_buffers.decode_accepted_counts[0, 0].item() == 1
+    assert runner._mtp_buffers.decode_tail_slot_ids[0, 0].item() == 2
+    assert runner._mtp_buffers.decode_tail_slot_ids[1, 0].item() == -1
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
@@ -1334,13 +1265,12 @@ def test_deepseek_run_decode_dispatches_active_token_count():
         captured["prepared"] = inputs
         return inputs
 
-    def fake_decode_fwd_args(inputs, x_hc, pre_hc_hidden_out, hidden_out, logits):
-        captured["x_hc_shape"] = tuple(x_hc.shape)
+    def fake_decode_fwd_args(inputs, pre_hc_hidden_out, hidden_out, logits, sampled_ids):
         captured["num_tokens_per_owner"] = inputs.num_tokens_per_owner
-        return (x_hc, pre_hc_hidden_out, hidden_out, logits)
+        return (pre_hc_hidden_out, hidden_out, logits, sampled_ids)
 
     def fake_run_l3(_callable, *args):
-        args[-1].fill_(1)
+        args[-2].fill_(1)
 
     hidden_out = torch.empty(
         runner._compiled.layout.ranks,
@@ -1351,14 +1281,19 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner._stage_decode_inputs = fake_stage
     runner._require_decode_buffers = lambda: SimpleNamespace(
-        x_hc_a=captured["prepared"].x_hc,
-        pre_hc_hidden_out=torch.empty(
+        sampled_ids=torch.empty(
             runner._compiled.layout.ranks,
             runner._compiled.layout.decode_tokens,
-            runner._compiled.layout.hc_mult,
-            model.config.hidden_size,
-            dtype=torch.float32,
+            8,
+            dtype=torch.int32,
         ),
+    )
+    runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(
+        runner._compiled.layout.ranks,
+        runner._compiled.layout.decode_tokens,
+        runner._compiled.layout.hc_mult,
+        model.config.hidden_size,
+        dtype=torch.float32,
     )
     runner._require_decode_output_buffer = lambda _hidden_size: hidden_out
     runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(
@@ -1383,12 +1318,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     )
 
     assert captured["num_tokens_per_owner"].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
-    assert captured["x_hc_shape"] == (
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.decode_tokens,
-        runner._compiled.layout.hc_mult,
-        model.config.hidden_size,
-    )
     assert result.logits.shape == (1, model.config.vocab_size)
 
 
@@ -1512,15 +1441,17 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
 def test_deepseek_release_finished_requests_discards_mtp_state():
     runner, _model = _runner_for_prepared_inputs()
     runner._mtp_request_states = {
-        "req-a": SimpleNamespace(proposed_tokens=0),
-        "req-b": SimpleNamespace(proposed_tokens=0),
+        "req-a": SimpleNamespace(proposed_tokens=0, tail_rank=1, tail_slot_id=2),
+        "req-b": SimpleNamespace(proposed_tokens=0, tail_rank=None, tail_slot_id=None),
     }
+    runner._mtp_free_tail_slots = [[] for _ in range(runner._compiled.layout.ranks)]
 
     runner.release_finished_requests(["req-a"])
 
     assert runner._mtp_request_states == {
-        "req-b": SimpleNamespace(proposed_tokens=0),
+        "req-b": SimpleNamespace(proposed_tokens=0, tail_rank=None, tail_slot_id=None),
     }
+    assert runner._mtp_free_tail_slots[1] == [2]
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:

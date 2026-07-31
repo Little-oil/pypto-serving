@@ -55,6 +55,11 @@ class ModelExecutor(ABC):
         return False
 
     @property
+    def supports_device_decode_embedding(self) -> bool:
+        """Return whether decode kernels gather embeddings from token IDs."""
+        return self.supports_device_embedding
+
+    @property
     def max_prefill_batch_size(self) -> int | None:
         """Return an executor-specific prefill dispatch limit, if any."""
         return None

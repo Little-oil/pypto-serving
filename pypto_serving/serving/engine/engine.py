@@ -519,7 +519,7 @@ class LLMEngine:
         decode_token_tensor: torch.Tensor,
     ) -> torch.Tensor | None:
         """Build decode hidden states only when the executor consumes them."""
-        if self._executor.supports_device_embedding:
+        if self._executor.supports_device_decode_embedding:
             return None
         return self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
 
