@@ -1287,6 +1287,12 @@ class _DeepSeekV4MtpRequestState:
     tail_position: int | None = None
     proposed_tokens: int = 0
     accepted_tokens: int = 0
+    # Running count of committed output tokens (advances by 1 or 2 per decode
+    # step, unlike tail_position which stalls on draft rejection). Used to
+    # correct seq_len under async scheduling.
+    committed_count: int = 0
+    # Prompt length, captured at initialization for seq_len correction.
+    prompt_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -2329,6 +2335,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 state = self._require_mtp_request_state(request_id)
                 state.proposed_tokens += 1
                 state.accepted_tokens += int(len(tokens) == decode_seq)
+                state.committed_count += len(tokens)
             logger.info(
                 "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
                 self._mtp_accepted_tokens,
@@ -2735,13 +2742,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
         actual_batch = len(batch.request_ids)
         draft = draft_token_ids[:actual_batch].detach().cpu().to(torch.long)
         current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
+        # Correct seq_lens from the runner's authoritative committed-token count.
+        # Under async scheduling the engine must optimistically assume the maximum
+        # tokens per step, so the seq_len it sends is too large whenever a
+        # previous step's draft was rejected. The runner tracks the exact count of
+        # committed output tokens (committed_count, which always advances by 1-2
+        # per step — unlike tail_position, which stalls on rejection). The +1 is
+        # the token being decoded this step (num_new = 1 for decode). Only applies
+        # after at least one decode (proposed_tokens > 0); the first decode trusts
+        # the engine's value, which is correct because no prior speculative step
+        # could have inflated it.
+        corrected_seq_lens = batch.seq_lens.detach().cpu().to(torch.int32).clone()
+        for idx, request_id in enumerate(batch.request_ids[:actual_batch]):
+            state = self._mtp_request_states.get(request_id)
+            if state is not None and state.proposed_tokens > 0:
+                corrected_seq_lens[idx] = state.prompt_len + state.committed_count + 1
         return replace(
             batch,
             token_ids=draft.reshape(actual_batch, 1),
             hidden_states=None,
             prev_token_ids=current,
             prev_hidden_states=None,
-            seq_lens=batch.seq_lens.detach().cpu().to(torch.int32) + 1,
+            seq_lens=corrected_seq_lens + 1,
         )
 
     def _require_mtp_request_state(self, request_id: str) -> _DeepSeekV4MtpRequestState:
@@ -2828,6 +2850,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             context.prev_hidden_states[n - 1],
         )
         state.tail_position = int(context.position_ids[n - 1].item())
+        state.prompt_len = n
         state.prefill_context = None
 
     def _initialize_mtp_tail_slot(

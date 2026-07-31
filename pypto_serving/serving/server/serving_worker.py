@@ -77,11 +77,6 @@ class WorkerProcess:
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
-        # Committed output-token count per request — the worker's authoritative
-        # context length. A speculative step commits a variable number of tokens
-        # that the engine cannot know when it builds the next step, so seq_len for
-        # a placeholder step is derived from this instead of the engine's value.
-        self._committed_output_counts: dict[str, int] = {}
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -234,7 +229,6 @@ class WorkerProcess:
                 for req_id in cmd.finished_request_ids:
                     self._req_cache.pop(req_id, None)
                     self._last_tokens.pop(req_id, None)
-                    self._committed_output_counts.pop(req_id, None)
 
             # 2. Register new and restarted requests into the cache.
             for nr in cmd.new_requests:
@@ -297,9 +291,6 @@ class WorkerProcess:
         if len(recent) > 2:
             recent = recent[-2:]
         self._last_tokens[request_id] = recent
-        self._committed_output_counts[request_id] = (
-            self._committed_output_counts.get(request_id, 0) + len(tokens)
-        )
 
     @staticmethod
     def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
@@ -413,44 +404,6 @@ class WorkerProcess:
             )
         return recent[-1]
 
-    def _resolve_seq_len(self, dr: DecodeRequest) -> int:
-        """Return this step's context length, correcting it on the placeholder path.
-
-        The engine computes seq_len at schedule time. With a speculative decoder
-        under async scheduling it must optimistically assume the maximum tokens
-        per step, so the value it sends is too large whenever a previous step's
-        draft was rejected. The worker has already executed those steps (the
-        command queue is FIFO), so its committed-token count is exact:
-
-            seq_len = num_prompt_tokens + committed_output_tokens + 1
-
-        (the trailing +1 is the token this step decodes). This only applies when
-        the engine flagged the step as placeholder-resolved; a step carrying real
-        tokens is trusted as-is, keeping the synchronous path untouched.
-        """
-        if dr.last_token != PLACEHOLDER_TOKEN:
-            return dr.seq_len
-        committed = self._committed_output_counts.get(dr.request_id)
-        if committed is None:
-            return dr.seq_len
-        cached = self._req_cache.get(dr.request_id)
-        if cached is None:
-            return dr.seq_len
-        return len(cached.prompt_token_ids) + committed + 1
-
-    def _resolve_prev_token(self, dr: DecodeRequest) -> int:
-        """Return the MTP prev-context token, substituting from cache on placeholder."""
-        if dr.prev_token != PLACEHOLDER_TOKEN:
-            return dr.prev_token
-        recent = self._last_tokens.get(dr.request_id)
-        if not recent:
-            raise RuntimeError(
-                f"No cached token to resolve placeholder prev token for {dr.request_id!r}"
-            )
-        # Token at absolute position seq_len-2: the second-most-recent sampled
-        # token when available, else the only one we have.
-        return recent[-2] if len(recent) >= 2 else recent[-1]
-
     def _batch_decode(
         self,
         scheduled: list[DecodeRequest],
@@ -471,23 +424,16 @@ class WorkerProcess:
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
             decode_tokens = [self._resolve_decode_token(dr) for dr in scheduled]
-            prev_tokens = [self._resolve_prev_token(dr) for dr in scheduled]
             block_ids_list = [dr.block_ids for dr in scheduled]
-            seq_lens = [self._resolve_seq_len(dr) for dr in scheduled]
+            seq_lens = [dr.seq_len for dr in scheduled]
 
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
             if self.executor.supports_device_decode_embedding:
                 # Device kernel embeds directly from token ids — do not build
                 # host-side embedding tensors.
                 decode_embeddings = None
-                prev_embeddings = None
             else:
                 decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
-                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
-                prev_embeddings = self.executor.lookup_embeddings(runtime_model, prev_token_tensor)
-
-            if self.executor.supports_device_decode_embedding:
-                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
 
             decode_result = self.executor.run_decode(
                 runtime_model,
@@ -501,8 +447,6 @@ class WorkerProcess:
                     block_ids=block_ids_list,
                     block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
                     cache_partitions=[dr.cache_partition for dr in scheduled],
-                    prev_token_ids=prev_token_tensor,
-                    prev_hidden_states=prev_embeddings,
                 ),
             )
 

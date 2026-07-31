@@ -621,7 +621,6 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
         "req": NewRequestData("req", [0], 0.0, 1.0, None),
     }
     worker._last_tokens = {}
-    worker._committed_output_counts = {}
     worker.output_queue = SimpleNamespace(put=results.append)
     worker._execute_step = lambda _cmd: StepResult(new_tokens={})
     replacement = NewRequestData("req", [1, 2], 0.0, 1.0, None)
@@ -1403,7 +1402,6 @@ def test_serving_worker_routes_supported_topk_candidates():
             DecodeRequest(
                 request_id="request",
                 last_token=7,
-                prev_token=1,
                 seq_len=2,
                 block_ids=[0],
             )
@@ -1473,13 +1471,10 @@ def test_serving_worker_mixed_topk_batch_falls_back_from_stale_candidates():
             DecodeRequest(
                 request_id=request_id,
                 last_token=3,
-                prev_token=prompt_token,
                 seq_len=2,
                 block_ids=[row],
             )
-            for row, (request_id, prompt_token) in enumerate(
-                (("supported", 1), ("unsupported", 2))
-            )
+            for row, request_id in enumerate(("supported", "unsupported"))
         ],
         model,
         decode_tokens,
@@ -1521,11 +1516,10 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
         )
     }
 
-    # last_token=3 (the one output token), prev_token=prompt_ids[-1]=1, seq_len=2.
+    # last_token=3 (the one output token), seq_len=2.
     decode_req = DecodeRequest(
         request_id="decode",
         last_token=3,
-        prev_token=1,
         seq_len=2,
         block_ids=[0],
     )
@@ -1543,7 +1537,6 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     substitute the token(s) it last sampled for that request."""
     worker = WorkerProcess.__new__(WorkerProcess)
     worker._last_tokens = {}
-    worker._committed_output_counts = {}
 
     # Record two sampled tokens (simulating two prior decode steps).
     worker._record_last_tokens("r", [11])
@@ -1553,20 +1546,17 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     placeholder = DecodeRequest(
         request_id="r",
         last_token=PLACEHOLDER_TOKEN,
-        prev_token=PLACEHOLDER_TOKEN,
         seq_len=5,
         block_ids=[0],
     )
-    # last -> most recent (22); prev -> second-most-recent (11).
+    # Most recent sampled token (22).
     assert worker._resolve_decode_token(placeholder) == 22
-    assert worker._resolve_prev_token(placeholder) == 11
 
     # A real (non-placeholder) token is passed through untouched.
     explicit = DecodeRequest(
-        request_id="r", last_token=99, prev_token=88, seq_len=5, block_ids=[0]
+        request_id="r", last_token=99, seq_len=5, block_ids=[0]
     )
     assert worker._resolve_decode_token(explicit) == 99
-    assert worker._resolve_prev_token(explicit) == 88
 
     # Cache keeps only the last 2 tokens (MTP prev context bound).
     worker._record_last_tokens("r", [33])
@@ -1574,59 +1564,11 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
 
     # Missing cache entry on placeholder is a hard error (never silently wrong).
     orphan = DecodeRequest(
-        request_id="missing", last_token=PLACEHOLDER_TOKEN, prev_token=PLACEHOLDER_TOKEN,
+        request_id="missing", last_token=PLACEHOLDER_TOKEN,
         seq_len=1, block_ids=[0],
     )
     with pytest.raises(RuntimeError):
         worker._resolve_decode_token(orphan)
-
-
-def test_worker_recomputes_seq_len_for_speculative_placeholder_step():
-    """The worker must correct seq_len on the placeholder path.
-
-    With a speculative decoder the engine optimistically assumes the maximum
-    tokens per step, so the seq_len it sends is too large once a draft is
-    rejected. The worker has already executed those steps (FIFO command queue),
-    so its committed-token count gives the exact context length. An inflated
-    seq_len shifts MTP's verification positions (seq_len - decode_seq) and drops
-    a token — the DeepSeek accuracy-guard failure.
-    """
-    worker = WorkerProcess.__new__(WorkerProcess)
-    worker._last_tokens = {}
-    worker._committed_output_counts = {}
-    worker._req_cache = {"r": NewRequestData("r", [1, 2, 3], 0.0, 1.0, None)}  # prompt=3
-
-    placeholder = lambda seq_len: DecodeRequest(  # noqa: E731
-        request_id="r",
-        last_token=PLACEHOLDER_TOKEN,
-        prev_token=PLACEHOLDER_TOKEN,
-        seq_len=seq_len,
-        block_ids=[0],
-    )
-
-    # Step A commits 2 tokens (draft accepted): the engine's assumption held.
-    worker._record_last_tokens("r", [100, 101])
-    assert worker._committed_output_counts["r"] == 2
-    assert worker._resolve_seq_len(placeholder(6)) == 6      # 3 prompt + 2 + 1
-
-    # Step B commits only 1 token (draft rejected) while the engine still assumed
-    # the maximum, so it over-counted. The worker corrects to the true length.
-    worker._record_last_tokens("r", [102])
-    assert worker._committed_output_counts["r"] == 3
-    assert worker._resolve_seq_len(placeholder(9)) == 7      # 3 prompt + 3 + 1
-
-    # A step carrying a real token is the synchronous path: trusted untouched.
-    real = DecodeRequest(
-        request_id="r", last_token=555, prev_token=554, seq_len=42, block_ids=[0]
-    )
-    assert worker._resolve_seq_len(real) == 42
-
-    # Unknown request (no committed count yet) falls back to the engine's value.
-    unknown = DecodeRequest(
-        request_id="other", last_token=PLACEHOLDER_TOKEN, prev_token=PLACEHOLDER_TOKEN,
-        seq_len=11, block_ids=[0],
-    )
-    assert worker._resolve_seq_len(unknown) == 11
 
 
 def test_incremental_detok_matches_full_decode_and_hides_partial_chars():
