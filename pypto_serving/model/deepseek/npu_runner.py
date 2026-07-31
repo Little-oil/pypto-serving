@@ -1632,11 +1632,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
         request_ids = tuple(request_ids)
         for request_id in request_ids:
             state = self._mtp_request_states.pop(request_id, None)
-            tail_rank = getattr(state, "tail_rank", None)
-            tail_slot_id = getattr(state, "tail_slot_id", None)
-            if tail_rank is not None and tail_slot_id is not None:
-                self._mtp_free_tail_slots[tail_rank].append(tail_slot_id)
-            if state is not None and state.proposed_tokens:
+            if state is None:
+                continue
+            if state.tail_rank is not None and state.tail_slot_id is not None:
+                self._mtp_free_tail_slots[state.tail_rank].append(state.tail_slot_id)
+            if state.proposed_tokens:
                 logger.info(
                     "DeepSeekV4 MTP acceptance for %s: accepted=%d proposed=%d rate=%.2f%%",
                     request_id,
@@ -1971,7 +1971,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         active_seq: int,
         positions: tuple[tuple[int, ...], ...],
         token_rows: torch.Tensor,
-        x_hc: torch.Tensor,
+        x_hc: torch.Tensor | None,
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Build mode-independent cache metadata around explicit token rows."""
         layout = self._compiled.layout
@@ -3929,7 +3929,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _materialize_resident_weights(self) -> None:
         """Upload inherited weights once and release their parent-process Host references."""
         worker = self._shared_l3_worker()
-        if hasattr(self, "_global_weights"):
+        if self._global_weights is not None:
             hidden_size = int(self.load_packed_global_weights().embed_weight.shape[1])
             self._materialize_embedding_device_weight()
             self._materialize_main_pre_hc_device(hidden_size)

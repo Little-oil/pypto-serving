@@ -768,6 +768,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._stacked_host_weights = {"main": main_weight}
     runner._stacked_device_weights = None
+    runner._global_weights = None
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._mtp_device_weights = None
     runner._shared_l3_worker = lambda: worker
@@ -1440,15 +1441,17 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
 def test_deepseek_release_finished_requests_discards_mtp_state():
     runner, _model = _runner_for_prepared_inputs()
     runner._mtp_request_states = {
-        "req-a": SimpleNamespace(proposed_tokens=0),
-        "req-b": SimpleNamespace(proposed_tokens=0),
+        "req-a": SimpleNamespace(proposed_tokens=0, tail_rank=1, tail_slot_id=2),
+        "req-b": SimpleNamespace(proposed_tokens=0, tail_rank=None, tail_slot_id=None),
     }
+    runner._mtp_free_tail_slots = [[] for _ in range(runner._compiled.layout.ranks)]
 
     runner.release_finished_requests(["req-a"])
 
     assert runner._mtp_request_states == {
-        "req-b": SimpleNamespace(proposed_tokens=0),
+        "req-b": SimpleNamespace(proposed_tokens=0, tail_rank=None, tail_slot_id=None),
     }
+    assert runner._mtp_free_tail_slots[1] == [2]
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:
