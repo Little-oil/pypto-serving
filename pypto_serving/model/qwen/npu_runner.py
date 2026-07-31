@@ -27,6 +27,7 @@ from pypto_serving.config.types import (
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
+    SamplingCandidates,
 )
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.tools.profile import profile_span
@@ -88,7 +89,7 @@ class _CompiledKernels:
 
     prefill: _L3Callable
     decode: _L3Callable
-    greedy_sample: _L3Callable
+    topk_select: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -103,14 +104,17 @@ class _CompiledKernels:
     prefill_block_table_buffer: torch.Tensor
     prefill_slot_mapping_buffer: torch.Tensor
     prefill_logits_buffer: torch.Tensor
-    prefill_sampled_ids_buffer: torch.Tensor
-    prefill_next_hidden_buffer: torch.Tensor
+    prefill_topk_values_buffer: torch.Tensor
+    prefill_topk_indices_buffer: torch.Tensor
     decode_seq_lens_buffer: torch.Tensor
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
     decode_logits_buffer: torch.Tensor
     decode_token_ids_buffer: torch.Tensor
     decode_sampled_ids_buffer: torch.Tensor
+    decode_topk_values_buffer: torch.Tensor
+    decode_topk_indices_buffer: torch.Tensor
+    sampling_control_buffer: torch.Tensor
     decode_next_hidden_buffer: torch.Tensor
 
 
@@ -277,7 +281,6 @@ class Qwen314BModelRunner(ModelRunner):
                     f"(requested {requested}, downgraded after OOM): "
                     f"{num_pages * bytes_per_page / 1e9:.2f} GB KV cache, "
                     f"{num_pages * runtime.page_size} context tokens",
-                    
                 )
                 return num_pages
             except (RuntimeError, MemoryError) as e:
@@ -369,7 +372,6 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info(
             f"  total used (measured):      {used_bytes / 1e9:7.2f} GB "
             f"/ {total_bytes / 1e9:.2f} GB (free {free_bytes / 1e9:.2f} GB)",
-            
         )
         logger.info(f"  ├─ weights (estimated):     {weight_bytes / 1e9:7.2f} GB")
         kv_tokens = num_pages * runtime.page_size
@@ -379,7 +381,6 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info(
             f"  ├─ KV cache ({num_pages} pages):     {kv_bytes / 1e9:7.2f} GB "
             f"({bytes_per_page / 1e6:.1f} MB/page)",
-            
         )
         logger.info(
             f"  │     capacity = {kv_tokens} tokens "
@@ -387,18 +388,15 @@ class Qwen314BModelRunner(ModelRunner):
             f"worst-case need {runtime.max_batch_size}x{max_seq_len}="
             f"{worst_case_demand} tokens"
             + ("  [OK]" if kv_tokens >= worst_case_demand else "  [TIGHT]"),
-            
         )
         logger.info(f"  ├─ simpler arena (env x 4): {arena_bytes / 1e9:7.2f} GB")
         logger.info(
             f"  └─ residual (buffers/scratch): {residual / 1e9:6.2f} GB "
             f"(compiled buffers + transient activation scratch + overhead)",
-            
         )
         logger.info(
             "  note: weights/arena are estimates, KV is exact; total is from "
             "mem_get_info (may under-count simpler's rtMalloc pool).",
-            
         )
 
     def warmup(self, model: RuntimeModel) -> None:
@@ -426,7 +424,6 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info(
             f"[warmup] starting (batch={batch}, max_num_batched_tokens={mnb}, "
             f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
-            
         )
         compiled = self._compiled
         kv_cache = list(self._kv_caches.values())[0]
@@ -541,14 +538,16 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.prefill_block_table_buffer,
             compiled.prefill_slot_mapping_buffer,
             compiled.prefill_logits_buffer,
-            compiled.prefill_sampled_ids_buffer,
-            compiled.prefill_next_hidden_buffer,
+            compiled.prefill_topk_values_buffer,
+            compiled.prefill_topk_indices_buffer,
             compiled.decode_seq_lens_buffer,
             compiled.decode_block_table_buffer,
             compiled.decode_slot_mapping_buffer,
             compiled.decode_logits_buffer,
             compiled.decode_token_ids_buffer,
             compiled.decode_sampled_ids_buffer,
+            compiled.decode_topk_values_buffer,
+            compiled.decode_topk_indices_buffer,
             compiled.decode_next_hidden_buffer,
         )
 
@@ -592,18 +591,24 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = batch.seq_lens[batch_idx]
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
-        sampled_ids, next_hidden = self._maybe_run_sample_embed(
+        sampled_ids = self._maybe_run_greedy_sample(
             logits_padded,
-            compiled.prefill_sampled_ids_buffer,
-            compiled.prefill_next_hidden_buffer,
             prefill_inputs.actual_batch,
             allow=batch.allow_device_greedy_sampling,
+        )
+        sampling_candidates = self._device_topk_outputs(
+            logits_padded,
+            compiled.prefill_topk_values_buffer,
+            compiled.prefill_topk_indices_buffer,
+            prefill_inputs.actual_batch,
+            allow=batch.allow_device_topk_sampling,
         )
         return PrefillResult(
             last_hidden=None,
             logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
             sampled_token_ids=sampled_ids,
-            next_hidden_states=next_hidden,
+            sampling_candidates=sampling_candidates,
+            next_hidden_states=None,
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -632,10 +637,20 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
-        device_greedy = batch.allow_device_greedy_sampling
+        device_sampling = (
+            batch.allow_device_greedy_sampling or batch.allow_device_topk_sampling
+        )
+        selector_logits = (
+            self._decode_logits_device_arg() if device_sampling else kernel_inputs.logits
+        )
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache, device_greedy=device_greedy),
+            *self._decode_kernel_args(
+                kernel_inputs,
+                k_cache,
+                v_cache,
+                device_sampling=device_sampling,
+            ),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -649,16 +664,24 @@ class Qwen314BModelRunner(ModelRunner):
             kernel_inputs.actual_batch,
             allow=batch.allow_device_greedy_sampling,
         )
+        sampling_candidates = self._device_topk_outputs(
+            selector_logits,
+            compiled.decode_topk_values_buffer,
+            compiled.decode_topk_indices_buffer,
+            kernel_inputs.actual_batch,
+            allow=batch.allow_device_topk_sampling,
+        )
         return DecodeResult(
             hidden_states=None,
-            # Device-greedy path: the host consumes sampled_ids, never logits, so we
-            # keep the logits buffer device-resident and skip its ~9.7MB D2H copy-back.
+            # Device sampling consumes only sampled ids or top-k candidates, so
+            # full-vocabulary logits remain device-resident.
             logits=(
                 None
-                if device_greedy
+                if device_sampling
                 else kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].cpu()
             ),
             sampled_token_ids=sampled_ids,
+            sampling_candidates=sampling_candidates,
             next_hidden_states=next_hidden,
         )
 
@@ -683,27 +706,69 @@ class Qwen314BModelRunner(ModelRunner):
             next_hidden,
         )
 
-    def _maybe_run_sample_embed(
+    def _maybe_run_greedy_sample(
         self,
         logits: torch.Tensor,
-        sampled_ids_buffer: torch.Tensor,
-        next_hidden_buffer: torch.Tensor,
         actual_batch: int,
         *,
         allow: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Run device greedy sampling when the request is greedy."""
+    ) -> torch.Tensor | None:
+        """Run the sampling selector in exact greedy mode for prefill."""
         if not allow:
-            return None, None
+            return None
         compiled = self._compiled
-        self._run_distributed_program(
-            compiled.greedy_sample,
+        self._run_sampling_selector(
             logits,
-            sampled_ids_buffer,
+            compiled.prefill_topk_values_buffer,
+            compiled.prefill_topk_indices_buffer,
+            actual_batch,
+            selection_k=1,
         )
-        return (
-            sampled_ids_buffer[:actual_batch, :1].clone(),
-            None,
+        return compiled.prefill_topk_indices_buffer[:actual_batch, :1].clone()
+
+    def _device_topk_outputs(
+        self,
+        logits: torch.Tensor | DeviceTensor,
+        values_buffer: torch.Tensor,
+        indices_buffer: torch.Tensor,
+        actual_batch: int,
+        *,
+        allow: bool,
+    ) -> SamplingCandidates | None:
+        """Run device top-k candidate selection and return small host tensors."""
+        if not allow:
+            return None
+        self._run_sampling_selector(
+            logits,
+            values_buffer,
+            indices_buffer,
+            actual_batch,
+            selection_k=indices_buffer.shape[1],
+        )
+        return SamplingCandidates(
+            values=values_buffer[:actual_batch].clone(),
+            token_ids=indices_buffer[:actual_batch].clone(),
+        )
+
+    def _run_sampling_selector(
+        self,
+        logits: torch.Tensor | DeviceTensor,
+        values_buffer: torch.Tensor,
+        indices_buffer: torch.Tensor,
+        actual_batch: int,
+        *,
+        selection_k: int,
+    ) -> None:
+        """Run the shared greedy/top-k selector without adding another worker program."""
+        control = self._compiled.sampling_control_buffer
+        control[0] = int(actual_batch)
+        control[1] = int(selection_k)
+        self._run_distributed_program(
+            self._compiled.topk_select,
+            logits,
+            control,
+            values_buffer,
+            indices_buffer,
         )
 
     def _prefill_kernel_args(
@@ -750,19 +815,21 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache: DeviceTensor,
         v_cache: DeviceTensor,
         *,
-        device_greedy: bool = False,
+        device_sampling: bool = False,
     ) -> tuple[Any, ...]:
         """Return arguments in ``qwen3_decode_host`` signature order.
 
-        On ``device_greedy`` the logits + next_hidden outputs are passed as
+        On device greedy or top-k sampling, logits + next_hidden are passed as
         worker-resident (device) tensors so they are never staged/copied-back
-        per step (no memset, no D2H); only the tiny sampled_ids stays host-visible.
+        per step. Only sampled ids or top-k candidates remain host-visible.
         """
         static = self._require_static_args()
         weights = static.decode_weights
-        logits_arg = self._decode_logits_device_arg() if device_greedy else inputs.logits
+        logits_arg = self._decode_logits_device_arg() if device_sampling else inputs.logits
         next_hidden_arg = (
-            self._decode_next_hidden_device_arg() if device_greedy else self._compiled.decode_next_hidden_buffer
+            self._decode_next_hidden_device_arg()
+            if device_sampling
+            else self._compiled.decode_next_hidden_buffer
         )
         return (
             weights["decode_input_rms_weight"],
@@ -834,7 +901,7 @@ class Qwen314BModelRunner(ModelRunner):
         """
         if self._kernel_cache is None:
             return
-        for spec in (self._compiled.prefill, self._compiled.decode, self._compiled.greedy_sample):
+        for spec in (self._compiled.prefill, self._compiled.decode, self._compiled.topk_select):
             self._kernel_cache.store(spec.name, spec.compiled, spec.params_fingerprint)
 
     def _shared_l3_worker(self) -> Any:
@@ -846,7 +913,7 @@ class Qwen314BModelRunner(ModelRunner):
             worker = DistributedWorker([
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
-                self._compiled.greedy_sample.compiled,
+                self._compiled.topk_select.compiled,
             ])
             self._l3_worker = worker
         return worker
@@ -865,7 +932,7 @@ class Qwen314BModelRunner(ModelRunner):
         return dev
 
     def _decode_logits_device_arg(self) -> DeviceTensor:
-        """Device-resident decode logits scratch (greedy path: never copied back).
+        """Device-resident decode logits scratch for device sampling.
 
         Allocated directly on the worker and left uninitialized — the fused decode
         kernel writes every max_batch row before the on-device sampler reads it — so

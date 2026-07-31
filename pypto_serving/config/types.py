@@ -203,6 +203,14 @@ class SamplingParams:
 
 
 @dataclass
+class SamplingCandidates:
+    """Device-selected sampling candidates for host-side final sampling."""
+
+    values: torch.Tensor
+    token_ids: torch.Tensor
+
+
+@dataclass
 class RequestState:
     """Mutable per-request state tracked during generation."""
 
@@ -245,6 +253,7 @@ class PrefillBatch:
     chunk_offsets: list[int]
     chunk_starts: list[int]
     allow_device_greedy_sampling: bool = False
+    allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
@@ -258,6 +267,7 @@ class PrefillResult:
     last_hidden: torch.Tensor | None
     logits: torch.Tensor
     sampled_token_ids: torch.Tensor | None = None
+    sampling_candidates: SamplingCandidates | None = None
     next_hidden_states: torch.Tensor | None = None
 
 
@@ -273,6 +283,7 @@ class DecodeBatch:
     hidden_states: torch.Tensor | None
     seq_lens: torch.Tensor
     allow_device_greedy_sampling: bool = False
+    allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
@@ -294,6 +305,7 @@ class DecodeResult:
     # the logits buffer stays device-resident (never copied back).
     logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
+    sampling_candidates: SamplingCandidates | None = None
     next_hidden_states: torch.Tensor | None = None
     accepted_token_ids: list[list[int]] | None = None
 

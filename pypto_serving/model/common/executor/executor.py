@@ -46,6 +46,11 @@ class ModelExecutor(ABC):
         return False
 
     @property
+    def device_topk_sampling_k(self) -> int:
+        """Return the max top-k candidate width the executor can produce on device."""
+        return 0
+
+    @property
     def supports_device_embedding(self) -> bool:
         """Return whether token embedding can be handled inside the device kernels.
 

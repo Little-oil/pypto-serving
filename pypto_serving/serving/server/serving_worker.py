@@ -331,6 +331,7 @@ class WorkerProcess:
                 self.executor.supports_device_sampling
                 and all(self._req_cache[pr.request_id].temperature <= 0.0 for pr in scheduled)
             )
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
             embedding_lookup = None
             if not self.executor.supports_device_embedding:
                 embedding_lookup = lambda token_ids: self.executor.lookup_embeddings(
@@ -347,6 +348,7 @@ class WorkerProcess:
                     device=device,
                     embedding_lookup=embedding_lookup,
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
                     block_ids=block_ids_list,
                     block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
                     cache_partitions=[pr.cache_partition for pr in scheduled],
@@ -370,7 +372,12 @@ class WorkerProcess:
                         top_k=cached.top_k,
                     )
                     token_id = self._sample_result_row(
-                        prefill_result, logits, params, i, allow_device_greedy_sampling
+                        prefill_result,
+                        logits,
+                        params,
+                        i,
+                        allow_device_greedy_sampling,
+                        allow_device_topk_sampling=allow_device_topk_sampling,
                     )
                     new_tokens[pr.request_id] = [token_id]
 
@@ -420,6 +427,7 @@ class WorkerProcess:
                 self.executor.supports_device_sampling
                 and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
             )
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
             decode_tokens = [self._resolve_decode_token(dr) for dr in scheduled]
             prev_tokens = [self._resolve_prev_token(dr) for dr in scheduled]
@@ -448,6 +456,7 @@ class WorkerProcess:
                     hidden_states=decode_embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
                     block_ids=block_ids_list,
                     block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
                     cache_partitions=[dr.cache_partition for dr in scheduled],
@@ -474,7 +483,12 @@ class WorkerProcess:
                     top_k=cached.top_k,
                 )
                 token_id = self._sample_result_row(
-                    decode_result, logits, params, i, allow_device_greedy_sampling
+                    decode_result,
+                    logits,
+                    params,
+                    i,
+                    allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
                 )
                 new_tokens[dr.request_id] = [token_id]
 
@@ -496,6 +510,7 @@ class WorkerProcess:
         params: SamplingParams,
         row_idx: int,
         allow_device_sampled: bool,
+        allow_device_topk_sampling: bool,
     ) -> int:
         """Return a sampled token from executor output, falling back to host sampling."""
         sampled = getattr(result, "sampled_token_ids", None)
@@ -506,7 +521,22 @@ class WorkerProcess:
                     f"sampled_token_ids has {flat.numel()} rows, expected row {row_idx}"
                 )
             return int(flat[row_idx].item())
+        candidates = getattr(result, "sampling_candidates", None)
+        if allow_device_topk_sampling and candidates is not None:
+            return self.sampler.sample_from_candidates(candidates, row_idx, params)
         return self.sampler.sample(logits, params)
+
+    def _allow_device_topk_sampling(self, scheduled: list) -> bool:
+        """Return whether a scheduled batch can use executor top-k candidates."""
+        max_device_topk = self.executor.device_topk_sampling_k
+        cached_requests = [self._req_cache[item.request_id] for item in scheduled]
+        return (
+            max_device_topk > 0
+            and all(request.temperature > 0.0 for request in cached_requests)
+            and all(request.top_k is not None for request in cached_requests)
+            and all(request.top_k > 0 for request in cached_requests)
+            and all(request.top_k <= max_device_topk for request in cached_requests)
+        )
 
 
 def _worker_entry(

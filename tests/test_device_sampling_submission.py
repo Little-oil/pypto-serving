@@ -33,11 +33,12 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
     dispatch = _source(QWEN_SERVING / "qwen3_l3_dispatch.py")
     executor = _source(QWEN_SERVING / "npu_executor.py")
     runner = _source(QWEN_SERVING / "npu_runner.py")
-    config = _source(QWEN / "config.py")
+    constants = _source(QWEN / "constants.py")
     greedy = _source(QWEN / "greedy_sample.py")
+    topk = _source(QWEN / "topk_select.py")
 
     assert "valid_vocab_size" not in dispatch
-    assert "REAL_VOCAB = 151936" in config
+    assert "real_vocab=151936" in constants
     assert "REAL_VOCAB" in executor
     assert "lm_head_weight[:1].expand" in executor
     assert "valid_vocab_size" not in runner
@@ -45,10 +46,42 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
     assert "REAL_NUM_FULL_VOCAB_CHUNKS" in greedy
     assert "REAL_VOCAB_TAIL" in greedy
     assert "token_id >= pl.cast(REAL_VOCAB" in greedy
+    assert "REAL_NUM_FULL_VOCAB_CHUNKS" in topk
+    assert "REAL_VOCAB_TAIL" in topk
+    assert "REAL_VOCAB = M.real_vocab" in topk
+    assert ":REAL_VOCAB" in topk
+
+
+def test_device_topk_uses_exact_grouped_selection() -> None:
+    topk = _source(QWEN / "topk_select.py")
+    dispatch = _source(QWEN_SERVING / "qwen3_l3_dispatch.py")
+    executor = _source(QWEN_SERVING / "npu_executor.py")
+    runner = _source(QWEN_SERVING / "npu_runner.py")
+
+    assert "TOPK = 32" in topk
+    assert "CHUNK_TOPK" not in topk
+    assert "TOPK_GROUP_WIDTH = 2048" in topk
+    assert "TOPK_NUM_GROUPS * TOPK <= TOPK_CANDIDATE_PAD" in topk
+    assert "def _topk_group_pairs(" in topk
+    assert "for g in pl.range(TOPK_NUM_FULL_GROUPS):" in topk
+    assert "group_pairs = _topk_group_pairs(logits, b, g)" in topk
+    assert "pairs = pl.mrgsort(pairs, block_len=1024)" in topk
+    assert "pl.set_validshape(tail_scores_raw, 1, TOPK_GROUP_TAIL)" in topk
+    assert "half0_pairs = candidate_sorted[:, 0 : 2 * TOPK]" in topk
+    assert "half1_pairs = candidate_sorted[" in topk
+    assert "candidate_pairs = pl.mrgsort(half0_pairs, half1_pairs)" in topk
+    assert "spread_ids = torch.arange(TOPK" in topk
+    assert "vals, idx = torch.topk(logits, TOPK" in topk
+    assert "output_dtype=pl.INT32" in topk
+    assert "qwen3_topk_select_host" in dispatch
+    assert "compile_topk_select" in executor
+    assert "_device_topk_outputs(" in runner
+    assert "sampling_control" in topk
 
 
 def test_device_greedy_tie_break_matches_host_argmax() -> None:
     greedy = _source(QWEN / "greedy_sample.py")
+    topk = _source(QWEN / "topk_select.py")
     decode_path = QWEN / "decode_layer.py"
     if not decode_path.is_file():
         decode_path = QWEN / "decode_fwd.py"
@@ -61,6 +94,11 @@ def test_device_greedy_tie_break_matches_host_argmax() -> None:
         assert "local_token = pl.cast(scan_t, pl.INT32)" in source
         assert "if val == best_val:" in source
 
+    assert 'name_hint="greedy_select"' in topk
+    assert "scan_c = (REAL_NUM_VOCAB_CHUNKS - 1) - c" in topk
+    assert "scan_t = (VOCAB_CHUNK - 1) - t" in topk
+    assert "local_token = pl.cast(scan_t, pl.INT32)" in topk
+
 
 def test_prefill_keeps_sampling_in_standalone_device_kernel() -> None:
     prefill = _source(QWEN / "prefill_fwd.py")
@@ -68,8 +106,10 @@ def test_prefill_keeps_sampling_in_standalone_device_kernel() -> None:
 
     assert "_greedy_sample_inline" not in prefill
     assert "_token_embed_inline" not in prefill
-    assert "compiled.greedy_sample" in runner
-    assert "_maybe_run_sample_embed(" in runner
+    assert "compiled.greedy_sample" not in runner
+    assert "compiled.topk_select" in runner
+    assert "_maybe_run_greedy_sample(" in runner
+    assert "selection_k=1" in runner
 
 
 def _device_greedy_argmax_with_clamp(logits):

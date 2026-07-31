@@ -38,6 +38,7 @@ from pypto_serving.model.qwen.npu_runner import (
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 128
+_QWEN14B_TOPK_SELECT_K = 32
 
 
 def _kernel_batch_pad(kernel_module: object) -> tuple[int, bool]:
@@ -55,8 +56,8 @@ def _kernel_batch_pad(kernel_module: object) -> tuple[int, bool]:
     greedy_sample carries the new spelling but is still fixed-batch. Callers
     must apply their own stage's rule. The distinction matters because a
     pre-rename decode writes exactly ``BATCH`` rows whatever the runtime batch,
-    so pointing it at buffers sized for a smaller ``max_batch_size`` would
-    overrun them.
+    while topk_select remains fixed-batch. Pointing either stage at undersized
+    buffers would overrun them.
     """
     value = getattr(kernel_module, "BATCH_PAD", None)
     if value is not None:
@@ -172,6 +173,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return True
 
     @property
+    def device_topk_sampling_k(self) -> int:
+        """Qwen3 NPU runner can return top-k sampling candidates."""
+        return _QWEN14B_TOPK_SELECT_K
+
+    @property
     def supports_device_embedding(self) -> bool:
         """Qwen3 NPU prefill and decode embed token ids inside device kernels."""
         return True
@@ -195,10 +201,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
         # contiguous bridge / MAX_SEQ env is needed.
         qwen3_decode_fwd = _load_pypto_lib_qwen14b_module("decode_fwd", kernel_dir)
-        qwen3_greedy_sample = _load_pypto_lib_qwen14b_module("greedy_sample", kernel_dir)
+        qwen3_topk_select = _load_pypto_lib_qwen14b_module("topk_select", kernel_dir)
         qwen3_l3_dispatch.prefill_fwd = qwen3_prefill_fwd.prefill_fwd
         qwen3_l3_dispatch.decode_fwd = qwen3_decode_fwd.decode_fwd
-        qwen3_l3_dispatch.greedy_sample_fwd = qwen3_greedy_sample.greedy_sample_fwd
+        qwen3_l3_dispatch.topk_select_fwd = qwen3_topk_select.topk_select_fwd
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
@@ -254,22 +260,31 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
                 f"{int(qwen3_decode_fwd.REAL_VOCAB)}."
             )
-        # greedy_sample_fwd is still a STATIC-batch stage (it was not converted
-        # alongside decode), so this stays an exact match rather than a bound.
-        greedy_sample_batch, _ = _kernel_batch_pad(qwen3_greedy_sample)
-        if greedy_sample_batch != kernel_batch:
+        # topk_select_fwd remains a fixed-batch stage, so require an exact
+        # match while accepting either pypto-lib batch constant spelling.
+        topk_select_batch, _ = _kernel_batch_pad(qwen3_topk_select)
+        if topk_select_batch != kernel_batch:
             raise ValueError(
-                "greedy_sample_fwd is compiled for a fixed kernel batch of "
-                f"{greedy_sample_batch}, but runtime max_batch_size is {kernel_batch}."
+                "topk_select_fwd is compiled for a fixed kernel BATCH of "
+                f"{topk_select_batch}, but runtime max_batch_size is {kernel_batch}."
             )
-        if int(qwen3_greedy_sample.VOCAB) != padded_vocab:
+        if int(qwen3_topk_select.VOCAB) != padded_vocab:
             raise ValueError(
-                "greedy_sample_fwd VOCAB must match the padded logits vocab: "
-                f"{int(qwen3_greedy_sample.VOCAB)} != {padded_vocab}."
+                "topk_select_fwd VOCAB must match the padded logits vocab: "
+                f"{int(qwen3_topk_select.VOCAB)} != {padded_vocab}."
             )
-        sampled_ids_width = int(
-            getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", getattr(qwen3_greedy_sample, "SAMPLED_IDS_PAD", 1))
-        )
+        if model.config.vocab_size != int(qwen3_topk_select.REAL_VOCAB):
+            raise ValueError(
+                "topk_select_fwd REAL_VOCAB must match model vocab_size: "
+                f"{int(qwen3_topk_select.REAL_VOCAB)} != {model.config.vocab_size}."
+            )
+        topk_width = int(qwen3_topk_select.TOPK)
+        if topk_width != _QWEN14B_TOPK_SELECT_K:
+            raise ValueError(
+                "topk_select_fwd TOPK must match executor capability: "
+                f"{topk_width} != {_QWEN14B_TOPK_SELECT_K}."
+            )
+        sampled_ids_width = int(getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", 1))
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable(
@@ -302,10 +317,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             page_size=page_size,
             sampled_ids_width=sampled_ids_width,
         )
-        greedy_sample = self._compile_greedy_sample_callable(
-            qwen3_l3_dispatch.qwen3_greedy_sample_host,
+        topk_select = self._compile_topk_select_callable(
+            qwen3_l3_dispatch.qwen3_topk_select_host,
             batch=kernel_batch,
-            sampled_ids_width=sampled_ids_width,
+            topk_width=topk_width,
             vocab_size=padded_vocab,
         )
         rope_cos_raw, rope_sin_raw = rope_tables(
@@ -353,13 +368,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             (kernel_batch, padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
-        prefill_sampled_ids_buffer = torch.empty(
-            (kernel_batch, sampled_ids_width),
-            dtype=torch.int32,
+        prefill_topk_values_buffer = torch.empty(
+            (kernel_batch, topk_width),
+            dtype=torch.float32,
         ).share_memory_()
-        prefill_next_hidden_buffer = torch.empty(
-            (kernel_batch, model.config.hidden_size),
-            dtype=torch.bfloat16,
+        prefill_topk_indices_buffer = torch.empty(
+            (kernel_batch, topk_width),
+            dtype=torch.int32,
         ).share_memory_()
         decode_logits_buffer = torch.empty(
             (kernel_batch, padded_vocab),
@@ -379,6 +394,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             (kernel_batch, sampled_ids_width),
             dtype=torch.int32,
         ).share_memory_()
+        decode_topk_values_buffer = torch.empty(
+            (kernel_batch, topk_width),
+            dtype=torch.float32,
+        ).share_memory_()
+        decode_topk_indices_buffer = torch.empty(
+            (kernel_batch, topk_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        sampling_control_buffer = torch.empty((2,), dtype=torch.int32).share_memory_()
         decode_next_hidden_buffer = torch.empty(
             (kernel_batch, model.config.hidden_size),
             dtype=torch.bfloat16,
@@ -386,7 +410,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
-            greedy_sample=greedy_sample,
+            topk_select=topk_select,
             final_norm_weight=final_norm_weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
@@ -401,14 +425,17 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             prefill_block_table_buffer=prefill_block_table_buffer,
             prefill_slot_mapping_buffer=prefill_slot_mapping_buffer,
             prefill_logits_buffer=prefill_logits_buffer,
-            prefill_sampled_ids_buffer=prefill_sampled_ids_buffer,
-            prefill_next_hidden_buffer=prefill_next_hidden_buffer,
+            prefill_topk_values_buffer=prefill_topk_values_buffer,
+            prefill_topk_indices_buffer=prefill_topk_indices_buffer,
             decode_seq_lens_buffer=decode_seq_lens_buffer,
             decode_block_table_buffer=decode_block_table_buffer,
             decode_slot_mapping_buffer=decode_slot_mapping_buffer,
             decode_logits_buffer=decode_logits_buffer,
             decode_token_ids_buffer=decode_token_ids_buffer,
             decode_sampled_ids_buffer=decode_sampled_ids_buffer,
+            decode_topk_values_buffer=decode_topk_values_buffer,
+            decode_topk_indices_buffer=decode_topk_indices_buffer,
+            sampling_control_buffer=sampling_control_buffer,
             decode_next_hidden_buffer=decode_next_hidden_buffer,
         )
 
@@ -528,20 +555,22 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         ]
         return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
 
-    def _compile_greedy_sample_callable(
+    def _compile_topk_select_callable(
         self,
         jit_fn: object,
         *,
         batch: int,
-        sampled_ids_width: int,
+        topk_width: int,
         vocab_size: int,
     ) -> _L3Callable:
-        """Compile the greedy sampling HOST wrapper."""
+        """Compile the top-k candidate selection HOST wrapper."""
         dummy_args = [
             torch.empty((batch, vocab_size), dtype=torch.float32),
-            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
+            torch.empty((2,), dtype=torch.int32),
+            torch.empty((batch, topk_width), dtype=torch.float32),
+            torch.empty((batch, topk_width), dtype=torch.int32),
         ]
-        return self._compile_jit_fwd_callable("greedy_sample_fwd", jit_fn, dummy_args)
+        return self._compile_jit_fwd_callable("topk_select_fwd", jit_fn, dummy_args)
 
     def _compile_jit_fwd_callable(
         self,

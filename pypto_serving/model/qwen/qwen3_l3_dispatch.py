@@ -16,7 +16,7 @@ import pypto.language as pl
 
 prefill_fwd = None
 decode_fwd = None
-greedy_sample_fwd = None
+topk_select_fwd = None
 
 
 @pl.jit.host
@@ -135,11 +135,15 @@ def qwen3_decode_host(
 
 
 @pl.jit.host
-def qwen3_greedy_sample_host(
+def qwen3_topk_select_host(
     logits: pl.Tensor,
-    sampled_ids: pl.Out[pl.Tensor],
-) -> pl.Tensor:
-    return greedy_sample_fwd(
+    sampling_control: pl.Tensor,
+    topk_values: pl.Out[pl.Tensor],
+    topk_indices: pl.Out[pl.Tensor],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    return topk_select_fwd(
         logits,
-        sampled_ids,
+        sampling_control,
+        topk_values,
+        topk_indices,
     )
