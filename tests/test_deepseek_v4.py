@@ -157,6 +157,27 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.executor_kwargs["enable_mtp"] is True
 
 
+def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--ep",
+            "8",
+            "--no-enable-mtp",
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.executor_kwargs["enable_mtp"] is False
+
+
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
     class StrictDataclassFieldValidationError(Exception):
         pass
@@ -722,9 +743,17 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     captured = {}
 
     class FakeDistributedWorker:
-        def __init__(self, compiled, *, persistent, inherited_host_tensors):
+        def __init__(
+            self,
+            compiled,
+            *,
+            persistent,
+            reset_persistent_windows,
+            inherited_host_tensors,
+        ):
             captured["compiled"] = compiled
             captured["persistent"] = persistent
+            captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
 
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
@@ -744,6 +773,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
     assert captured["persistent"] is True
+    assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
 
 
@@ -1321,6 +1351,102 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     assert result.logits.shape == (1, model.config.vocab_size)
 
 
+def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode_mtp_fused")
+    runner._decode_flow = runner._run_mtp_decode
+    layout = runner._compiled.layout
+    main_sampled_ids = torch.zeros(
+        layout.ranks,
+        layout.decode_tokens,
+        8,
+        dtype=torch.int32,
+    )
+    mtp_buffers = SimpleNamespace(
+        decode_accepted_counts=torch.ones(
+            layout.ranks,
+            layout.decode_batch,
+            dtype=torch.int32,
+        ),
+        decode_input_ids=torch.zeros(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.long,
+        ),
+        decode_position_ids=torch.zeros(
+            layout.ranks,
+            layout.decode_tokens,
+            dtype=torch.int32,
+        ),
+        decode_sampled_ids=torch.zeros(
+            layout.ranks,
+            layout.decode_batch,
+            8,
+            dtype=torch.int32,
+        ),
+    )
+    state = SimpleNamespace(
+        draft_token_id=5,
+        tail_token_id=3,
+        tail_slot_id=0,
+        tail_position=126,
+        proposed_tokens=0,
+        accepted_tokens=0,
+    )
+    runner._mtp_request_states["req-a"] = state
+    staged = SimpleNamespace(
+        request_ids=("req-a",),
+        ranks=(0,),
+        local_rows=(0,),
+        actual_batch=1,
+        per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
+    )
+    dispatches = []
+
+    runner._ensure_l3_shared_buffers = lambda _model: None
+    runner.prepare_mtp_decode_inputs = lambda _model, _batch: staged
+    runner._stage_decode_inputs = lambda prepared: prepared
+    runner._stage_fused_mtp_metadata = lambda _inputs: layout.decode_seq
+    runner._require_decode_buffers = lambda: SimpleNamespace(sampled_ids=main_sampled_ids)
+    runner._require_mtp_buffers = lambda: mtp_buffers
+    runner._require_decode_output_buffer = lambda _hidden_size: torch.empty(0)
+    runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(0)
+    runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
+    runner._decode_fwd_args = lambda *_args: ()
+    runner._fused_mtp_decode_args = lambda _main_args, _active_tokens: ("fused",)
+    runner._debug_decode_dispatch = lambda *_args: None
+
+    def fake_run_l3(callable_spec, *args):
+        dispatches.append((callable_spec.name, args))
+        main_sampled_ids[0, 0, 0] = 5
+        main_sampled_ids[0, 1, 0] = 9
+        mtp_buffers.decode_accepted_counts[0, 0] = 2
+        mtp_buffers.decode_input_ids[0, 1] = 9
+        mtp_buffers.decode_position_ids[0, 1] = 128
+        mtp_buffers.decode_sampled_ids[0, 0, 0] = 7
+
+    runner._run_l3 = fake_run_l3
+
+    result = runner.run_decode(
+        model,
+        DecodeBatch(
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[3]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            allow_device_greedy_sampling=True,
+        ),
+    )
+
+    assert dispatches == [("decode_mtp_fused", ("fused",))]
+    assert result.accepted_token_ids == [[5, 9]]
+    assert state.draft_token_id == 7
+    assert state.tail_token_id == 9
+    assert state.tail_position == 128
+    assert state.proposed_tokens == 1
+    assert state.accepted_tokens == 1
+
+
 def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
     layout = DeepSeekV4CacheLayout(
         ranks=1,
@@ -1536,6 +1662,7 @@ def _write_deepseek_kernel_dir(
     (kernel_dir / "prefill_mtp.py").write_text("")
     (kernel_dir / "decode_layer.py").write_text("")
     (kernel_dir / "decode_fwd.py").write_text("")
+    (kernel_dir / "decode_fwd_mtp.py").write_text("")
     (kernel_dir / "decode_mtp.py").write_text("")
     (kernel_dir / "config.py").write_text(
         "\n".join(

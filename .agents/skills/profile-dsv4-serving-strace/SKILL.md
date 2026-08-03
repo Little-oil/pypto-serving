@@ -79,6 +79,8 @@ summarizes Effective when reprocessing an older log that contains complete devic
 Serving child processes can write several complete `[STRACE]` records on one physical log
 line. The analyzer splits at every marker before calling Simpler's built-in
 `parse_spans`, `group_invocations`, `to_chrome_trace`, and `_round_metrics` APIs.
+It detects both the legacy four-submission decode layout and the current two-submission
+main-plus-verify / MTP layout from the serving kernel spans and final MTP counters.
 
 ## Validate before reporting success
 
@@ -91,8 +93,8 @@ Require all of the following:
 4. `server.log` contains successful SA profiler start/stop, final request, and MTP
    acceptance lines.
 5. Eight distinct `[chip_process pid=... dev=...] ready` mappings are present.
-6. `serving-trace/trace.json` contains non-empty `traceEvents`, including framework and
-   all four DSV4 prefill/decode kernel spans.
+6. `serving-trace/trace.json` contains non-empty `traceEvents`, including framework spans
+   and all prefill/decode kernel spans required by the detected decode layout.
 7. `server.log` contains host `[STRACE]` records and no `clk=dev` records.
 8. `simpler-swimlane.json`, `strace-8lane.json`, and
    `strace-8lane-host-clock.json` contain non-empty `traceEvents`.

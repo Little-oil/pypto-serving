@@ -533,6 +533,17 @@ _MTP_DECODE_TENSOR_ORDER = (
     "logit_row_indices",
 )
 
+_FUSED_MTP_SHARED_TENSORS = frozenset(
+    {
+        "embed_weight",
+        "main_pre_hc_hidden",
+        "freqs_cos",
+        "freqs_sin",
+        "ori_block_table",
+        "lm_head_weight",
+    }
+)
+
 _DECODE_INPUT_TENSOR_FIELDS = (
     "input_ids",
     "position_ids",
@@ -1248,6 +1259,8 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_position_ids: torch.Tensor
     decode_accepted_counts: torch.Tensor
     decode_tail_slot_ids: torch.Tensor
+    decode_tail_token_ids: torch.Tensor
+    decode_tail_positions: torch.Tensor
     tail_init_hidden: torch.Tensor
     decode_kv_cache: torch.Tensor
     prefill_hidden_out: torch.Tensor
@@ -2299,7 +2312,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return DecodeResult(hidden_states=None, logits=logits)
 
     def _run_mtp_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Verify request-local MTP drafts and advance the accepted windows."""
+        """Verify and advance request-local MTP drafts in one L3 dispatch."""
         if not batch.allow_device_greedy_sampling:
             raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_initialize", cat="executor"):
@@ -2307,24 +2320,64 @@ class DeepSeekV4ModelRunner(ModelRunner):
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_build_speculative_batch", cat="executor"):
             draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
             speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
-        output = self._execute_main_decode(
-            model,
-            self.prepare_mtp_decode_inputs(model, speculative_batch),
-            active_seq=self._compiled.layout.decode_seq,
-        )
-        inputs = output.inputs
-        decode_seq = self._compiled.layout.decode_seq
+
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
+            inputs = self._stage_decode_inputs(
+                self.prepare_mtp_decode_inputs(model, speculative_batch)
+            )
+            active_tokens = self._stage_fused_mtp_metadata(inputs)
+        layout = self._compiled.layout
+        decode_buffers = self._require_decode_buffers()
+        mtp_buffers = self._require_mtp_buffers()
+        hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
+        pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
+        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
+        with profile_span(
+            "DeepSeekV4ModelRunner.decode.prepare_fwd_args",
+            cat="executor",
+            args={"actual_tokens": active_tokens},
+        ):
+            main_args = self._decode_fwd_args(
+                inputs,
+                pre_hc_hidden_buffer,
+                hidden_buffer,
+                logits_buffer,
+                decode_buffers.sampled_ids,
+            )
+            args = self._fused_mtp_decode_args(main_args, active_tokens)
+        self._debug_decode_dispatch(inputs, main_args)
+        try:
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.l3_dispatch",
+                cat="executor",
+                args={"actual_tokens": active_tokens, "fused_mtp": True},
+            ):
+                self._run_l3(self._require_decode_callable(), *args)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DeepSeekV4 fused main/MTP decode dispatch failed "
+                f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
+            ) from exc
+
+        decode_seq = layout.decode_seq
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_accept", cat="executor"):
             main_ids = torch.stack(
                 tuple(
-                    output.sampled_ids[rank, local_row * decode_seq + offset, 0]
+                    decode_buffers.sampled_ids[rank, local_row * decode_seq + offset, 0]
                     for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
                     for offset in range(decode_seq)
                 )
             ).to(torch.long).reshape(inputs.actual_batch, decode_seq)
-            accepted = accept_mtp_tokens(main_ids, draft_token_ids)
+            accepted_counts = tuple(
+                int(mtp_buffers.decode_accepted_counts[rank, local_row].item())
+                for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
+            )
+            accepted = [
+                main_ids[index, :accepted_count].detach().cpu().tolist()
+                for index, accepted_count in enumerate(accepted_counts)
+            ]
             self._mtp_proposed_tokens += inputs.actual_batch
-            self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
+            self._mtp_accepted_tokens += sum(count == decode_seq for count in accepted_counts)
             for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
                 state = self._require_mtp_request_state(request_id)
                 state.proposed_tokens += 1
@@ -2341,18 +2394,26 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     draft_token_ids.detach().cpu().tolist(),
                     main_ids.detach().cpu().tolist(),
                 )
-        # Match the reference accepted_num flow: update the MTP window from
-        # committed main-model outputs immediately, even after rejection.
         with profile_span(
-            "DeepSeekV4ModelRunner.decode.mtp_advance",
+            "DeepSeekV4ModelRunner.decode.mtp_update_state",
             cat="executor",
-            args={"accepted_counts": tuple(len(tokens) for tokens in accepted)},
+            args={"accepted_counts": accepted_counts},
         ):
-            self._advance_mtp_drafts(
-                inputs,
-                main_ids,
-                accepted_counts=tuple(len(tokens) for tokens in accepted),
-            )
+            for request_id, rank, local_row in zip(
+                inputs.request_ids,
+                inputs.ranks,
+                inputs.local_rows,
+                strict=True,
+            ):
+                row_end = (local_row + 1) * decode_seq - 1
+                state = self._require_mtp_request_state(request_id)
+                state.draft_token_id = int(
+                    mtp_buffers.decode_sampled_ids[rank, local_row, 0].item()
+                )
+                state.tail_token_id = int(mtp_buffers.decode_input_ids[rank, row_end].item())
+                state.tail_position = int(
+                    mtp_buffers.decode_position_ids[rank, row_end].item()
+                )
         return DecodeResult(
             hidden_states=None,
             logits=None,
@@ -2704,6 +2765,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
         values = self._mark_resident_args(values, _MTP_DECODE_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _MTP_DECODE_TENSOR_ORDER)
 
+    def _fused_mtp_decode_args(
+        self,
+        main_args: tuple[Any, ...],
+        active_tokens: int,
+    ) -> tuple[Any, ...]:
+        """Append the non-shared MTP arguments to the main decode arguments."""
+        buffers = self._require_mtp_buffers()
+        mtp_args = self._mtp_decode_args()
+        fused_mtp_args = tuple(
+            arg
+            for name, arg in zip(_MTP_DECODE_TENSOR_ORDER, mtp_args, strict=True)
+            if name not in _FUSED_MTP_SHARED_TENSORS
+        )
+        return (
+            *main_args,
+            buffers.decode_tail_token_ids,
+            buffers.decode_tail_positions,
+            *fused_mtp_args,
+            self._int32_scalar(active_tokens),
+        )
+
     def _require_mtp_buffers(self) -> _DeepSeekV4MtpSharedBuffers:
         if self._mtp_buffers is None:
             raise RuntimeError("DeepSeekV4 MTP shared buffers are not staged")
@@ -3007,6 +3089,37 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_decode_inputs_initialized = True
         return active_tokens
 
+    def _stage_fused_mtp_metadata(self, inputs: DeepSeekV4PreparedDecodeInputs) -> int:
+        """Stage request tails consumed by the device-side verifier."""
+        buffers = self._require_mtp_buffers()
+        layout = self._compiled.layout
+        buffers.decode_tail_slot_ids.fill_(-1)
+        buffers.decode_tail_token_ids.zero_()
+        buffers.decode_tail_positions.zero_()
+        buffers.decode_logit_row_indices.fill_(-1)
+        for request_id, rank, local_row in zip(
+            inputs.request_ids,
+            inputs.ranks,
+            inputs.local_rows,
+            strict=True,
+        ):
+            state = self._require_mtp_request_state(request_id)
+            if (
+                state.tail_token_id is None
+                or state.tail_slot_id is None
+                or state.tail_position is None
+            ):
+                raise RuntimeError(
+                    f"DeepSeekV4 MTP committed tail is not initialized for {request_id!r}"
+                )
+            buffers.decode_tail_token_ids[rank, local_row] = state.tail_token_id
+            buffers.decode_tail_positions[rank, local_row] = state.tail_position
+            buffers.decode_tail_slot_ids[rank, local_row] = state.tail_slot_id
+            buffers.decode_logit_row_indices[rank, local_row] = (
+                local_row * layout.decode_seq + layout.decode_seq - 1
+            )
+        return max(inputs.per_rank_counts) * layout.decode_seq
+
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
         tensors = self._stacked_device_weights or self._stacked_host_weights
         if tensors is None:
@@ -3240,7 +3353,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
         """Load immutable MTP weights and allocate mutable shared buffers before worker fork."""
-        if self._compiled.mtp_prefill is None or self._compiled.mtp_decode is None:
+        legacy_mtp = (
+            self._compiled.mtp_prefill is not None
+            and self._compiled.mtp_decode is not None
+        )
+        if not self._compiled.enable_mtp and not legacy_mtp:
             return None
         if self._mtp_buffers is not None:
             return self._mtp_buffers
@@ -3293,6 +3410,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
             decode_tail_slot_ids=self._shared_empty(
                 (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_slot_ids"
+            ),
+            decode_tail_token_ids=self._shared_empty(
+                (ranks, layout.decode_batch), torch.long, name="mtp_decode_tail_token_ids"
+            ),
+            decode_tail_positions=self._shared_empty(
+                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_positions"
             ),
             tail_init_hidden=self._shared_empty(
                 (ranks, layout.decode_batch, layout.hc_mult, hidden),
