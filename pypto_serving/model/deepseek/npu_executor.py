@@ -102,12 +102,14 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_attention_hca",
     "decode_attention_swa",
     "decode_fwd",
+    "decode_fwd_mtp",
     "decode_input_pack",
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
     "decode_metadata_device",
     "decode_mtp",
+    "decode_mtp_verify",
     "lookup_embedding",
     "decode_sparse_attn",
     "decode_sparse_attn_csa",
@@ -438,9 +440,21 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 self._prefill_dummy_args(model, layout, modules["config"]),
             )
             decode = self._compile_l3_callable(
-                "deepseek_v4_decode",
-                modules["decode_fwd"].l3_decode_fwd,
-                self._decode_dummy_args(model, layout, modules["config"]),
+                "deepseek_v4_decode_mtp_fused" if self._enable_mtp else "deepseek_v4_decode",
+                (
+                    modules["decode_fwd_mtp"].l3_decode_fwd_mtp
+                    if self._enable_mtp
+                    else modules["decode_fwd"].l3_decode_fwd
+                ),
+                (
+                    self._fused_mtp_dummy_args(
+                        modules,
+                        model=model,
+                        layout=layout,
+                    )
+                    if self._enable_mtp
+                    else self._decode_dummy_args(model, layout, modules["config"])
+                ),
             )
             if self._enable_mtp:
                 mtp_prefill = self._compile_l3_callable(
@@ -451,16 +465,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                         model=model,
                         layout=layout,
                         num_tokens=layout.prefill_seq,
-                    ),
-                )
-                mtp_decode = self._compile_l3_callable(
-                    "deepseek_v4_mtp_decode",
-                    modules["decode_mtp"].l3_mtp_decode_layer,
-                    self._mtp_dummy_args(
-                        modules["decode_mtp"],
-                        model=model,
-                        layout=layout,
-                        num_tokens=layout.decode_tokens,
                     ),
                 )
             freqs_cos, freqs_sin = self._build_rope_tables(modules["rope_tables"], modules["config"])
@@ -487,6 +491,54 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             num_hash_layers=num_hash_layers,
             enable_mtp=self._enable_mtp,
         )
+
+    def _fused_mtp_dummy_args(
+        self,
+        modules: dict[str, object],
+        *,
+        model: RuntimeModel,
+        layout: DeepSeekV4CacheLayout,
+    ) -> tuple[Any, ...]:
+        """Build the combined main-decode and MTP-decode compile signature."""
+        main_args = self._decode_dummy_args(model, layout, modules["config"])
+        mtp_args = self._mtp_dummy_args(
+            modules["decode_mtp"],
+            model=model,
+            layout=layout,
+            num_tokens=layout.decode_tokens,
+        )
+        with _deepseek_v4_import_context(
+            self._kernel_dir,
+            pypto_root=self._kernel_dir.parents[2],
+            ep=len(self._device_ids),
+            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            moe_shape="decode",
+        ):
+            mtp_specs = modules["decode_mtp"].build_tensor_specs(
+                num_tokens=layout.decode_tokens,
+            )
+        shared_names = {
+            "embed_weight",
+            "main_pre_hc_hidden",
+            "freqs_cos",
+            "freqs_sin",
+            "ori_block_table",
+            "lm_head_weight",
+        }
+        tail_token_ids = torch.empty(
+            (layout.ranks, layout.decode_batch),
+            dtype=torch.int64,
+        )
+        tail_positions = torch.empty(
+            (layout.ranks, layout.decode_batch),
+            dtype=torch.int32,
+        )
+        fused_mtp_args = tuple(
+            arg
+            for spec, arg in zip(mtp_specs, mtp_args, strict=True)
+            if spec.name not in shared_names
+        )
+        return (*main_args, tail_token_ids, tail_positions, *fused_mtp_args)
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
         """Import DeepSeekV4 pypto-lib modules with EP fixed to the serving world size."""
@@ -522,10 +574,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             config.DECODE_RECV_MAX = ranks * layout.decode_tokens
             config.RECV_MAX = config.DECODE_RECV_MAX
             modules = {"config": config}
+            decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "rope_tables"]
+            if self._enable_mtp:
+                decode_module_names.extend(("decode_mtp", "decode_fwd_mtp"))
             modules.update(
                 {
                     name: importlib.import_module(name)
-                    for name in ("decode_layer", "decode_fwd", "decode_mtp", "lm_head", "rope_tables")
+                    for name in decode_module_names
                 }
             )
         modules["prefill_layer"] = prefill_layer

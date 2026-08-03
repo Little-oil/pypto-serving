@@ -18,9 +18,10 @@ from pathlib import Path
 
 PROCESS_NAME_RE = re.compile(r"inv=(?P<inv>\d+) \(pid=(?P<pid>\d+)\)")
 DEVICE_READY_RE = re.compile(r"\[chip_process pid=(?P<pid>\d+) dev=(?P<device>\d+)\] ready")
+MTP_ACCEPTANCE_RE = re.compile(r"MTP acceptance for .* proposed=(?P<steps>\d+)")
 
 
-def callable_label(invocation: int) -> tuple[str, int | None, str]:
+def callable_label(invocation: int, decode_width: int) -> tuple[str, int | None, str]:
     prefill = {
         1: ("prefill.main", None, "rail_response"),
         2: ("prefill.main.lm_head", None, "rail_animation"),
@@ -29,8 +30,15 @@ def callable_label(invocation: int) -> tuple[str, int | None, str]:
     }
     if invocation in prefill:
         return prefill[invocation]
-    step = (invocation - 5) // 4 + 1
-    phase = (invocation - 5) % 4
+    step = (invocation - 5) // decode_width + 1
+    phase = (invocation - 5) % decode_width
+    if decode_width == 2:
+        decode = {
+            0: ("decode.main+verify", "good"),
+            1: ("decode.mtp", "cq_build_running"),
+        }
+        label, color = decode[phase]
+        return label, step, color
     decode = {
         0: ("decode.main", "good"),
         1: ("decode.main.lm_head", "rail_animation"),
@@ -91,9 +99,10 @@ def main() -> None:
     source = json.loads(args.input.read_text())
     source_events = source["traceEvents"] if isinstance(source, dict) else source
 
+    server_log = args.server_log.read_text(errors="replace")
     pid_to_device = {
         int(match.group("pid")): int(match.group("device"))
-        for match in DEVICE_READY_RE.finditer(args.server_log.read_text(errors="replace"))
+        for match in DEVICE_READY_RE.finditer(server_log)
     }
     devices = sorted(pid_to_device.values())
     if len(devices) != 8 or len(set(devices)) != 8:
@@ -118,6 +127,19 @@ def main() -> None:
         virtual_pid = event.get("pid")
         if virtual_pid in virtual_processes and event.get("ph") == "X":
             grouped.setdefault(int(virtual_pid), []).append(event)
+
+    invocation_ids = sorted({invocation for _device, invocation in virtual_processes.values()})
+    if not invocation_ids or invocation_ids != list(range(1, invocation_ids[-1] + 1)):
+        raise ValueError(f"unexpected invocation ids: {invocation_ids}")
+    decode_invocations = invocation_ids[-1] - 4
+    acceptance_matches = list(MTP_ACCEPTANCE_RE.finditer(server_log))
+    proposed_steps = int(acceptance_matches[-1].group("steps")) if acceptance_matches else 0
+    if proposed_steps and decode_invocations == proposed_steps * 2:
+        decode_width = 2
+    elif decode_invocations % 4 == 0:
+        decode_width = 4
+    else:
+        raise ValueError(f"cannot infer decode invocation width from {invocation_ids[-1]} invocations")
 
     roots = [
         event
@@ -169,7 +191,7 @@ def main() -> None:
         runner = one_event(events, "simpler_run.runner_run")
         validate = one_event(events, "simpler_run.validate")
         device_wall = one_event(events, "simpler_run.runner_run.device_wall")
-        label, step, color = callable_label(invocation)
+        label, step, color = callable_label(invocation, decode_width)
         event_name = label if step is None else f"D{step:02d} {label}"
         has_device_trace = device_wall is not None
         event_args = {

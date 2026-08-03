@@ -87,6 +87,32 @@ def main() -> None:
     server_log = server_log_path.read_text(encoding="utf-8", errors="replace")
     serving_trace = json.loads(serving_trace_path.read_text(encoding="utf-8"))
 
+    serving_events = serving_trace["traceEvents"]
+    kernel_durations_ms: dict[str, list[float]] = defaultdict(list)
+    for event in serving_events:
+        if (
+            event.get("ph") == "X"
+            and event.get("cat") == "kernel"
+            and not event.get("name", "").endswith(".worker_run")
+        ):
+            kernel_durations_ms[event["args"]["kernel"]].append(event["dur"] / 1000.0)
+
+    required_kernels = {"deepseek_v4_prefill", "deepseek_v4_mtp_prefill"}
+    if "deepseek_v4_decode_mtp_fused" in kernel_durations_ms:
+        decode_layout = "two_l2"
+        decode_width = 2
+        required_kernels.add("deepseek_v4_decode_mtp_fused")
+    elif {"deepseek_v4_decode", "deepseek_v4_mtp_decode"}.issubset(kernel_durations_ms):
+        decode_layout = "split"
+        decode_width = 4
+        required_kernels.update({"deepseek_v4_decode", "deepseek_v4_mtp_decode"})
+    else:
+        raise RuntimeError(
+            "serving trace has neither the fused nor split DeepSeek V4 decode kernel layout"
+        )
+    if not required_kernels.issubset(kernel_durations_ms):
+        raise RuntimeError(f"missing serving kernel spans: {required_kernels - kernel_durations_ms.keys()}")
+
     split_log = server_log.replace("[STRACE]", "\n[STRACE]")
     spans = list(parse_spans(split_log.splitlines()))
     invocations = group_invocations(spans)
@@ -130,11 +156,11 @@ def main() -> None:
     invocation_ids = sorted(hid_by_inv)
     if (
         invocation_ids != list(range(1, invocation_ids[-1] + 1))
-        or invocation_ids[-1] < 8
-        or (invocation_ids[-1] - 4) % 4
+        or invocation_ids[-1] < 4 + decode_width
+        or (invocation_ids[-1] - 4) % decode_width
     ):
         raise RuntimeError(f"unexpected invocation ids: {invocation_ids}")
-    decode_step_count = (invocation_ids[-1] - 4) // 4
+    decode_step_count = (invocation_ids[-1] - 4) // decode_width
     if len(request_invocations) != len(devices) * invocation_ids[-1]:
         raise RuntimeError(
             f"incomplete rank data: got {len(request_invocations)} invocations, "
@@ -177,10 +203,13 @@ def main() -> None:
     decode_rows = []
     critical_metric = "total_effective_us" if device_effective_available else "total_host_us"
     for step in range(decode_step_count):
-        base = 5 + step * 4
+        base = 5 + step * decode_width
         per_rank = []
         for pid in pids:
-            per_rank.append(rank_phase_row(pid, [base, base + 1], [base + 2, base + 3]))
+            if decode_layout == "two_l2":
+                per_rank.append(rank_phase_row(pid, [base], [base + 1]))
+            else:
+                per_rank.append(rank_phase_row(pid, [base, base + 1], [base + 2, base + 3]))
         critical = max(per_rank, key=lambda row: row[critical_metric])
         decode_row = {
             "step": step + 1,
@@ -199,25 +228,6 @@ def main() -> None:
                 }
             )
         decode_rows.append(decode_row)
-
-    serving_events = serving_trace["traceEvents"]
-    kernel_durations_ms: dict[str, list[float]] = defaultdict(list)
-    for event in serving_events:
-        if (
-            event.get("ph") == "X"
-            and event.get("cat") == "kernel"
-            and not event.get("name", "").endswith(".worker_run")
-        ):
-            kernel_durations_ms[event["args"]["kernel"]].append(event["dur"] / 1000.0)
-
-    required_kernels = {
-        "deepseek_v4_prefill",
-        "deepseek_v4_mtp_prefill",
-        "deepseek_v4_decode",
-        "deepseek_v4_mtp_decode",
-    }
-    if not required_kernels.issubset(kernel_durations_ms):
-        raise RuntimeError(f"missing serving kernel spans: {required_kernels - kernel_durations_ms.keys()}")
 
     request_ms = next(
         (
@@ -287,6 +297,7 @@ def main() -> None:
     summary = {
         "run_id": args.run_id,
         "devices": devices,
+        "decode_layout": decode_layout,
         "request": {
             "prompt_tokens": int(completion_match.group(1)),
             "completion_tokens": completion_tokens,
@@ -325,10 +336,29 @@ def main() -> None:
     (artifact_dir / "profile-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
     prefill = summary["simpler"]["prefill_critical"]
-    main_serving = summary["serving_kernel_ms"]["deepseek_v4_decode"]["steady_after_first"]
-    mtp_serving = summary["serving_kernel_ms"]["deepseek_v4_mtp_decode"]["steady_after_first"]
-    if main_serving is None or mtp_serving is None:
-        raise RuntimeError("need more than one decode kernel span for steady statistics")
+    if decode_layout == "two_l2":
+        fused_serving = summary["serving_kernel_ms"]["deepseek_v4_decode_mtp_fused"][
+            "steady_after_first"
+        ]
+        if fused_serving is None:
+            raise RuntimeError("need more than one fused decode kernel span for steady statistics")
+        serving_decode_lines = (
+            f"- Combined decode steady mean (steps 2-{decode_step_count}): "
+            f"{fused_serving['mean']:.3f} ms/iteration"
+        )
+        main_phase_label = "Main+verify"
+    else:
+        main_serving = summary["serving_kernel_ms"]["deepseek_v4_decode"]["steady_after_first"]
+        mtp_serving = summary["serving_kernel_ms"]["deepseek_v4_mtp_decode"]["steady_after_first"]
+        if main_serving is None or mtp_serving is None:
+            raise RuntimeError("need more than one decode kernel span for steady statistics")
+        serving_decode_lines = (
+            f"- Decode main steady mean (steps 2-{decode_step_count}): "
+            f"{main_serving['mean']:.3f} ms/iteration\n"
+            f"- Decode MTP steady mean (steps 2-{decode_step_count}): "
+            f"{mtp_serving['mean']:.3f} ms/iteration"
+        )
+        main_phase_label = "Main"
     critical_rank_counts = Counter(row["critical_device"] for row in decode_rows)
     critical_rank_summary = ", ".join(
         f"device {device}: {count}/{decode_step_count}"
@@ -366,9 +396,9 @@ This input contains device STRACE. Effective is the union of the device-domain O
 Sched windows.
 
 - Prefill critical rank: device {prefill["device"]}, main={prefill["main_effective_us"] / 1000:.3f} ms, MTP={prefill["mtp_effective_us"] / 1000:.3f} ms, total={prefill["total_effective_us"] / 1000:.3f} ms
-- Decode steady critical rank mean: main={steady_effective["critical_main_effective_us"]["mean"] / 1000:.3f} ms, MTP={steady_effective["critical_mtp_effective_us"]["mean"] / 1000:.3f} ms, total={steady_effective["critical_total_effective_us"]["mean"] / 1000:.3f} ms/iteration
+- Decode steady critical rank mean: {main_phase_label}={steady_effective["critical_main_effective_us"]["mean"] / 1000:.3f} ms, MTP={steady_effective["critical_mtp_effective_us"]["mean"] / 1000:.3f} ms, total={steady_effective["critical_total_effective_us"]["mean"] / 1000:.3f} ms/iteration
 
-| Decode iteration | Critical device | Main Effective (ms) | MTP Effective (ms) | Total Effective (ms) |
+| Decode iteration | Critical device | {main_phase_label} Effective (ms) | MTP Effective (ms) | Total Effective (ms) |
 | ---: | ---: | ---: | ---: | ---: |
 {effective_decode_table}
 """
@@ -384,16 +414,15 @@ Sched windows.
 
 - Prefill main kernel span: {kernel_durations_ms["deepseek_v4_prefill"][0]:.3f} ms
 - Prefill MTP kernel span: {kernel_durations_ms["deepseek_v4_mtp_prefill"][0]:.3f} ms
-- Decode main steady mean (steps 2-{decode_step_count}): {main_serving["mean"]:.3f} ms/iteration
-- Decode MTP steady mean (steps 2-{decode_step_count}): {mtp_serving["mean"]:.3f} ms/iteration
+{serving_decode_lines}
 
 ## Simpler Host STRACE
 
 - Prefill critical rank: device {prefill["device"]}, main={prefill["main_host_us"] / 1000:.3f} ms, MTP={prefill["mtp_host_us"] / 1000:.3f} ms, total={prefill["total_host_us"] / 1000:.3f} ms
-- Decode steady critical rank mean (steps 2-{decode_step_count}): main={host_stats["critical_main_host_us"]["mean"] / 1000:.3f} ms, MTP={host_stats["critical_mtp_host_us"]["mean"] / 1000:.3f} ms, total={host_stats["critical_total_host_us"]["mean"] / 1000:.3f} ms/iteration
+- Decode steady critical rank mean (steps 2-{decode_step_count}): {main_phase_label}={host_stats["critical_main_host_us"]["mean"] / 1000:.3f} ms, MTP={host_stats["critical_mtp_host_us"]["mean"] / 1000:.3f} ms, total={host_stats["critical_total_host_us"]["mean"] / 1000:.3f} ms/iteration
 - Critical-rank counts across decode: {critical_rank_summary}
 
-| Decode iteration | Critical device | Main host (ms) | MTP host (ms) | Total host (ms) |
+| Decode iteration | Critical device | {main_phase_label} host (ms) | MTP host (ms) | Total host (ms) |
 | ---: | ---: | ---: | ---: | ---: |
 {host_decode_table}
 
