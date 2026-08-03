@@ -87,17 +87,16 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
-    # Async (pipelined) scheduling. None = auto: on for single-token decoders,
-    # off for MTP executors (DeepSeek V4) which return a variable token count per
-    # step (not yet supported by the optimistic-advance path).
+    # Async (pipelined) scheduling. None = auto (on). Speculative/MTP decoders
+    # are supported: the scheduler optimistically reserves the upper bound of
+    # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
 
     def resolve_async_scheduling(self) -> bool:
-        """Resolve the async-scheduling flag, applying the MTP auto-gate."""
+        """Resolve the async-scheduling flag (default on for all executors)."""
         if self.async_scheduling is not None:
             return self.async_scheduling
-        # Auto: enable for single-token decoders; MTP (DeepSeek V4) stays sync.
-        return self.executor_cls != "PyptoDeepSeekV4Executor"
+        return True
 
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
@@ -640,25 +639,24 @@ class ReplicaEngineCore:
                 prompt_ids = req.prompt_token_ids
                 # In async mode a request scheduled while a prior token is still
                 # in flight (num_output_placeholders > 0) has a stale
-                # output_token_ids tail. Send placeholders so the worker uses the
-                # token(s) it just sampled (FIFO guarantees they are cached by the
-                # time it runs this step).
+                # output_token_ids tail. Send a placeholder so the worker uses the
+                # token it last committed (FIFO guarantees it is cached by the
+                # time the worker runs this step).
                 if req.num_output_placeholders > 0:
                     last_token = PLACEHOLDER_TOKEN
-                    prev_token = PLACEHOLDER_TOKEN
                 else:
                     last_token = output_ids[-1] if output_ids else prompt_ids[-1]
-                    if len(output_ids) >= 2:
-                        prev_token = output_ids[-2]
-                    elif output_ids and prompt_ids:
-                        prev_token = prompt_ids[-1]
-                    else:
-                        prev_token = last_token
                 decode_requests.append(DecodeRequest(
                     request_id=req_id,
                     last_token=last_token,
-                    prev_token=prev_token,
-                    seq_len=req.num_tokens,
+                    # Context length for THIS step, snapshotted at schedule time:
+                    # positions already computed plus the token(s) this step adds.
+                    # Do not use req.num_tokens — under async scheduling it also
+                    # counts in-flight placeholders from *other* steps, which would
+                    # inflate seq_len past the KV actually written and shift the
+                    # kernel's positions (observed as duplicated/misplaced tokens
+                    # with chunked prefill at pipeline depth 2).
+                    seq_len=sr.num_computed_tokens + sr.num_new_tokens,
                     block_ids=list(sr.block_ids),
                     block_ids_by_group={
                         name: list(block_ids)

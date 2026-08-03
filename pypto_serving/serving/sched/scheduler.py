@@ -414,7 +414,27 @@ class Scheduler:
             # A step samples a token iff it is a decode step or the prefill chunk
             # that completes the prompt.
             if not scheduled.is_prefill or completes_prompt:
-                request.num_output_placeholders += 1
+                # Reserve the MAXIMUM tokens this step can emit. Speculative /MTP
+                # decode returns a variable count (1 .. 1+num_speculative_tokens)
+                # that is only known once the worker replies, so we optimistically
+                # reserve the upper bound — matching the block allocation that
+                # schedule() already made for num_new + speculative_tokens — and
+                # subtract the shortfall in _reconcile_async_output.
+                reserved = 1 + self._speculative_tokens_for(request, scheduled)
+                request.num_output_placeholders += reserved
+                request.num_computed_tokens += reserved - 1
+
+    def _speculative_tokens_for(
+        self, request: "Request", scheduled: "ScheduledRequest"
+    ) -> int:
+        """Extra tokens beyond the first that a sampling step may emit.
+
+        Mirrors the accounting ``schedule()`` uses when allocating blocks: only
+        greedy decode steps get speculative capacity.
+        """
+        if scheduled.is_prefill or request.temperature > 0.0:
+            return 0
+        return self.config.num_speculative_tokens
 
     def update_from_output(
         self,
@@ -524,29 +544,56 @@ class Scheduler:
         placeholder was reserved and ``token_ids`` is empty), so it emits nothing
         but still publishes its confirmed blocks.
 
-        For the single-token (Qwen) path a step yields exactly one token; the
-        release count therefore matches. Variable multi-token (MTP) reconciliation
-        — where fewer tokens may be accepted than optimistically reserved — is a
-        follow-up (async is gated off for MTP executors for now).
+        A single-token (Qwen) step reserves exactly one slot, so the release
+        matches one-for-one. Speculative / MTP decode reserves the upper bound
+        (``1 + num_speculative_tokens``) because the accepted count is unknown at
+        dispatch; if fewer tokens come back — through rejection or an early EOS —
+        the shortfall is subtracted from ``num_computed_tokens`` here so the
+        request's accounting ends up identical to the synchronous path.
         """
-        # This step reserved a placeholder iff it sampled a token: a decode step,
-        # or a prefill chunk that completed the prompt. num_computed_tokens was
-        # already advanced, so "completed the prompt" == num_computed >= prompt.
+        # This step reserved placeholders iff it sampled: a decode step, or a
+        # prefill chunk that completed the prompt. num_computed_tokens was already
+        # advanced, so "completed the prompt" == num_computed >= prompt.
         sampled_this_step = (
             not scheduled.is_prefill
             or request.num_computed_tokens >= request.num_prompt_tokens
         )
-        if sampled_this_step and request.num_output_placeholders > 0:
-            request.num_output_placeholders -= 1
+        reserved = (
+            1 + self._speculative_tokens_for(request, scheduled)
+            if sampled_this_step
+            else 0
+        )
 
         # Publish confirmed blocks now (worker succeeded), not at dispatch.
         self._cache_completed_blocks(request)
 
+        retained_tokens = 0
         for token_id in token_ids:
             request.output_token_ids.append(token_id)
+            retained_tokens += 1
             outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
             if self._check_finish(request) is not None:
+                # Tokens after a finish are dropped (mirrors the sync path), so
+                # they must not count as retained.
                 break
+
+        if reserved:
+            # Release every placeholder this step reserved.
+            request.num_output_placeholders = max(
+                0, request.num_output_placeholders - reserved
+            )
+            # Reclaim only the SPECULATIVE positions that produced no retained
+            # token. advance_after_schedule added `reserved - 1` extra positions
+            # on top of scheduled.num_new_tokens; the latter is this step's real
+            # KV work (a prefill chunk, or the decode's own token) and must never
+            # be reverted — doing so would re-schedule the same prefill chunk and
+            # decode it twice.
+            speculative_positions = reserved - 1
+            unused_speculative = max(0, speculative_positions - max(0, retained_tokens - 1))
+            if unused_speculative > 0:
+                request.num_computed_tokens = max(
+                    0, request.num_computed_tokens - unused_speculative
+                )
 
     def _check_finish(self, request: Request) -> RequestStatus | None:
         if not request.output_token_ids:
