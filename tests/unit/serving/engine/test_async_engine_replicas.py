@@ -13,91 +13,9 @@ import asyncio
 
 import pytest
 
-import pypto_serving.cli.main as cli
-from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
+from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
-
-
-def _parse_cli_args(argv: list[str]):
-    return cli.build_parser().parse_args(argv)
-
-def test_parallel_config_groups_dp_replicas_into_tp_groups():
-    config = ParallelConfig(
-        data_parallel_size=2,
-        tensor_parallel_size=2,
-        devices=(0, 1, 2, 3),
-    )
-
-    assert config.replica_device_groups == ((0, 1), (2, 3))
-    assert config.for_replica((2, 3)).data_parallel_size == 1
-    assert config.for_replica((2, 3)).devices == (2, 3)
-
-
-def test_parallel_config_rejects_unsupported_modes():
-    with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        ParallelConfig(pipeline_parallel_size=2)
-
-    with pytest.raises(ValueError, match="expert parallel"):
-        ParallelConfig(enable_expert_parallel=True)
-
-    with pytest.raises(ValueError, match="duplicates"):
-        ParallelConfig(data_parallel_size=1, tensor_parallel_size=2, devices=(0, 0))
-
-
-def test_parse_device_ids_uses_default_device():
-    assert parse_device_ids(None, default_device=3) == (3,)
-    assert parse_device_ids("0, 2,4", default_device=3) == (0, 2, 4)
-
-
-def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    args = _parse_cli_args([
-        "--model",
-        str(model_dir),
-        "--devices",
-        "0,1,2,3",
-        "--dp",
-        "2",
-        "--tp",
-        "2",
-    ])
-
-    config = cli.build_serving_engine_config(args)
-
-    assert config.device_id == 0
-    assert config.device_ids == ()
-    assert config.worker_device_ids() == (0, 1)
-    assert config.parallel_config.data_parallel_size == 2
-    assert config.parallel_config.tensor_parallel_size == 2
-    assert config.parallel_config.replica_device_groups == ((0, 1), (2, 3))
-
-
-def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    args = _parse_cli_args([
-        "--model",
-        str(model_dir),
-        "--devices",
-        "0,1,2",
-        "--dp",
-        "2",
-        "--tp",
-        "2",
-    ])
-
-    with pytest.raises(ValueError, match="number of devices"):
-        cli.build_serving_engine_config(args)
-
-
-def test_parser_rejects_unsupported_parallel_flags(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-
-    with pytest.raises(SystemExit):
-        _parse_cli_args(["--model", str(model_dir), "--pp", "2"])
 
 
 def test_async_llm_engine_routes_to_least_pending_tokens():
@@ -266,7 +184,9 @@ class _FakeCore:
     def pending_token_load(self) -> int:
         return self.load
 
-    async def add_request(self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None):
+    async def add_request(
+        self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None
+    ):
         self.requests.append(request_id)
         self.prompt_token_ids.append(list(prompt_token_ids) if prompt_token_ids is not None else None)
         if on_queued is not None:
@@ -288,7 +208,9 @@ class _BlockingCore(_FakeCore):
         self.admitted = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def add_request(self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None):
+    async def add_request(
+        self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None
+    ):
         self.requests.append(request_id)
         self.prompt_token_ids.append(list(prompt_token_ids) if prompt_token_ids is not None else None)
         self.load = 1

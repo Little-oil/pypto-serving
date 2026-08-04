@@ -1,0 +1,65 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from __future__ import annotations
+
+
+import pytest
+
+import pypto_serving.cli.main as cli
+
+
+def _parse_cli_args(argv: list[str]):
+    return cli.build_parser().parse_args(argv)
+
+
+def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_cli_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3",
+            "--dp",
+            "2",
+            "--tp",
+            "2",
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.device_id == 0
+    assert config.device_ids == ()
+    assert config.worker_device_ids() == (0, 1)
+    assert config.parallel_config.data_parallel_size == 2
+    assert config.parallel_config.tensor_parallel_size == 2
+    assert config.parallel_config.replica_device_groups == ((0, 1), (2, 3))
+
+
+def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_cli_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2",
+            "--dp",
+            "2",
+            "--tp",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="number of devices"):
+        cli.build_serving_engine_config(args)

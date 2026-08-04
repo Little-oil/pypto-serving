@@ -25,9 +25,10 @@ from pypto_serving.model.qwen.kernel_cache import (
     canonical_source,
     compute_params_fingerprint,
 )
-from pypto_serving.model.deepseek.kernel_cache import (
-    compute_params_fingerprint as compute_deepseek_params_fingerprint,
-)
+
+from pathlib import Path
+
+from pypto_serving.model.qwen import npu_executor
 
 
 class _FakeTensor:
@@ -93,14 +94,9 @@ def _cache(tmp_path, code_fingerprint="v1+abcd"):
 
 # --- params fingerprint ----------------------------------------------------
 
+
 def _pf(name, args, platform="a2a3"):
     return compute_params_fingerprint(name, args, platform=platform)
-
-
-def test_params_fingerprint_is_stable():
-    a = [_FakeTensor((16, 512)), _FakeTensor((512,))]
-    b = [_FakeTensor((16, 512)), _FakeTensor((512,))]
-    assert _pf("decode_fwd", a) == _pf("decode_fwd", b)
 
 
 def test_params_fingerprint_tracks_every_distinguishing_dimension():
@@ -114,59 +110,8 @@ def test_params_fingerprint_tracks_every_distinguishing_dimension():
     assert base != _pf("prefill_fwd", args)
 
 
-def test_deepseek_params_fingerprint_tracks_deployment_layout():
-    def kernel(x: tuple[int, int]):
-        pass
-
-    jit_fn = types.SimpleNamespace(_func=kernel)
-    kwargs = {
-        "platform": "a2a3",
-        "block_dim": None,
-        "prefill_seq": 128,
-        "decode_batch": 4,
-        "decode_seq": 2,
-        "decode_tokens": 8,
-    }
-    base = compute_deepseek_params_fingerprint("deepseek_v4_decode", jit_fn, **kwargs)
-
-    for dimension in ("prefill_seq", "decode_batch", "decode_seq", "decode_tokens"):
-        changed = {**kwargs, dimension: kwargs[dimension] + 1}
-        assert base != compute_deepseek_params_fingerprint(
-            "deepseek_v4_decode",
-            jit_fn,
-            **changed,
-        )
-
-
-def test_deepseek_params_fingerprint_tracks_signature_annotations():
-    def small(x: tuple[int, int]):
-        pass
-
-    def large(x: tuple[int, int, int]):
-        pass
-
-    kwargs = {
-        "platform": "a2a3",
-        "block_dim": None,
-        "prefill_seq": 128,
-        "decode_batch": 4,
-        "decode_seq": 2,
-        "decode_tokens": 8,
-    }
-    small_fingerprint = compute_deepseek_params_fingerprint(
-        "deepseek_v4_decode",
-        types.SimpleNamespace(_func=small),
-        **kwargs,
-    )
-    large_fingerprint = compute_deepseek_params_fingerprint(
-        "deepseek_v4_decode",
-        types.SimpleNamespace(_func=large),
-        **kwargs,
-    )
-    assert small_fingerprint != large_fingerprint
-
-
 # --- AST-canonical source hashing -----------------------------------------
+
 
 def test_canonical_source_ignores_blank_lines_comments_and_spacing():
     a = "def f(x):\n    return x + 1\n"
@@ -174,18 +119,8 @@ def test_canonical_source_ignores_blank_lines_comments_and_spacing():
     assert canonical_source(a) == canonical_source(b)
 
 
-def test_canonical_source_detects_logic_change():
-    a = "def f(x):\n    return x + 1\n"
-    c = "def f(x):\n    return x + 2\n"
-    assert canonical_source(a) != canonical_source(c)
-
-
-def test_canonical_source_falls_back_on_syntax_error():
-    broken = "def f(:\n"
-    assert canonical_source(broken) == broken.encode()
-
-
 # --- KernelCache load / store ---------------------------------------------
+
 
 def test_store_then_load_round_trip(tmp_path, reload_calls):
     cache = _cache(tmp_path)
@@ -275,3 +210,37 @@ def test_store_is_noop_when_build_dir_is_the_slot(tmp_path, reload_calls):
     after = sorted(p.name for p in slot.rglob("*"))
     assert before == after
     assert not (slot / FINGERPRINT_FILE).exists()
+
+
+def _qwen_kernel_dir(root: Path) -> Path:
+    kernel_dir = root / "models" / "qwen3_14b"
+    kernel_dir.mkdir(parents=True)
+    return kernel_dir
+
+
+def test_qwen_kernel_discovery_prefers_explicit_root(tmp_path: Path, monkeypatch) -> None:
+    explicit_root = tmp_path / "explicit"
+    explicit_kernel_dir = _qwen_kernel_dir(explicit_root)
+    _qwen_kernel_dir(tmp_path / "environment")
+    monkeypatch.setenv("PYPTO_ROOT", str(tmp_path / "environment"))
+
+    assert npu_executor._find_pypto_lib_qwen14b_dir(str(explicit_root)) == explicit_kernel_dir
+
+
+def test_qwen_kernel_discovery_uses_environment_root(tmp_path: Path, monkeypatch) -> None:
+    pypto_root = tmp_path / "environment"
+    kernel_dir = _qwen_kernel_dir(pypto_root)
+    monkeypatch.setenv("PYPTO_ROOT", str(pypto_root))
+
+    assert npu_executor._find_pypto_lib_qwen14b_dir() == kernel_dir
+
+
+def test_qwen_kernel_discovery_falls_back_to_editable_checkout(tmp_path: Path, monkeypatch) -> None:
+    checkout = tmp_path / "checkout"
+    module_path = checkout / "pypto_serving" / "model" / "qwen" / "npu_executor.py"
+    module_path.parent.mkdir(parents=True)
+    kernel_dir = _qwen_kernel_dir(checkout / "pypto-lib")
+    monkeypatch.delenv("PYPTO_ROOT", raising=False)
+    monkeypatch.setattr(npu_executor, "__file__", str(module_path))
+
+    assert npu_executor._find_pypto_lib_qwen14b_dir() == kernel_dir

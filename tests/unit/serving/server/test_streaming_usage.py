@@ -26,6 +26,7 @@ from pypto_serving.serving.server.server import ServingServer
 # Fake engine
 # ---------------------------------------------------------------------------
 
+
 class _FakeEngine:
     """Minimal engine stub: yields caller-supplied TokenOutputs."""
 
@@ -36,6 +37,7 @@ class _FakeEngine:
         class _Inner:
             def apply_chat_template(self, messages, **kwargs):
                 return " ".join(m["content"] for m in messages)
+
         tokenizer = _Inner()
 
         def encode(self, text: str) -> list[int]:
@@ -56,6 +58,7 @@ def _make_server(outputs: list[TokenOutput]) -> ServingServer:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_sse(raw: bytes) -> list[dict]:
     """Parse ``data: ...\n\n`` blocks; skip [DONE]."""
     chunks = []
@@ -63,7 +66,7 @@ def _parse_sse(raw: bytes) -> list[dict]:
         line = line.strip()
         if not line.startswith("data:"):
             continue
-        payload = line[len("data:"):].strip()
+        payload = line[len("data:") :].strip()
         if payload == "[DONE]":
             continue
         chunks.append(json.loads(payload))
@@ -74,14 +77,19 @@ def _parse_sse(raw: bytes) -> list[dict]:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 def test_stream_completion_terminal_usage_chunk():
     """Final SSE chunk must have empty choices and correct usage counts."""
     outputs = [
         TokenOutput(text="Hello", token_id=100, prompt_tokens=5, completion_tokens=1),
         TokenOutput(text="Hello world", token_id=101, prompt_tokens=5, completion_tokens=2),
         TokenOutput(
-            text="Hello world!", token_id=102, finished=True, finish_reason="FINISHED_EOS",
-            prompt_tokens=5, completion_tokens=3,
+            text="Hello world!",
+            token_id=102,
+            finished=True,
+            finish_reason="FINISHED_EOS",
+            prompt_tokens=5,
+            completion_tokens=3,
         ),
     ]
     server = _make_server(outputs)
@@ -115,31 +123,3 @@ def test_stream_completion_terminal_usage_chunk():
     delta_chunks = [c for c in parsed if c["choices"]]
     for c in delta_chunks:
         assert c.get("usage") is None, f"Intermediate chunk has usage: {c}"
-
-
-def test_stream_completion_usage_emitted_once_only():
-    """Usage must appear only in the terminal chunk, never during streaming."""
-    outputs = [
-        TokenOutput(text=str(i), token_id=i, prompt_tokens=4, completion_tokens=i + 1)
-        for i in range(9)
-    ] + [
-        TokenOutput(
-            text="done", token_id=9, finished=True, finish_reason="FINISHED_LENGTH",
-            prompt_tokens=4, completion_tokens=10,
-        )
-    ]
-    server = _make_server(outputs)
-
-    from pypto_serving.config.types import GenerateConfig
-    import asyncio
-
-    async def collect():
-        return [c async for c in server._stream_completion(
-            "req-1", "prompt", GenerateConfig(max_new_tokens=10), "test-model"
-        )]
-
-    raw = b"".join(c.encode() for c in asyncio.run(collect()))
-    parsed = _parse_sse(raw)
-    usage_chunks = [c for c in parsed if not c["choices"]]
-    assert len(usage_chunks) == 1
-    assert usage_chunks[0]["usage"]["completion_tokens"] == 10

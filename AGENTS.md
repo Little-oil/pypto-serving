@@ -31,7 +31,7 @@ python -m pip install --no-deps -e .
 Run the main unit tests:
 
 ```bash
-python -m pytest tests/test_batching.py tests/test_parallel.py
+python -m pytest tests/unit
 ```
 
 Run lint checks used by pre-commit:

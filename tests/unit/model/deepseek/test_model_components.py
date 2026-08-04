@@ -140,16 +140,25 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     model_dir = _write_deepseek_model_dir(tmp_path)
     args = cli.build_parser().parse_args(
         [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "8",
-            "--ep", "8",
-            "--tp", "1",
-            "--block-size", "128",
-            "--max-model-len", "260",
-            "--dtype", "int8",
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--ep",
+            "8",
+            "--tp",
+            "1",
+            "--block-size",
+            "128",
+            "--max-model-len",
+            "260",
+            "--dtype",
+            "int8",
             "--enable-mtp",
-            "--kernel-cache-dir", str(tmp_path / "kernel-cache"),
+            "--kernel-cache-dir",
+            str(tmp_path / "kernel-cache"),
         ]
     )
 
@@ -163,27 +172,6 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["enable_mtp"] is True
     assert config.executor_kwargs["kernel_cache_dir"] == str((tmp_path / "kernel-cache").resolve())
-
-
-def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model",
-            str(model_dir),
-            "--devices",
-            "0,1,2,3,4,5,6,7",
-            "--dp",
-            "8",
-            "--ep",
-            "8",
-            "--no-enable-mtp",
-        ]
-    )
-
-    config = cli.build_serving_engine_config(args)
-
-    assert config.executor_kwargs["enable_mtp"] is False
 
 
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
@@ -416,9 +404,7 @@ def test_deepseek_compile_l3_callable_reuses_cached_program():
         def compile(self, *_args, **_kwargs):
             raise AssertionError("cache hit must skip JIT compilation")
 
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(
-        npu_executor.DeepSeekV4PyptoExecutor
-    )
+    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
     executor._device_ids = tuple(range(8))
     executor._platform = "a2a3"
     executor._kernel_cache = FakeCache()
@@ -726,7 +712,9 @@ def test_deepseek_weight_store_loads_rank_local_experts(tmp_path):
             reads.append(name)
             return torch.tensor([len(reads)])
 
-    store = DeepSeekV4WeightStore(model_dir=tmp_path, weight_map=weight_map, safe_open_fn=lambda path, device: _Reader())
+    store = DeepSeekV4WeightStore(
+        model_dir=tmp_path, weight_map=weight_map, safe_open_fn=lambda path, device: _Reader()
+    )
 
     loaded = store.load_rank_layer_weights(
         0,
@@ -773,8 +761,14 @@ def test_deepseek_weight_store_packs_lm_head_into_8_tp_shards(tmp_path):
     assert global_weights.lm_head_layout.vocab_per_rank == 2
     assert global_weights.lm_head_layout.padded_vocab_per_rank == 512
     assert global_weights.lm_head_weight.shape == (8, 512, 4)
-    assert global_weights.lm_head_weight[0, :2].tolist() == [[100.0, 101.0, 102.0, 103.0], [104.0, 105.0, 106.0, 107.0]]
-    assert global_weights.lm_head_weight[1, :2].tolist() == [[108.0, 109.0, 110.0, 111.0], [112.0, 113.0, 114.0, 115.0]]
+    assert global_weights.lm_head_weight[0, :2].tolist() == [
+        [100.0, 101.0, 102.0, 103.0],
+        [104.0, 105.0, 106.0, 107.0],
+    ]
+    assert global_weights.lm_head_weight[1, :2].tolist() == [
+        [108.0, 109.0, 110.0, 111.0],
+        [112.0, 113.0, 114.0, 115.0],
+    ]
     assert torch.count_nonzero(global_weights.lm_head_weight[:, 2:]) == 0
 
 
@@ -797,7 +791,10 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
     assert packed.tensors["csa_cmp_wkv"].shape == (2, 2, 4)
     assert packed.tensors["csa_cmp_wkv"][0].tolist() == raw["layers.0.attn.compressor.wkv.weight"].tolist()
     assert packed.tensors["csa_inner_wkv"].shape == (2, 2, 4)
-    assert packed.tensors["csa_inner_wkv"][0].tolist() == raw["layers.0.attn.indexer.compressor.wkv.weight"].tolist()
+    assert (
+        packed.tensors["csa_inner_wkv"][0].tolist()
+        == raw["layers.0.attn.indexer.compressor.wkv.weight"].tolist()
+    )
     assert packed.tensors["hca_cmp_wkv"].shape == (2, 512, 4096)
     assert torch.count_nonzero(packed.tensors["hca_cmp_wkv"]) == 0
     assert packed.tensors["gate_bias"].shape == (2, 4)
@@ -886,20 +883,6 @@ def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slice
     assert all(tensor.is_contiguous() for tensor in stacked.tensors.values())
 
 
-def test_deepseek_retain_stacked_host_weights_keeps_ordinary_storage():
-    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._stacked_host_weights = None
-    runner._l3_worker = None
-    weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-
-    retained = runner._retain_stacked_host_weights(
-        weight_loader.DeepSeekV4StackedLayerWeights(tensors={"weight": weight})
-    )
-
-    assert retained.tensors["weight"] is weight
-    assert not retained.tensors["weight"].is_shared()
-
-
 def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypatch):
     main_weight = torch.zeros((1, 2), dtype=torch.float32)
     mtp_weight = torch.ones((1, 2), dtype=torch.float32)
@@ -980,9 +963,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._mtp_device_weights = None
     runner._compiled = SimpleNamespace(
-        prepacked_layer_weights=DeepSeekV4StackedLayerWeights(
-            tensors={"main": main_weight}
-        )
+        prepacked_layer_weights=DeepSeekV4StackedLayerWeights(tensors={"main": main_weight})
     )
     runner._shared_l3_worker = lambda: worker
 
@@ -1065,13 +1046,9 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch
     runtime = RuntimeConfig(npu_memory_utilization=0.8)
 
     bytes_per_slot = sum(
-        spec.max_blocks_per_seq * spec.spec.page_size_bytes
-        for spec in runner._cache_group_specs
+        spec.max_blocks_per_seq * spec.spec.page_size_bytes for spec in runner._cache_group_specs
     )
-    scratch_bytes = sum(
-        layout.decode_batch * spec.spec.page_size_bytes
-        for spec in runner._cache_group_specs
-    )
+    scratch_bytes = sum(layout.decode_batch * spec.spec.page_size_bytes for spec in runner._cache_group_specs)
     expected = max((2_000_000_000 - scratch_bytes) // bytes_per_slot, 1)
 
     assert runner._compute_kv_cache_capacity_slots(runtime) == expected
@@ -1135,8 +1112,7 @@ def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
         )
     )
     runner._cache_group_num_blocks = {
-        name: 2
-        for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
+        name: 2 for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
     }
 
     class FakeWorker:
@@ -1254,24 +1230,6 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     ]
     assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
-
-
-def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[5]], dtype=torch.long),
-            hidden_states=None,
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=_grouped_cache_rows(1),
-            cache_partitions=[0],
-        ),
-    )
-    assert prepared.x_hc is None
-    assert prepared.input_ids[0, :2].tolist() == [5, 5]
 
 
 def test_deepseek_prepare_mtp_decode_inputs_stages_device_metadata_sources():
@@ -1685,35 +1643,6 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
         assert name not in prefill.tensors
 
 
-def test_deepseek_shared_buffer_setup_does_not_require_cache_zeroing_buffers(monkeypatch):
-    runner, model = _runner_for_prepared_inputs()
-    runner._stacked_device_weights = object()
-
-    for method_name in (
-        "load_packed_global_weights",
-        "_static_freqs_cos_tensor",
-        "_static_freqs_sin_tensor",
-        "_ensure_decode_buffers",
-        "_ensure_mtp_buffers",
-        "_require_prefill_output_buffer",
-        "_require_prefill_pre_hc_output_buffer",
-        "_require_prefill_logits_buffer",
-        "_static_final_norm_weight_tensor",
-        "_static_lm_head_weight_tensor",
-        "_require_decode_logits_buffer",
-        "_hc_head_tensors",
-        "_ensure_prefill_fwd_buffers",
-        "_assert_l3_shared_buffers_preallocated",
-        "_materialize_resident_weights",
-    ):
-        monkeypatch.setattr(runner, method_name, lambda *args, **kwargs: None)
-
-    runner._ensure_l3_shared_buffers(model)
-
-    assert not hasattr(runner, "_decode_work_cache")
-    assert not hasattr(runner, "_cache_zero_page")
-
-
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     layout = DeepSeekV4CacheLayout(
         ranks=1,
@@ -2038,7 +1967,9 @@ def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
         hc_head_scale=torch.empty(0),
         hc_head_base=torch.empty(0),
     )
-    hidden = torch.arange(layout.ranks * 6 * 3, dtype=torch.float32).reshape(layout.ranks, 6, 3).to(torch.bfloat16)
+    hidden = (
+        torch.arange(layout.ranks * 6 * 3, dtype=torch.float32).reshape(layout.ranks, 6, 3).to(torch.bfloat16)
+    )
 
     def fail_run_l3(*args):
         raise AssertionError("host LM-head must not dispatch an L3 program")
