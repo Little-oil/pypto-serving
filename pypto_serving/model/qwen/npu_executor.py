@@ -20,15 +20,15 @@ from typing import Any
 import torch
 
 from pypto_serving.config.types import RuntimeModel
+from pypto_serving.model.common.compiler.compiler import KernelCompiler
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
-from pypto_serving.model.common.executor.utils import rope_tables, round_up
+from pypto_serving.model.common.executor.utils import (
+    build_pypto_run_config,
+    rope_tables,
+    round_up,
+)
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.qwen import qwen3_l3_dispatch
-from pypto_serving.model.qwen.kernel_cache import (
-    KernelCache,
-    compute_code_fingerprint,
-    compute_params_fingerprint,
-)
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
     _L3Callable,
@@ -88,15 +88,15 @@ class _KernelLayerWeights:
     w_down: torch.Tensor
 
 
-def _find_pypto_lib_qwen14b_dir(pypto_root: str | None = None) -> Path:
+def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
     """Find the Qwen3-14B kernel directory from configuration or a checkout."""
-    if pypto_root is None:
-        pypto_root = os.environ.get("PYPTO_ROOT")
-    if pypto_root:
-        candidate = Path(pypto_root) / "models" / "qwen3_14b"
+    if pypto_lib_root is None:
+        pypto_lib_root = os.environ.get("PYPTO_LIB_ROOT")
+    if pypto_lib_root:
+        candidate = Path(pypto_lib_root) / "models" / "qwen3_14b"
         if candidate.is_dir():
             return candidate
-        raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_ROOT={pypto_root!r}")
+        raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
 
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
@@ -105,7 +105,7 @@ def _find_pypto_lib_qwen14b_dir(pypto_root: str | None = None) -> Path:
             return candidate
     raise FileNotFoundError(
         "Cannot locate Qwen3-14B kernels. Run from a checkout with pypto-lib available "
-        "or set PYPTO_ROOT to a pypto-lib checkout."
+        "or set PYPTO_LIB_ROOT to a pypto-lib checkout."
     )
 
 
@@ -146,25 +146,29 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         *,
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
-        save_kernels_dir: str | None = None,
-        pypto_root: str | None = None,
-        kernel_cache_dir: str | None = None,
+        pypto_build_dir: str = "build_output",
+        use_compile_cache: bool = False,
     ) -> None:
+        # ``pypto_build_dir`` is the per-worker build dir (set by the serving
+        # worker). When ``use_compile_cache`` is set, the compiler writes each
+        # kernel straight to ``<pypto_build_dir>/<name>`` and reloads it on a
+        # later launch, so it doubles as the on-disk kernel cache. No
+        # fingerprinting -- the caller must keep this dir config/kernel-source
+        # appropriate. When off, pypto uses its default per-kernel build dirs.
         super().__init__(
             kv_cache_manager,
             platform=platform,
             device_ids=device_ids,
-            save_kernels_dir=save_kernels_dir,
+            pypto_build_dir=pypto_build_dir,
+            use_compile_cache=use_compile_cache,
         )
-        self._pypto_root = pypto_root
-        # One on-disk kernel cache shared by the load path (this executor, at
-        # compile time) and the store path (the runner, after the L3 worker has
-        # assembled the device binaries). Building it here computes the code
-        # fingerprint once (memoised) instead of per kernel.
-        self._kernel_cache = (
-            KernelCache(kernel_cache_dir, compute_code_fingerprint(pypto_root))
-            if kernel_cache_dir
-            else None
+        self._compiler = KernelCompiler(
+            run_config=build_pypto_run_config(
+                platform=self._platform,
+                device_ids=self._device_ids,
+                pypto_build_dir=self._pypto_build_dir,
+            ),
+            cache_dir=self._pypto_build_dir,
         )
 
     @property
@@ -189,12 +193,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
-            kernel_cache=self._kernel_cache,
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
-        kernel_dir = _find_pypto_lib_qwen14b_dir(self._pypto_root)
+        kernel_dir = _find_pypto_lib_qwen14b_dir()
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir)
         # The fused all-layer decode lives in decode_fwd.decode_fwd. It is
         # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
@@ -578,60 +581,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         jit_fn: object,
         dummy_args: list[torch.Tensor],
     ) -> _L3Callable:
-        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram."""
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
-        from pypto.runtime import RunConfig  # noqa: PLC0415
+        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram.
 
-        config = self._run_config(codegen_only=True)
-        distributed_config = DistributedConfig(
-            device_ids=list(self._device_ids),
-            num_sub_workers=0,
-            aicpu_thread_num=4,
-        )
-        params_fingerprint = compute_params_fingerprint(name, dummy_args, platform=self._platform)
-        if self._kernel_cache is not None:
-            cached = self._kernel_cache.load(
-                name,
-                params_fingerprint,
-                platform=self._platform,
-                distributed_config=distributed_config,
-            )
-            if cached is not None:
-                # output_dir points at the cache slot, which also holds the
-                # compiled device binaries (cache/*.bin + kernels/*.o); the L3
-                # worker's compile_and_assemble finds them and skips recompiling.
-                return _L3Callable(
-                    compiled=cached,
-                    name=name,
-                    aicpu_thread_num=4,
-                    params_fingerprint=params_fingerprint,
-                )
-        run_config = RunConfig(
-            platform=config.platform,
-            device_id=config.device_id,
-            backend_type=config.backend_type,
-            strategy=config.strategy,
-            dump_passes=config.dump_passes,
-            save_kernels=config.save_kernels,
-            save_kernels_dir=config.save_kernels_dir,
-            codegen_only=True,
-            diagnostic_phase=config.diagnostic_phase,
-            disabled_diagnostics=config.disabled_diagnostics,
-            compile_profiling=config.compile_profiling,
-            distributed_config=distributed_config,
-        )
-        compiled = jit_fn.compile(*dummy_args, config=run_config)
-        if not isinstance(compiled, DistributedCompiledProgram):
-            raise TypeError(
-                f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}"
-            )
-        return _L3Callable(
-            compiled=compiled,
-            name=name,
-            aicpu_thread_num=4,
-            params_fingerprint=params_fingerprint,
-        )
+        The on-disk cache fast-path and the JIT compile are both handled by the
+        shared :class:`KernelCompiler`.
+        """
+        return self._compiler.compile(name, jit_fn, dummy_args, use_cache=self._use_compile_cache)
 
     @staticmethod
     def _load_runtime_config(output_dir: Path) -> dict[str, Any]:

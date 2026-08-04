@@ -114,6 +114,7 @@ class WorkerProcess:
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
+                pypto_build_dir=str(pypto_build_dir),
                 **self.config.executor_kwargs,
             )
 
@@ -253,21 +254,20 @@ class WorkerProcess:
             cat="worker",
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
-            with self.executor.session():
-                if cmd.prefill_requests:
-                    max_prefill_batch = self.executor.max_prefill_batch_size
-                    if max_prefill_batch is None:
-                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
-                    else:
-                        if max_prefill_batch <= 0:
-                            raise ValueError("executor max_prefill_batch_size must be positive")
-                        for chunk in self._partitioned_prefill_chunks(
-                            cmd.prefill_requests,
-                            max_prefill_batch,
-                        ):
-                            self._batch_prefill(chunk, runtime_model, new_tokens)
-                if cmd.decode_requests:
-                    self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
+            if cmd.prefill_requests:
+                max_prefill_batch = self.executor.max_prefill_batch_size
+                if max_prefill_batch is None:
+                    self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
+                else:
+                    if max_prefill_batch <= 0:
+                        raise ValueError("executor max_prefill_batch_size must be positive")
+                    for chunk in self._partitioned_prefill_chunks(
+                        cmd.prefill_requests,
+                        max_prefill_batch,
+                    ):
+                        self._batch_prefill(chunk, runtime_model, new_tokens)
+            if cmd.decode_requests:
+                self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
 
         # Retain the tokens just sampled so a following pipelined decode step can
         # resolve its PLACEHOLDER_TOKEN input from the worker cache.

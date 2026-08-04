@@ -201,68 +201,67 @@ class LLMEngine:
                 completed_sampled_ids: dict[int, torch.Tensor] = {}
                 completed_candidate_values: dict[int, torch.Tensor] = {}
                 completed_candidate_ids: dict[int, torch.Tensor] = {}
-                with self._executor.session():
-                    while remaining:
-                        # greedily take up to total_budget tokens
-                        chunk_req: list[int] = []
-                        chunk_lens: list[int] = []
-                        budget = total_budget
-                        for ri, left in remaining:
-                            if budget <= 0:
-                                break
-                            take = min(left, budget)
-                            if take <= 0:
-                                continue
-                            chunk_req.append(ri)
-                            chunk_lens.append(take)
-                            budget -= take
-                            offsets[ri] += take
-                        token_chunks: list[list[int]] = []
-                        chunk_starts: list[int] = []
-                        for row, ri in enumerate(chunk_req):
-                            n = chunk_lens[row]
-                            start = offsets[ri] - n
-                            token_chunks.append(prompt_token_ids[ri][start:offsets[ri]])
-                            chunk_starts.append(start)
-                        sub_batch = pack_prefill_batch(
-                            request_ids=[requests[ri].request_id for ri in chunk_req],
-                            token_chunks=token_chunks,
-                            seq_lens=[offsets[ri] for ri in chunk_req],
-                            chunk_starts=chunk_starts,
-                            device=runtime_model.runtime.device,
-                            embedding_lookup=embedding_lookup,
-                            allow_device_greedy_sampling=allow_device_greedy_sampling,
-                            allow_device_topk_sampling=allow_device_topk_sampling,
-                            kv_allocations=[allocations[ri] for ri in chunk_req],
-                        )
-                        prefill_result = self._executor.run_prefill(runtime_model, sub_batch)
-                        sampled_ids = (
-                            prefill_result.sampled_token_ids.view(-1)
-                            if prefill_result.sampled_token_ids is not None
-                            else None
-                        )
-                        for row, ri in enumerate(chunk_req):
-                            if offsets[ri] < len(prompt_token_ids[ri]):
-                                continue
-                            completed_logits[ri] = self._select_batch_row(
-                                prefill_result.logits, row
-                            ).clone()
-                            if sampled_ids is not None:
-                                completed_sampled_ids[ri] = sampled_ids[row].clone()
-                            if prefill_result.sampling_candidates is not None:
-                                completed_candidate_values[ri] = (
-                                    prefill_result.sampling_candidates.values[row].clone()
-                                )
-                                completed_candidate_ids[ri] = (
-                                    prefill_result.sampling_candidates.token_ids[row].clone()
-                                )
-                        # remove completed requests from the pool
-                        for i in range(len(remaining) - 1, -1, -1):
-                            ri = remaining[i][0]
-                            if offsets[ri] >= len(prompt_token_ids[ri]):
-                                del remaining[i]
-                            else:
-                                remaining[i] = [ri, len(prompt_token_ids[ri]) - offsets[ri]]
+                while remaining:
+                    # greedily take up to total_budget tokens
+                    chunk_req: list[int] = []
+                    chunk_lens: list[int] = []
+                    budget = total_budget
+                    for ri, left in remaining:
+                        if budget <= 0:
+                            break
+                        take = min(left, budget)
+                        if take <= 0:
+                            continue
+                        chunk_req.append(ri)
+                        chunk_lens.append(take)
+                        budget -= take
+                        offsets[ri] += take
+                    token_chunks: list[list[int]] = []
+                    chunk_starts: list[int] = []
+                    for row, ri in enumerate(chunk_req):
+                        n = chunk_lens[row]
+                        start = offsets[ri] - n
+                        token_chunks.append(prompt_token_ids[ri][start:offsets[ri]])
+                        chunk_starts.append(start)
+                    sub_batch = pack_prefill_batch(
+                        request_ids=[requests[ri].request_id for ri in chunk_req],
+                        token_chunks=token_chunks,
+                        seq_lens=[offsets[ri] for ri in chunk_req],
+                        chunk_starts=chunk_starts,
+                        device=runtime_model.runtime.device,
+                        embedding_lookup=embedding_lookup,
+                        allow_device_greedy_sampling=allow_device_greedy_sampling,
+                        allow_device_topk_sampling=allow_device_topk_sampling,
+                        kv_allocations=[allocations[ri] for ri in chunk_req],
+                    )
+                    prefill_result = self._executor.run_prefill(runtime_model, sub_batch)
+                    sampled_ids = (
+                        prefill_result.sampled_token_ids.view(-1)
+                        if prefill_result.sampled_token_ids is not None
+                        else None
+                    )
+                    for row, ri in enumerate(chunk_req):
+                        if offsets[ri] < len(prompt_token_ids[ri]):
+                            continue
+                        completed_logits[ri] = self._select_batch_row(
+                            prefill_result.logits, row
+                        ).clone()
+                        if sampled_ids is not None:
+                            completed_sampled_ids[ri] = sampled_ids[row].clone()
+                        if prefill_result.sampling_candidates is not None:
+                            completed_candidate_values[ri] = (
+                                prefill_result.sampling_candidates.values[row].clone()
+                            )
+                            completed_candidate_ids[ri] = (
+                                prefill_result.sampling_candidates.token_ids[row].clone()
+                            )
+                    # remove completed requests from the pool
+                    for i in range(len(remaining) - 1, -1, -1):
+                        ri = remaining[i][0]
+                        if offsets[ri] >= len(prompt_token_ids[ri]):
+                            del remaining[i]
+                        else:
+                            remaining[i] = [ri, len(prompt_token_ids[ri]) - offsets[ri]]
                 if len(completed_logits) != len(requests):
                     raise RuntimeError("Chunked prefill did not produce logits for every request")
                 prefill_logits = torch.stack(
@@ -315,11 +314,10 @@ class LLMEngine:
                 )
                 if fast_path_result is not None:
                     return fast_path_result
-                with self._executor.session():
-                    prefill_result = self._executor.run_prefill(
-                        runtime_model,
-                        prefill_batch,
-                    )
+                prefill_result = self._executor.run_prefill(
+                    runtime_model,
+                    prefill_batch,
+                )
                 prefill_logits = prefill_result.logits
                 prefill_sampled_token_ids = (
                     prefill_result.sampled_token_ids
@@ -470,51 +468,50 @@ class LLMEngine:
                 kv_allocations=[alloc],
             )
 
-            with self._executor.session():
-                prefill_result = self._executor.run_prefill(
+            prefill_result = self._executor.run_prefill(
+                runtime_model,
+                prefill_batch,
+            )
+
+            logits = self._select_batch_row(prefill_result.logits, 0)
+            generated: list[int] = []
+            emitted_text = ""
+            sampling_params = self._sampler.from_generate_config(config)
+            current_token = self._sampler.sample(logits, sampling_params)
+
+            for _ in range(config.max_new_tokens):
+                generated.append(current_token)
+                text = tokenizer.decode(generated)
+                delta = text[len(emitted_text) :]
+                emitted_text = text
+                if delta:
+                    yield delta
+                if self._should_stop(record, config, generated, emitted_text, current_token):
+                    break
+
+                self._kv_cache_manager.ensure_one_more_slot(alloc)
+                request.seq_len += 1
+                decode_token = torch.tensor([current_token], dtype=torch.long, device=runtime_model.runtime.device)
+                decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
                     runtime_model,
-                    prefill_batch,
+                    decode_token,
                 )
-
-                logits = self._select_batch_row(prefill_result.logits, 0)
-                generated: list[int] = []
-                emitted_text = ""
-                sampling_params = self._sampler.from_generate_config(config)
-                current_token = self._sampler.sample(logits, sampling_params)
-
-                for _ in range(config.max_new_tokens):
-                    generated.append(current_token)
-                    text = tokenizer.decode(generated)
-                    delta = text[len(emitted_text) :]
-                    emitted_text = text
-                    if delta:
-                        yield delta
-                    if self._should_stop(record, config, generated, emitted_text, current_token):
-                        break
-
-                    self._kv_cache_manager.ensure_one_more_slot(alloc)
-                    request.seq_len += 1
-                    decode_token = torch.tensor([current_token], dtype=torch.long, device=runtime_model.runtime.device)
-                    decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
-                        runtime_model,
-                        decode_token,
-                    )
-                    decode_result = self._executor.run_decode(
-                        runtime_model,
-                        DecodeBatch(
-                            request_ids=[request.request_id],
-                            token_ids=decode_token.unsqueeze(0),
-                            hidden_states=decode_embeddings,
-                            seq_lens=torch.tensor(
-                                [request.seq_len],
-                                dtype=torch.int32,
-                                device=runtime_model.runtime.device,
-                            ),
-                            kv_allocations=[alloc],
+                decode_result = self._executor.run_decode(
+                    runtime_model,
+                    DecodeBatch(
+                        request_ids=[request.request_id],
+                        token_ids=decode_token.unsqueeze(0),
+                        hidden_states=decode_embeddings,
+                        seq_lens=torch.tensor(
+                            [request.seq_len],
+                            dtype=torch.int32,
+                            device=runtime_model.runtime.device,
                         ),
-                    )
-                    logits = self._select_batch_row(decode_result.logits, 0)
-                    current_token = self._sampler.sample(logits, sampling_params)
+                        kv_allocations=[alloc],
+                    ),
+                )
+                logits = self._select_batch_row(decode_result.logits, 0)
+                current_token = self._sampler.sample(logits, sampling_params)
         finally:
             self._kv_cache_manager.free(alloc)
 

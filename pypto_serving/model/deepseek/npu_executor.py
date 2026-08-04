@@ -21,13 +21,10 @@ from pathlib import Path
 import torch
 
 from pypto_serving.config.types import RuntimeModel
+from pypto_serving.model.common.compiler.compiler import KernelCompiler
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
+from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
-from pypto_serving.model.deepseek.kernel_cache import (
-    KernelCache,
-    compute_code_fingerprint,
-    compute_params_fingerprint,
-)
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
@@ -97,16 +94,16 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
 )
 
 
-def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
+def _find_pypto_lib_deepseek_v4_dir(pypto_lib_root: str | None = None) -> Path:
     """Find the DeepSeekV4 kernel directory."""
-    if pypto_root is None:
-        pypto_root = os.environ.get("PYPTO_ROOT")
-    if pypto_root:
-        root = Path(pypto_root)
+    if pypto_lib_root is None:
+        pypto_lib_root = os.environ.get("PYPTO_LIB_ROOT")
+    if pypto_lib_root:
+        root = Path(pypto_lib_root)
         candidate = root / "models" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
-        raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_ROOT={pypto_root!r}")
+        raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
 
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
@@ -117,7 +114,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
 
     raise FileNotFoundError(
         "Cannot locate DeepSeekV4 kernels. Run from a checkout with pypto-lib available "
-        "or set PYPTO_ROOT to a pypto-lib checkout."
+        "or set PYPTO_LIB_ROOT to a pypto-lib checkout."
     )
 
 
@@ -184,7 +181,7 @@ def _runtime_scalar_compile_args(
 def _deepseek_v4_import_context(
     kernel_dir: Path,
     *,
-    pypto_root: Path,
+    pypto_lib_root: Path,
     ep: int,
     lm_head_tp: int | None = None,
     moe_shape: str | None = None,
@@ -215,7 +212,7 @@ def _deepseek_v4_import_context(
         # serving always packs the full 43-layer forward.
         sys.argv.extend(["--num-layers", str(int(num_layers))])
     sys.path.insert(0, str(kernel_dir))
-    sys.path.insert(0, str(pypto_root))
+    sys.path.insert(0, str(pypto_lib_root))
     try:
         yield
     finally:
@@ -238,30 +235,36 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         device_ids: Sequence[int] | None = None,
-        save_kernels_dir: str | None = None,
-        pypto_root: str | None = None,
+        pypto_build_dir: str = "build_output",
+        use_compile_cache: bool = False,
         compile_kernels: bool = False,
         enable_mtp: bool = False,
-        kernel_cache_dir: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
             kv_cache_manager,
             platform=platform,
             device_ids=worker_device_ids,
-            save_kernels_dir=save_kernels_dir,
+            pypto_build_dir=pypto_build_dir,
+            use_compile_cache=use_compile_cache,
         )
-        self._pypto_root = pypto_root
-        self._kernel_dir = _find_pypto_lib_deepseek_v4_dir(pypto_root)
+        self._kernel_dir = _find_pypto_lib_deepseek_v4_dir()
         self._compile_kernels = bool(compile_kernels)
         # Keep production serving opt-in because older checkpoints may not carry
         # MTP weights. The CLI passes this model-specific feature flag explicitly.
         self._enable_mtp = bool(enable_mtp)
         self._embedding_cache: dict[str, torch.Tensor] = {}
-        self._kernel_cache = (
-            KernelCache(kernel_cache_dir, compute_code_fingerprint(pypto_root))
-            if kernel_cache_dir
-            else None
+        # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
+        # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
+        # build dir doubles as the on-disk kernel cache (load-or-compile, slotted
+        # by kernel name); otherwise pypto uses its default per-kernel build dirs.
+        self._compiler = KernelCompiler(
+            run_config=build_pypto_run_config(
+                platform=self._platform,
+                device_ids=self._device_ids,
+                pypto_build_dir=self._pypto_build_dir,
+            ),
+            cache_dir=self._pypto_build_dir,
         )
 
     @property
@@ -319,7 +322,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         """Create the DeepSeekV4 runtime runner."""
         if not isinstance(compiled, DeepSeekV4CompiledKernels):
             raise TypeError("DeepSeekV4PyptoExecutor requires DeepSeekV4 compiled metadata.")
-        return DeepSeekV4ModelRunner(compiled=compiled, kernel_cache=self._kernel_cache)
+        return DeepSeekV4ModelRunner(compiled=compiled)
 
     def _compile_model(self, model: RuntimeModel) -> DeepSeekV4CompiledKernels:
         """Validate DeepSeekV4 W8A8 metadata and return runner artifacts.
@@ -440,12 +443,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
         """Import DeepSeekV4 pypto-lib modules with EP fixed to the serving world size."""
-        pypto_root = self._kernel_dir.parents[1]
+        pypto_lib_root = self._kernel_dir.parents[1]
         ranks = layout.ranks
         fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
         with _deepseek_v4_import_context(
             self._kernel_dir,
-            pypto_root=pypto_root,
+            pypto_lib_root=pypto_lib_root,
             ep=ranks,
             lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="prefill",
@@ -456,7 +459,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             prefill_mtp = importlib.import_module("prefill_mtp")
         with _deepseek_v4_import_context(
             self._kernel_dir,
-            pypto_root=pypto_root,
+            pypto_lib_root=pypto_lib_root,
             ep=ranks,
             lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
             moe_shape="decode",
@@ -494,68 +497,23 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         layout: DeepSeekV4CacheLayout,
         runtime_scalar_names: frozenset[str] | None = None,
     ) -> DeepSeekV4L3Callable:
-        """Compile one fully annotated DeepSeekV4 HOST wrapper."""
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
-        from pypto.runtime import RunConfig  # noqa: PLC0415
+        """Compile one fully annotated DeepSeekV4 HOST wrapper.
 
-        config = self._run_config(codegen_only=True)
-        distributed_config = DistributedConfig(
-            device_ids=list(self._device_ids),
-            num_sub_workers=0,
-        )
-        params_fingerprint = compute_params_fingerprint(
-            name,
-            jit_fn,
-            platform=self._platform,
-            block_dim=getattr(distributed_config, "block_dim", None),
-            prefill_seq=layout.prefill_seq,
-            decode_batch=layout.decode_batch,
-            decode_seq=layout.decode_seq,
-            decode_tokens=layout.decode_tokens,
-        )
-        if self._kernel_cache is not None:
-            cached = self._kernel_cache.load(
-                name,
-                params_fingerprint,
-                platform=self._platform,
-                distributed_config=distributed_config,
-            )
-            if cached is not None:
-                return DeepSeekV4L3Callable(
-                    compiled=cached,
-                    name=name,
-                    params_fingerprint=params_fingerprint,
-                )
-        run_config = RunConfig(
-            platform=config.platform,
-            device_id=config.device_id,
-            backend_type=config.backend_type,
-            strategy=config.strategy,
-            dump_passes=config.dump_passes,
-            save_kernels=config.save_kernels,
-            save_kernels_dir=config.save_kernels_dir,
-            codegen_only=True,
-            diagnostic_phase=config.diagnostic_phase,
-            disabled_diagnostics=config.disabled_diagnostics,
-            compile_profiling=config.compile_profiling,
-            enable_scope_stats=True,
-            distributed_config=distributed_config,
+        The JIT compile + type-check + (optional) cache load-or-compile are
+        delegated to the shared :class:`KernelCompiler`; ``runtime_scalar_names``
+        feeds the startup-optimisation compile signature. ``layout`` is retained
+        on the signature for the call sites but is not needed now that the
+        layout-aware fingerprint is gone.
+        """
+        compile_args = (
+            _runtime_scalar_compile_args(jit_fn, runtime_scalar_names)
+            if runtime_scalar_names
+            else ()
         )
         with profile_span(f"DeepSeekV4PyptoExecutor.compile.{name}", cat="executor"):
-            compile_args = (
-                _runtime_scalar_compile_args(jit_fn, runtime_scalar_names)
-                if runtime_scalar_names
-                else ()
+            return self._compiler.compile(
+                name, jit_fn, compile_args, use_cache=self._use_compile_cache
             )
-            compiled = jit_fn.compile(*compile_args, config=run_config)
-        if not isinstance(compiled, DistributedCompiledProgram):
-            raise TypeError(f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}")
-        return DeepSeekV4L3Callable(
-            compiled=compiled,
-            name=name,
-            params_fingerprint=params_fingerprint,
-        )
 
 
     def _build_rope_tables(self, utils_module: object, config_module: object) -> tuple[torch.Tensor, torch.Tensor]:

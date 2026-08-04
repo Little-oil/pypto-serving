@@ -114,5 +114,5 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   local Ascend runtime environment to be available in the active Python
   environment.
 - `pypto-lib/` is not included in the wheel. An editable checkout discovers its
-  kernel submodule automatically; for any other installation, set `PYPTO_ROOT`
+  kernel submodule automatically; for any other installation, set `PYPTO_LIB_ROOT`
   to the root of a `pypto-lib` checkout before loading a model.

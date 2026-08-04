@@ -52,16 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument(
-        "--kernel-cache-dir",
-        default=None,
+        "--use-compile-cache",
+        action="store_true",
+        default=False,
         help=(
-            "Directory of precompiled kernels to reuse across launches. "
-            "If unset, kernels are JIT-compiled and their device binaries built every launch. "
-            "If set: reuse kernels already cached there (skipping both the JIT and the ~30s "
-            "device-binary compile), and compile+store any that are missing. Changes to a "
-            "program's compiled tensor, scalar, or deployment-layout specialization, its "
-            "kernel or dispatch sources, the target platform, or the PyPTO version invalidate "
-            "the affected kernels and trigger a rebuild."
+            "Reuse compiled kernels across launches. Each kernel is written to "
+            "<pypto_build_dir>/<name> and reloaded on the next launch, skipping the JIT "
+            "and the device-binary assembly. Off by default. NOTE: there is no "
+            "fingerprinting, so reuse the same build dir only for the same config and "
+            "kernel sources; clear it on a config/kernel change to avoid stale binaries."
         ),
     )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
@@ -185,7 +184,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     model_dir = str(Path(args.model).resolve())
-    executor_kwargs = _build_executor_kwargs()
+    executor_kwargs: dict[str, object] = {}
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = _read_model_config(Path(model_dir))
     model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
@@ -194,17 +193,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs["enable_mtp"] = args.enable_mtp
     elif args.enable_mtp:
         raise ValueError("--enable-mtp is only supported for DeepSeek V4")
-    if args.kernel_cache_dir:
-        cache_dir = Path(args.kernel_cache_dir).resolve()
-        if cache_dir.exists() and not cache_dir.is_dir():
-            raise ValueError(f"--kernel-cache-dir {cache_dir} exists but is not a directory")
-        if not cache_dir.exists() or not any(cache_dir.iterdir()):
-            print(
-                f"[kernel-cache] {cache_dir} is empty or missing; kernels will be compiled "
-                "this launch and stored there for reuse next time.",
-                flush=True,
-            )
-        executor_kwargs["kernel_cache_dir"] = str(cache_dir)
+    executor_kwargs["use_compile_cache"] = args.use_compile_cache
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -286,17 +275,6 @@ def _build_runtime_config(
         num_speculative_tokens=1 if args.enable_mtp else 0,
         kv_cache_groups=kv_cache_groups,
     )
-
-
-def _build_executor_kwargs() -> dict[str, object]:
-    executor_kwargs: dict[str, object] = {}
-    pypto_root = os.environ.get("PYPTO_ROOT")
-    save_kernels_dir = os.environ.get("PYPTO_SAVE_KERNELS_DIR")
-    if pypto_root:
-        executor_kwargs["pypto_root"] = pypto_root
-    if save_kernels_dir:
-        executor_kwargs["save_kernels_dir"] = save_kernels_dir
-    return executor_kwargs
 
 
 def _build_profile_config(args: argparse.Namespace) -> ProfileConfig:

@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -26,7 +25,6 @@ from pypto_serving.config.types import (
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.tools.profile import profile_span
-from .utils import backend_type_for_platform
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +39,8 @@ class PyptoExecutor(ModelExecutor, ABC):
         *,
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
-        save_kernels_dir: str | None = None,
+        pypto_build_dir: str = "build_output",
+        use_compile_cache: bool = False,
     ) -> None:
         """Initialize common PyPTO runtime options and model registries."""
         super().__init__(kv_cache_manager)
@@ -49,7 +48,8 @@ class PyptoExecutor(ModelExecutor, ABC):
         self._device_ids = tuple(int(device) for device in device_ids)
         if not self._device_ids:
             raise ValueError("device_ids must contain at least one device id")
-        self._save_kernels_dir = save_kernels_dir
+        self._pypto_build_dir = pypto_build_dir
+        self._use_compile_cache = use_compile_cache
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}
 
@@ -99,11 +99,6 @@ class PyptoExecutor(ModelExecutor, ABC):
         ):
             return self._runners[model.config.model_id].run_decode(model, batch)
 
-    @contextlib.contextmanager
-    def session(self):
-        """Provide a generation lifecycle hook for PyPTO runtimes."""
-        yield
-
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""
         for model_id, runner in self._runners.items():
@@ -113,19 +108,6 @@ class PyptoExecutor(ModelExecutor, ABC):
                     close()
                 except Exception:
                     logger.exception("Failed to close PyPTO runner for model %s", model_id)
-
-    def _run_config(self, *, codegen_only: bool):
-        """Build a PyPTO ``RunConfig`` for compile or execution calls."""
-        from pypto.runtime import RunConfig
-
-        return RunConfig(
-            platform=self._platform,
-            device_id=self._device_ids[0],
-            backend_type=backend_type_for_platform(self._platform),
-            codegen_only=codegen_only,
-            save_kernels=self._save_kernels_dir is not None,
-            save_kernels_dir=self._save_kernels_dir,
-        )
 
     @abstractmethod
     def _compile_model(self, model: RuntimeModel) -> object:

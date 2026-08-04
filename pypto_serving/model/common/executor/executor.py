@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from abc import ABC, abstractmethod
 
 import torch
@@ -34,11 +33,6 @@ class ModelExecutor(ABC):
     def __init__(self, kv_cache_manager: KvCacheManager | None = None) -> None:
         """Store the KV cache manager shared with the engine (optional for serving path)."""
         self._kv_cache_manager = kv_cache_manager
-
-    @contextlib.contextmanager
-    def session(self):
-        """Wrap one generation sequence in executor-specific runtime state."""
-        yield
 
     @property
     def supports_device_sampling(self) -> bool:
