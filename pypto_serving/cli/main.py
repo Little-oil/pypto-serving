@@ -55,13 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--kernel-cache-dir",
         default=None,
         help=(
-            "Directory of precompiled kernels to reuse across launches (Qwen3 only). "
+            "Directory of precompiled kernels to reuse across launches. "
             "If unset, kernels are JIT-compiled and their device binaries built every launch. "
             "If set: reuse kernels already cached there (skipping both the JIT and the ~30s "
-            "device-binary compile), and compile+store any that are missing. A different "
-            "runtime config (e.g. --max-model-len, --block-size, --max-num-seqs), an edit to "
-            "the kernel or dispatch sources, or a pypto upgrade invalidates the affected "
-            "kernels and triggers a rebuild."
+            "device-binary compile), and compile+store any that are missing. Changes to a "
+            "program's compiled tensor, scalar, or deployment-layout specialization, its "
+            "kernel or dispatch sources, the target platform, or the PyPTO version invalidate "
+            "the affected kernels and trigger a rebuild."
         ),
     )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
@@ -194,7 +194,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs["enable_mtp"] = args.enable_mtp
     elif args.enable_mtp:
         raise ValueError("--enable-mtp is only supported for DeepSeek V4")
-    if model_family == "qwen" and args.kernel_cache_dir:
+    if args.kernel_cache_dir:
         cache_dir = Path(args.kernel_cache_dir).resolve()
         if cache_dir.exists() and not cache_dir.is_dir():
             raise ValueError(f"--kernel-cache-dir {cache_dir} exists but is not a directory")

@@ -14,7 +14,7 @@ import logging
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
@@ -39,6 +39,9 @@ from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4WeightStore,
 )
 from pypto_serving.tools.profile import profile_span
+
+if TYPE_CHECKING:
+    from pypto_serving.model.common.kernel_cache import KernelCache
 
 
 logger = logging.getLogger(__name__)
@@ -1066,6 +1069,7 @@ class DeepSeekV4L3Callable:
     name: str
     block_dim: int | None = None
     aicpu_thread_num: int = 4
+    params_fingerprint: str = ""
 
 
 @dataclass
@@ -1107,6 +1111,7 @@ class DeepSeekV4CompiledKernels:
     compress_ratios: tuple[int, ...]
     layer_plan: tuple["DeepSeekV4LayerPlan", ...]
     kernel_dir: str
+    prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
     runtime_model: RuntimeModel | None = None
     prefill: DeepSeekV4L3Callable | None = None
     decode: DeepSeekV4L3Callable | None = None
@@ -1378,9 +1383,15 @@ def accept_mtp_tokens(main_token_ids: torch.Tensor, draft_token_ids: torch.Tenso
 class DeepSeekV4ModelRunner(ModelRunner):
     """Runner boundary for DeepSeekV4 W8A8 kernels and model-specific caches."""
 
-    def __init__(self, *, compiled: DeepSeekV4CompiledKernels) -> None:
+    def __init__(
+        self,
+        *,
+        compiled: DeepSeekV4CompiledKernels,
+        kernel_cache: KernelCache | None = None,
+    ) -> None:
         super().__init__()
         self._compiled = compiled
+        self._kernel_cache = kernel_cache
         self.cache_metadata = DeepSeekV4CacheMetadataBuilder(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._l3_worker: Any | None = None
@@ -1691,12 +1702,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def load_stacked_layer_weights(self) -> DeepSeekV4StackedLayerWeights:
         """Load and stack all hidden-layer weights for the packed decode_fwd kernel."""
+        if self._compiled.prepacked_layer_weights is not None:
+            return self._compiled.prepacked_layer_weights
         compress_ratios = tuple(int(layer.compress_ratio) for layer in self._compiled.layer_plan)
         return self._compiled.weight_store.load_stacked_layer_weights(
             ranks=self._compiled.layout.ranks,
             n_routed_experts=self._compiled.n_routed_experts,
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
+            use_prepacked=False,
         )
 
     def load_mtp_weights(self) -> DeepSeekV4MtpWeights:
@@ -2567,6 +2581,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     stacked_weights = self.load_stacked_layer_weights()
                 with profile_span("DeepSeekV4ModelRunner.prepare.retain_layer_weights", cat="executor"):
                     self._retain_stacked_host_weights(stacked_weights)
+                del stacked_weights
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_hc_head", cat="executor"):
             self._hc_head_tensors()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_fwd_buffers", cat="executor"):
@@ -4088,6 +4103,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
             with profile_span("DeepSeekV4ModelRunner.upload_resident_main_weights", cat="executor"):
                 self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
+            self._compiled.prepacked_layer_weights = None
             self._stacked_host_weights = None
             logger.info(
                 "DeepSeekV4 resident main weights uploaded; released_parent_host_bytes=%d",
@@ -4142,7 +4158,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     inherited_host_tensors=self._inherited_host_weights(),
                 )
             self._l3_worker = worker
+            self._store_kernel_binaries()
         return worker
+
+    def _store_kernel_binaries(self) -> None:
+        """Persist fully assembled programs for reuse by a later launch."""
+        if self._kernel_cache is None:
+            return
+        for callable_spec in self._compiled.l3_callables():
+            self._kernel_cache.store(
+                callable_spec.name,
+                callable_spec.compiled,
+                callable_spec.params_fingerprint,
+            )
 
     def _inherited_host_weights(self) -> list[torch.Tensor]:
         """Return immutable main and MTP weights that must be visible at worker fork."""

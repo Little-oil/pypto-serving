@@ -20,6 +20,11 @@ requests in one global step. MTP decode uses B4S2 on each rank, for a maximum of
 32 global active rows. The scheduler may admit fewer long-context requests when
 a rank's fixed pypto-lib cache pools are full.
 
+For repeated launches, add `--kernel-cache-dir /persistent/path/deepseek-kernels`.
+The first launch populates the directory after executable assembly. Later
+launches reuse all four compiled programs when their source, PyPTO version,
+platform, tensor signatures, and scalar specializations still match.
+
 MTP prefill context, draft token, committed tail, and acceptance counters are
 owned by request ID. MTP prefill and decode share one worker-resident cache, but
 each request addresses it with the scheduler-owned rank-local `ori` block IDs.
@@ -31,6 +36,24 @@ rank-sharded worker-resident tensors. Prefill and decode pass the same device
 handles and address them with scheduler-owned group block IDs; there is no
 prefill CPU snapshot or cache handoff. Reassigned pages are cleared with
 targeted host-to-device copies before their new owner writes them.
+
+## Optional Prepacked Weights
+
+The 43 hidden layers can be converted once into the final rank-stacked Host
+layout:
+
+```bash
+pypto-prepack-deepseek-v4 /data/models/dsv4-flash-w8a8
+```
+
+The command atomically writes
+`pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint. Subsequent
+starts sample its Linux page-cache residency before opening it. A hot sidecar is
+validated against the checkpoint-file and deployment fingerprint, then
+memory-mapped as the final layout instead of repacking every hidden layer. A
+cold, missing, or stale sidecar uses the original checkpoint path, avoiding a
+cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force`
+after replacing checkpoint shards or changing the packed rank layout.
 
 ## Completion Check
 
