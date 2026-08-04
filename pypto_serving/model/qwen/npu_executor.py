@@ -93,14 +93,14 @@ def _find_pypto_lib_qwen14b_dir(pypto_root: str | None = None) -> Path:
     if pypto_root is None:
         pypto_root = os.environ.get("PYPTO_ROOT")
     if pypto_root:
-        candidate = Path(pypto_root) / "models" / "qwen3" / "14b"
+        candidate = Path(pypto_root) / "models" / "qwen3_14b"
         if candidate.is_dir():
             return candidate
         raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_ROOT={pypto_root!r}")
 
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
-        candidate = directory / "pypto-lib" / "models" / "qwen3" / "14b"
+        candidate = directory / "pypto-lib" / "models" / "qwen3_14b"
         if candidate.is_dir():
             return candidate
     raise FileNotFoundError(

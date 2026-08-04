@@ -20,7 +20,7 @@ from pypto_serving.serving.engine.engine import LLMEngine
 
 
 def _qwen_kernel_dir(root: Path) -> Path:
-    kernel_dir = root / "models" / "qwen3" / "14b"
+    kernel_dir = root / "models" / "qwen3_14b"
     kernel_dir.mkdir(parents=True)
     return kernel_dir
 
