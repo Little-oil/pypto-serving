@@ -69,20 +69,19 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
     "combine",
-    "decode_attention_csa",
-    "decode_attention_hca",
-    "decode_attention_swa",
+    "decode_csa",
+    "decode_hca",
+    "decode_swa",
     "decode_fwd",
     "decode_fwd_mtp",
     "decode_input_pack",
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
-    "decode_metadata_device",
+    "decode_metadata",
     "decode_mtp",
     "decode_mtp_verify",
     "lookup_embedding",
-    "decode_sparse_attn",
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
     "decode_sparse_attn_swa",
@@ -93,9 +92,9 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "hc_post",
     "hc_pre",
     "lm_head",
-    "prefill_attention_csa",
-    "prefill_attention_hca",
-    "prefill_attention_swa",
+    "prefill_csa",
+    "prefill_hca",
+    "prefill_swa",
     "prefill_indexer_compressor",
     "prefill_layer",
     "prefill_mtp",
@@ -103,7 +102,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "prefill_sparse_attn",
     "qkv_proj_rope",
     "rmsnorm",
-    "rope_tables",
+    "utils",
 )
 
 
@@ -480,7 +479,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     runtime_scalar_names=frozenset({"num_tokens"}),
                 )
             freqs_cos, freqs_sin = self._build_rope_tables(
-                modules["rope_tables"],
+                modules["utils"],
                 modules["config"],
             )
 
@@ -542,7 +541,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             config.DECODE_RECV_MAX = ranks * layout.decode_tokens
             config.RECV_MAX = config.DECODE_RECV_MAX
             modules = {"config": config}
-            decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "rope_tables"]
+            decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "utils"]
             if self._enable_mtp:
                 decode_module_names.extend(("decode_mtp", "decode_fwd_mtp"))
             modules.update(
@@ -628,9 +627,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         )
 
 
-    def _build_rope_tables(self, rope_tables_module: object, config_module: object) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_rope_tables(self, utils_module: object, config_module: object) -> tuple[torch.Tensor, torch.Tensor]:
         """Build full-sequence DeepSeekV4 RoPE tables using pypto-lib's helper."""
-        freqs_cos, freqs_sin = rope_tables_module.build_deepseek_v4_rope_tables(
+        freqs_cos, freqs_sin = utils_module.build_rope_tables(
             config_module.FLASH,
             0,
             dtype=torch.bfloat16,
@@ -641,8 +640,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         """Fail fast when the checked-out pypto-lib kernels do not match serving topology."""
         required_modules = (
             "config.py",
-            "prefill_attention_hca.py",
-            "prefill_attention_csa.py",
+            "prefill_hca.py",
+            "prefill_csa.py",
             "prefill_layer.py",
             "prefill_fwd.py",
             "prefill_mtp.py",
@@ -681,10 +680,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             if actual is not None and actual != expected:
                 mismatched.append(f"{name}={actual} expected {expected}")
         expected_module_constants = {
-            "prefill_attention_hca.py": {
+            "prefill_hca.py": {
                 "HCA_STATE_MAX_BLOCKS": layout.prefill_hca_state_max_blocks,
             },
-            "prefill_attention_csa.py": {
+            "prefill_csa.py": {
                 "CSA_STATE_MAX_BLOCKS": layout.prefill_csa_state_max_blocks,
                 "INNER_STATE_MAX_BLOCKS": layout.prefill_csa_inner_state_max_blocks,
             },

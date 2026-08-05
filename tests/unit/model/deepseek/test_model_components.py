@@ -269,14 +269,14 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
             "decode_fwd": decode_fwd,
             "decode_fwd_mtp": decode_fwd_mtp,
             "prefill_mtp": prefill_mtp,
-            "rope_tables": object(),
+            "utils": object(),
         },
     )
     monkeypatch.setattr(npu_executor.DeepSeekV4PyptoExecutor, "_compile_l3_callable", _fake_compile)
     monkeypatch.setattr(
         npu_executor.DeepSeekV4PyptoExecutor,
         "_build_rope_tables",
-        lambda self, rope_tables_module, config_module: (torch.empty(1), torch.empty(1)),
+        lambda self, utils_module, config_module: (torch.empty(1), torch.empty(1)),
     )
     executor = npu_executor.DeepSeekV4PyptoExecutor(
         platform="a2a3sim",
@@ -444,9 +444,9 @@ def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
     with pytest.raises(
         ValueError,
         match=(
-            r"prefill_attention_hca.py:HCA_STATE_MAX_BLOCKS=1024 expected 2048"
-            r".*prefill_attention_csa.py:CSA_STATE_MAX_BLOCKS=2048 expected 4096"
-            r".*prefill_attention_csa.py:INNER_STATE_MAX_BLOCKS=2048 expected 4096"
+            r"prefill_hca.py:HCA_STATE_MAX_BLOCKS=1024 expected 2048"
+            r".*prefill_csa.py:CSA_STATE_MAX_BLOCKS=2048 expected 4096"
+            r".*prefill_csa.py:INNER_STATE_MAX_BLOCKS=2048 expected 4096"
         ),
     ):
         executor._validate_kernel_contract(DeepSeekV4CacheLayout())
@@ -1752,7 +1752,7 @@ def _write_deepseek_kernel_dir(
 ) -> Path:
     kernel_dir = tmp_path / f"deepseek-v4-kernels-tp{lm_head_tp_size}"
     kernel_dir.mkdir()
-    (kernel_dir / "prefill_attention_hca.py").write_text(
+    (kernel_dir / "prefill_hca.py").write_text(
         "\n".join(
             [
                 "HCA_STATE_BLOCK_NUM = 64",
@@ -1761,7 +1761,7 @@ def _write_deepseek_kernel_dir(
             ]
         )
     )
-    (kernel_dir / "prefill_attention_csa.py").write_text(
+    (kernel_dir / "prefill_csa.py").write_text(
         "\n".join(
             [
                 "CSA_STATE_BLOCK_NUM = 65",
