@@ -19,7 +19,7 @@ platform/                      C++ platform-management layer (engine lifecycle, 
 examples/
   model/qwen3_14b/
     npu_generate.py            NPU generation/profiling example
-tests/                         CLI, batching, E2E serving, and benchmark tests
+tests/                         host-side unit tests and CI NPU accuracy guards
 ```
 
 ## Platform
@@ -101,12 +101,6 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
 curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
-```
-
-Run the serving benchmark:
-
-```bash
-python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ```
 
 ## Notes

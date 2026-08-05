@@ -1,0 +1,523 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from simpler.task_interface import DataType
+
+from pypto_serving.config.types import (
+    DecodeBatch,
+    LayerWeights,
+    ModelConfig,
+    PrefillBatch,
+    RuntimeConfig,
+    RuntimeModel,
+)
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.npu_runner import (
+    _CompiledKernels,
+    _DecodeKernelInputs,
+    _L3Callable,
+    Qwen314BModelRunner as ModelRunner,
+)
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.worker.worker import WorkerTensor
+
+
+ROOT = Path(__file__).resolve().parents[1]
+QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
+QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+
+
+def _model(
+    max_batch_size: int,
+    max_seq_len: int = 128,
+    page_size: int = 64,
+    eos_token_id: int | None = None,
+    max_num_batched_tokens: int = 4096,
+) -> RuntimeModel:
+    config = ModelConfig(
+        model_id="test-model",
+        architecture="qwen3",
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=max_seq_len,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        bos_token_id=None,
+        eos_token_id=eos_token_id,
+        pad_token_id=None,
+        torch_dtype="bfloat16",
+    )
+    runtime = RuntimeConfig(
+        page_size=page_size,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        device="cpu",
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+    return RuntimeModel(
+        config=config,
+        runtime=runtime,
+        embed_tokens=torch.zeros(config.vocab_size, config.hidden_size),
+        final_norm_weight=torch.ones(config.hidden_size),
+        lm_head=torch.zeros(config.vocab_size, config.hidden_size),
+        layers=[],
+    )
+
+
+def _compiled_kernels(
+    model: RuntimeModel,
+    *,
+    callable_: _L3Callable | None = None,
+    decode_weights: dict[str, torch.Tensor] | None = None,
+) -> _CompiledKernels:
+    kernel_batch = model.runtime.max_batch_size
+    sampled_ids_width = 8
+    max_seq = model.runtime.max_seq_len
+    hidden_size = model.config.hidden_size
+    intermediate_size = model.config.intermediate_size
+    head_dim = model.config.head_dim
+    kv_hidden = model.config.num_key_value_heads * head_dim
+    max_blocks = (max_seq + model.runtime.page_size - 1) // model.runtime.page_size
+    if callable_ is None:
+        callable_ = _L3Callable(
+            compiled=object(),
+            name="fake",
+            aicpu_thread_num=1,
+        )
+    if decode_weights is None:
+        decode_weights = {
+            "decode_input_rms_weight": torch.ones(1, hidden_size),
+            "decode_wq": torch.zeros(hidden_size, hidden_size),
+            "decode_wk": torch.zeros(hidden_size, kv_hidden),
+            "decode_wv": torch.zeros(hidden_size, kv_hidden),
+            "decode_q_norm_weight": torch.ones(1, head_dim),
+            "decode_k_norm_weight": torch.ones(1, head_dim),
+            "decode_wo": torch.zeros(hidden_size, hidden_size),
+            "decode_post_rms_weight": torch.ones(1, hidden_size),
+            "decode_w_gate": torch.zeros(hidden_size, intermediate_size),
+            "decode_w_up": torch.zeros(hidden_size, intermediate_size),
+            "decode_w_down": torch.zeros(intermediate_size, hidden_size),
+        }
+    return _CompiledKernels(
+        prefill=callable_,
+        decode=callable_,
+        topk_select=callable_,
+        final_norm_weight=torch.ones(1, hidden_size),
+        rope_cos=torch.zeros(max_seq, head_dim),
+        rope_sin=torch.zeros(max_seq, head_dim),
+        padded_vocab=model.config.vocab_size,
+        padded_lm_head_weight=torch.zeros(model.config.vocab_size, hidden_size),
+        padded_embed_weight=torch.zeros(model.config.vocab_size, hidden_size),
+        decode_weights=decode_weights,
+        prefill_token_ids_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
+        prefill_seq_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_chunk_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_chunk_offsets_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
+        prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
+        prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
+        prefill_topk_values_buffer=torch.empty(kernel_batch, 4, dtype=torch.float32),
+        prefill_topk_indices_buffer=torch.empty(kernel_batch, 4, dtype=torch.int32),
+        decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
+        decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
+        decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
+        decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
+        decode_token_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
+        decode_sampled_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
+        decode_topk_values_buffer=torch.empty(kernel_batch, 4, dtype=torch.float32),
+        decode_topk_indices_buffer=torch.empty(kernel_batch, 4, dtype=torch.int32),
+        sampling_control_buffer=torch.empty(2, dtype=torch.int32),
+        decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
+    )
+
+
+def test_kv_cache_capacity_uses_actual_runtime_batch_size():
+    model = _model(max_batch_size=1, max_seq_len=128, page_size=64)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+
+    k_cache, _ = manager.materialize_single_layer_cache(model.config.model_id, 0)
+    assert k_cache.shape[0] == 1 * 2 * model.config.num_key_value_heads * model.runtime.page_size
+
+
+def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
+    model = _model(max_batch_size=15)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    compiled = _compiled_kernels(model)
+    runner = ModelRunner(
+        compiled=compiled,
+    )
+    allocations = [
+        manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1) for idx in range(2)
+    ]
+    seq_lens = [idx + 1 for idx in range(len(allocations))]
+    prepared = runner._prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=[alloc.request_id for alloc in allocations],
+            token_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+            input_embeddings=None,
+            seq_lens=seq_lens,
+            chunk_lens=[1, 2],
+            chunk_offsets=[0, 1],
+            chunk_starts=[0, 0],
+            kv_allocations=allocations,
+        ),
+    )
+
+    assert prepared.actual_batch == 2
+    assert prepared.token_ids.shape == (3,)
+    assert prepared.token_ids.tolist() == [1, 2, 3]
+    assert prepared.seq_lens.shape == (model.runtime.max_batch_size,)
+    assert prepared.seq_lens[:2].tolist() == [1, 2]
+    assert prepared.seq_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.chunk_lens[:2].tolist() == [1, 2]
+    assert prepared.chunk_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.chunk_offsets[:2].tolist() == [0, 1]
+    assert prepared.chunk_offsets[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.block_table.shape == (model.runtime.max_batch_size * 2,)
+    assert prepared.block_table[0].item() == allocations[0].page_ids[0]
+    assert prepared.block_table[4:].tolist() == [-1] * (prepared.block_table.numel() - 4)
+    assert prepared.slot_mapping.shape == (3,)
+    assert prepared.slot_mapping.data_ptr() == compiled.prefill_slot_mapping_buffer.data_ptr()
+    assert prepared.slot_mapping[2].item() == manager.slot_mapping_for_request(allocations[1], 1)
+
+
+def test_prefill_inputs_pack_resumed_chunk_metadata():
+    model = _model(max_batch_size=1, max_seq_len=8, page_size=2)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(
+        compiled=_compiled_kernels(model),
+    )
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
+
+    prepared = runner._prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=[alloc.request_id],
+            token_ids=torch.tensor([5, 6], dtype=torch.long),
+            input_embeddings=None,
+            seq_lens=[4],
+            chunk_lens=[2],
+            chunk_offsets=[0],
+            chunk_starts=[2],
+            kv_allocations=[alloc],
+        ),
+    )
+
+    assert prepared.token_ids.tolist() == [5, 6]
+    assert prepared.seq_lens.tolist() == [4]
+    assert prepared.chunk_lens.tolist() == [2]
+    assert prepared.chunk_offsets.tolist() == [0]
+    assert prepared.slot_mapping.tolist() == [
+        manager.slot_mapping_for_request(alloc, 2),
+        manager.slot_mapping_for_request(alloc, 3),
+    ]
+
+
+def test_write_slot_mapping_rejects_insufficient_pages():
+    target = torch.empty(2, dtype=torch.int32).numpy()
+    with pytest.raises(ValueError, match="too small"):
+        ModelRunner._write_slot_mapping(target, [0], 2, 2, start_pos=1)
+
+
+def test_write_slot_mapping_fills_target_slice_across_physical_pages():
+    target = torch.full((6,), -1, dtype=torch.int32).numpy()
+
+    ModelRunner._write_slot_mapping(target[1:5], [7, 3], 4, 2)
+
+    assert target.tolist() == [-1, 14, 15, 6, 7, -1]
+
+
+def test_prepare_decode_inputs_writes_compiled_buffers_and_replicates_padding():
+    model = _model(max_batch_size=2)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    compiled = _compiled_kernels(model)
+    runner = ModelRunner(compiled=compiled)
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
+    prepared = runner._prepare_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=[alloc.request_id],
+            token_ids=torch.tensor([[7]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[alloc],
+        ),
+    )
+
+    assert prepared.actual_batch == 1
+    assert prepared.token_ids is compiled.decode_token_ids_buffer
+    assert prepared.seq_lens is compiled.decode_seq_lens_buffer
+    assert prepared.block_table is compiled.decode_block_table_buffer
+    assert prepared.slot_mapping is compiled.decode_slot_mapping_buffer
+    assert prepared.logits is compiled.decode_logits_buffer
+    assert prepared.token_ids[:, :1].tolist() == [[7], [7]]
+    assert torch.count_nonzero(prepared.token_ids[:, 1:]).item() == 0
+    assert prepared.seq_lens.tolist() == [1, 1]
+    assert prepared.block_table.reshape(2, 2).tolist() == [
+        [alloc.page_ids[0], -1],
+        [alloc.page_ids[0], -1],
+    ]
+    expected_slot = manager.slot_mapping_for_request(alloc)
+    assert prepared.slot_mapping.tolist() == [expected_slot, expected_slot]
+
+
+def test_prepare_decode_inputs_caches_block_table_until_pages_change():
+    model = _model(max_batch_size=1)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
+
+    def prepare(seq_len: int):
+        return runner._prepare_decode_inputs(
+            model,
+            DecodeBatch(
+                request_ids=[alloc.request_id],
+                token_ids=torch.tensor([[7]], dtype=torch.long),
+                hidden_states=None,
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+                kv_allocations=[alloc],
+            ),
+        )
+
+    prepared = prepare(1)
+    cached_pages = runner._decode_block_table_row_pages[0]
+    prepare(2)
+    assert runner._decode_block_table_row_pages[0] is cached_pages
+
+    alloc.tokens_used = alloc.tokens_capacity
+    manager.ensure_one_more_slot(alloc)
+    prepared = prepare(model.runtime.page_size + 1)
+    assert runner._decode_block_table_row_pages[0] is not cached_pages
+    assert prepared.block_table.tolist() == alloc.page_ids
+
+
+def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
+    model = _model(max_batch_size=1)
+    compiled = _compiled_kernels(model)
+    compiled.decode = _L3Callable(
+        compiled=object(),
+        name="decode",
+        aicpu_thread_num=1,
+    )
+    compiled.topk_select = _L3Callable(
+        compiled=object(),
+        name="topk_select",
+        aicpu_thread_num=1,
+    )
+    runner = ModelRunner(compiled=compiled)
+    host_logits = torch.zeros(1, model.config.vocab_size)
+    kernel_inputs = _DecodeKernelInputs(
+        actual_batch=1,
+        token_ids=compiled.decode_token_ids_buffer,
+        seq_lens=compiled.decode_seq_lens_buffer,
+        block_table=compiled.decode_block_table_buffer,
+        slot_mapping=compiled.decode_slot_mapping_buffer,
+        logits=host_logits,
+    )
+    runner._kv_caches = {
+        model.config.model_id: SimpleNamespace(
+            key_pages=object(),
+            value_pages=object(),
+        )
+    }
+    device_logits = object()
+    device_next_hidden = object()
+    monkeypatch.setattr(
+        runner,
+        "_prepare_decode_inputs",
+        lambda _model, _batch: kernel_inputs,
+    )
+    monkeypatch.setattr(runner, "_decode_logits_device_arg", lambda: device_logits)
+    monkeypatch.setattr(
+        runner,
+        "_decode_next_hidden_device_arg",
+        lambda: device_next_hidden,
+    )
+    dispatches = []
+    monkeypatch.setattr(
+        runner,
+        "_run_distributed_program",
+        lambda callable_spec, *args: dispatches.append((callable_spec, args)),
+    )
+
+    result = runner.run_decode(
+        model,
+        DecodeBatch(
+            request_ids=["request"],
+            token_ids=torch.tensor([[7]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            allow_device_topk_sampling=True,
+            block_ids=[[0]],
+        ),
+    )
+
+    assert result.logits is None
+    assert result.sampling_candidates is not None
+    assert dispatches[0][0] is compiled.decode
+    assert dispatches[0][1][20] is device_logits
+    assert dispatches[0][1][-1] is device_next_hidden
+    assert dispatches[1][0] is compiled.topk_select
+    assert dispatches[1][1][0] is device_logits
+
+
+def test_decode_kernel_inputs_reject_multi_token_rows():
+    model = _model(max_batch_size=2)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+
+    with pytest.raises(ValueError, match="exactly one token per row"):
+        runner._prepare_decode_inputs(
+            model,
+            DecodeBatch(
+                request_ids=["req-0"],
+                token_ids=torch.tensor([[3, 4]], dtype=torch.int32),
+                hidden_states=None,
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                block_ids=[[0]],
+            ),
+        )
+
+
+def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
+    model = _model(max_batch_size=1, page_size=256)
+    model.layers = [_layer(model.config.hidden_size, model.config.intermediate_size, model.config.head_dim)]
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    executor = PyptoExecutor(manager)
+    cached_layer = executor._kernel_layer_weights(model.layers[0])
+    fake_kernel = _CopyKernel()
+    fake_callable = _L3Callable(
+        compiled=fake_kernel,
+        name="fake",
+        aicpu_thread_num=1,
+    )
+    compiled = _compiled_kernels(
+        model,
+        callable_=fake_callable,
+        decode_weights=executor._stack_decode_weights([cached_layer]),
+    )
+    executor._compiled[model.config.model_id] = compiled
+    monkeypatch.setattr(ModelRunner, "_static_device_tensor", staticmethod(lambda tensor: tensor))
+    runner = ModelRunner(
+        compiled=compiled,
+    )
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
+    monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    monkeypatch.setattr(
+        runner,
+        "_run_distributed_program",
+        lambda callable_spec, *args: callable_spec.compiled(*(getattr(arg, "tensor", arg) for arg in args)),
+    )
+    executor._runners[model.config.model_id] = runner
+    monkeypatch.setattr(
+        PyptoExecutor,
+        "_kernel_weight",
+        staticmethod(lambda weight: (_ for _ in ()).throw(AssertionError("_kernel_weight should be cached"))),
+    )
+
+    prefill_alloc = manager.allocate_for_prompt(model.config.model_id, "prefill", 1)
+    executor.run_prefill(
+        model,
+        PrefillBatch(
+            request_ids=["prefill"],
+            token_ids=torch.zeros(1, dtype=torch.long),
+            input_embeddings=None,
+            seq_lens=[1],
+            chunk_lens=[1],
+            chunk_offsets=[0],
+            chunk_starts=[0],
+            kv_allocations=[prefill_alloc],
+        ),
+    )
+    manager.free(prefill_alloc)
+
+    decode_alloc = manager.allocate_for_prompt(model.config.model_id, "decode", 1)
+    executor.run_decode(
+        model,
+        DecodeBatch(
+            request_ids=["decode"],
+            token_ids=torch.zeros(1, 1, dtype=torch.long),
+            hidden_states=torch.ones(1, model.config.hidden_size),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[decode_alloc],
+        ),
+    )
+    manager.free(decode_alloc)
+
+
+def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
+    kv_hidden = head_dim
+    return LayerWeights(
+        input_rms_weight=torch.ones(hidden_size),
+        wq=torch.zeros(hidden_size, hidden_size),
+        wk=torch.zeros(kv_hidden, hidden_size),
+        wv=torch.zeros(kv_hidden, hidden_size),
+        q_norm_weight=torch.ones(head_dim),
+        k_norm_weight=torch.ones(head_dim),
+        wo=torch.zeros(hidden_size, hidden_size),
+        post_rms_weight=torch.ones(hidden_size),
+        w_gate=torch.zeros(intermediate_size, hidden_size),
+        w_up=torch.zeros(intermediate_size, hidden_size),
+        w_down=torch.zeros(hidden_size, intermediate_size),
+    )
+
+
+class _CopyKernel:
+    def __call__(self, *args, config=None):
+        tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if len(tensors) < 2:
+            return None
+        src, out = tensors[0], tensors[-1]
+        if out.shape == src.shape:
+            out.copy_(src)
+        else:
+            out.zero_()
+        return None
+
+
+class _FakeWorker:
+    _DTYPES = {
+        torch.float32: DataType.FLOAT32,
+        torch.bfloat16: DataType.BFLOAT16,
+        torch.int32: DataType.INT32,
+    }
+
+    def __init__(self) -> None:
+        self._next_ptr = 1
+        self.initialized = True
+
+    def alloc_tensor(self, shape, dtype, init=None):
+        nbytes = torch.empty(tuple(shape), dtype=dtype).nbytes
+        tensor = WorkerTensor(self._next_ptr, tuple(shape), self._DTYPES[dtype])
+        self._next_ptr += nbytes
+        return tensor
+
+    def free_tensor(self, tensor):
+        return None
+
+    def run(self, compiled, *args, **kwargs):
+        return None
