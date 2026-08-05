@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Collapse Simpler's per-invocation trace into one host-clock lane per NPU rank."""
+"""Merge the supported one-L2 host STRACE with the serving trace."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ DEVICE_READY_RE = re.compile(r"\[chip_process pid=(?P<pid>\d+) dev=(?P<device>\d
 MTP_ACCEPTANCE_RE = re.compile(r"MTP acceptance for .* proposed=(?P<steps>\d+)")
 
 
-def callable_label(invocation: int, decode_width: int) -> tuple[str, int | None, str]:
+def callable_label(invocation: int) -> tuple[str, int | None, str]:
     prefill = {
         1: ("prefill.main", None, "rail_response"),
         2: ("prefill.main.lm_head", None, "rail_animation"),
@@ -30,23 +30,7 @@ def callable_label(invocation: int, decode_width: int) -> tuple[str, int | None,
     }
     if invocation in prefill:
         return prefill[invocation]
-    step = (invocation - 5) // decode_width + 1
-    phase = (invocation - 5) % decode_width
-    if decode_width == 2:
-        decode = {
-            0: ("decode.main+verify", "good"),
-            1: ("decode.mtp", "cq_build_running"),
-        }
-        label, color = decode[phase]
-        return label, step, color
-    decode = {
-        0: ("decode.main", "good"),
-        1: ("decode.main.lm_head", "rail_animation"),
-        2: ("decode.mtp", "cq_build_running"),
-        3: ("decode.mtp.lm_head", "rail_idle"),
-    }
-    label, color = decode[phase]
-    return label, step, color
+    return "decode.main+verify+mtp", invocation - 4, "good"
 
 
 def one_event(events: list[dict], name: str) -> dict | None:
@@ -58,46 +42,33 @@ def one_event(events: list[dict], name: str) -> dict | None:
     return matches[0]
 
 
-def interval_union_us(events: list[dict], suffixes: tuple[str, ...]) -> float:
-    intervals = sorted(
-        (float(event["ts"]), float(event["ts"]) + float(event["dur"]))
-        for event in events
-        if event.get("ph") == "X" and str(event.get("name", "")).endswith(suffixes)
-    )
-    merged: list[list[float]] = []
-    for start, end in intervals:
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return sum(end - start for start, end in merged)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path, help="Simpler strace_timing Chrome trace")
     parser.add_argument("server_log", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument(
-        "--detailed",
-        action="store_true",
-        help="Draw host spans and visually project device-clock spans inside runner_run.",
+        "--serving-trace",
+        type=Path,
+        required=True,
+        help="Serving SA_PROFILE trace on the shared host monotonic clock.",
     )
-    parser.add_argument(
-        "--host-only",
-        action="store_true",
-        help="With --detailed, omit device-clock projections.",
-    )
-    args = parser.parse_args()
-    if args.host_only and not args.detailed:
-        parser.error("--host-only requires --detailed")
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     source = json.loads(args.input.read_text())
     source_events = source["traceEvents"] if isinstance(source, dict) else source
+    if any(
+        event.get("ph") == "X"
+        and (
+            event.get("tid") == 1
+            or event.get("args", {}).get("attrs") == "clk=dev"
+        )
+        for event in source_events
+    ):
+        raise ValueError("device STRACE is unsupported; expected host-only STRACE")
 
     server_log = args.server_log.read_text(errors="replace")
     pid_to_device = {
@@ -128,18 +99,17 @@ def main() -> None:
         if virtual_pid in virtual_processes and event.get("ph") == "X":
             grouped.setdefault(int(virtual_pid), []).append(event)
 
-    invocation_ids = sorted({invocation for _device, invocation in virtual_processes.values()})
-    if not invocation_ids or invocation_ids != list(range(1, invocation_ids[-1] + 1)):
-        raise ValueError(f"unexpected invocation ids: {invocation_ids}")
-    decode_invocations = invocation_ids[-1] - 4
     acceptance_matches = list(MTP_ACCEPTANCE_RE.finditer(server_log))
-    proposed_steps = int(acceptance_matches[-1].group("steps")) if acceptance_matches else 0
-    if proposed_steps and decode_invocations == proposed_steps * 2:
-        decode_width = 2
-    elif decode_invocations % 4 == 0:
-        decode_width = 4
-    else:
-        raise ValueError(f"cannot infer decode invocation width from {invocation_ids[-1]} invocations")
+    if not acceptance_matches:
+        raise ValueError("missing final MTP acceptance line")
+    proposed_steps = int(acceptance_matches[-1].group("steps"))
+    invocation_ids = sorted({invocation for _device, invocation in virtual_processes.values()})
+    expected_invocation_ids = list(range(1, 5 + proposed_steps))
+    if invocation_ids != expected_invocation_ids:
+        raise ValueError(
+            "expected four prefill invocations plus one fused invocation per decode step: "
+            f"got={invocation_ids}, proposed={proposed_steps}"
+        )
 
     roots = [
         event
@@ -149,17 +119,57 @@ def main() -> None:
     ]
     if not roots:
         raise ValueError("no simpler_run roots found")
-    origin_us = min(float(event["ts"]) for event in roots)
 
-    process_id = 1
-    output_events: list[dict] = [
-        {
-            "ph": "M",
-            "name": "process_name",
-            "pid": process_id,
-            "args": {"name": "DeepSeek V4 STRACE (8 NPU lanes)"},
-        }
-    ]
+    serving_source = json.loads(args.serving_trace.read_text())
+    serving_events = (
+        serving_source["traceEvents"]
+        if isinstance(serving_source, dict)
+        else serving_source
+    )
+    serving_timed_events = [event for event in serving_events if "ts" in event]
+    serving_spans = [event for event in serving_events if event.get("ph") == "X"]
+    if not serving_spans:
+        raise ValueError(f"serving trace has no complete spans: {args.serving_trace}")
+    host_start = min(float(event["ts"]) for event in roots)
+    host_end = max(float(event["ts"]) + float(event["dur"]) for event in roots)
+    serving_start = min(float(event["ts"]) for event in serving_spans)
+    serving_end = max(
+        float(event["ts"]) + float(event.get("dur", 0)) for event in serving_spans
+    )
+    if max(host_start, serving_start) >= min(host_end, serving_end):
+        raise ValueError(
+            "serving trace and host STRACE do not overlap on the host monotonic clock"
+        )
+
+    origin_us = min(float(event["ts"]) for event in roots + serving_timed_events)
+    serving_pids = {
+        int(event["pid"])
+        for event in serving_events
+        if isinstance(event.get("pid"), int)
+    }
+    process_id = max(serving_pids, default=0) + 1
+    output_events: list[dict] = []
+    for event in serving_events:
+        output_event = dict(event)
+        if "ts" in output_event:
+            output_event["ts"] = float(output_event["ts"]) - origin_us
+        output_events.append(output_event)
+    output_events.extend(
+        [
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": process_id,
+                "args": {"name": "Simpler host STRACE (8 NPU lanes)"},
+            },
+            {
+                "ph": "M",
+                "name": "process_sort_index",
+                "pid": process_id,
+                "args": {"sort_index": len(serving_pids)},
+            },
+        ]
+    )
     for sort_index, device in enumerate(devices):
         output_events.extend(
             [
@@ -190,10 +200,8 @@ def main() -> None:
         bind = one_event(events, "simpler_run.bind")
         runner = one_event(events, "simpler_run.runner_run")
         validate = one_event(events, "simpler_run.validate")
-        device_wall = one_event(events, "simpler_run.runner_run.device_wall")
-        label, step, color = callable_label(invocation, decode_width)
+        label, step, color = callable_label(invocation)
         event_name = label if step is None else f"D{step:02d} {label}"
-        has_device_trace = device_wall is not None
         event_args = {
             "device": device,
             "invocation": invocation,
@@ -204,105 +212,57 @@ def main() -> None:
             "bind_ms": round(float(bind["dur"]) / 1000.0, 6) if bind else None,
             "runner_run_ms": round(float(runner["dur"]) / 1000.0, 6) if runner else None,
             "validate_ms": round(float(validate["dur"]) / 1000.0, 6) if validate else None,
-            "device_wall_ms": round(float(device_wall["dur"]) / 1000.0, 6) if device_wall else None,
-            "effective_ms": (
-                round(interval_union_us(events, (".orch", ".sched")) / 1000.0, 6)
-                if has_device_trace
-                else None
-            ),
         }
-        if not args.detailed:
-            output_events.append(
-                {
-                    "ph": "X",
-                    "name": event_name,
-                    "cat": "simpler_run",
-                    "pid": process_id,
-                    "tid": device,
-                    "ts": float(root["ts"]) - origin_us,
-                    "dur": float(root["dur"]),
-                    "cname": color,
-                    "args": event_args,
-                }
-            )
-            continue
-
-        if runner is None:
-            raise ValueError(f"invocation {invocation} has no runner_run span")
-        if device_wall is None:
-            if args.host_only:
-                projected_device_start = 0.0
-            else:
-                raise ValueError(
-                    f"invocation {invocation} has no device_wall span; use --host-only "
-                    "when SIMPLER_DEVICE_STRACE_ENABLE=0"
-                )
-        else:
-            projected_device_start = (
-                float(runner["ts"]) + float(runner["dur"]) - float(device_wall["dur"])
-            )
         for source_event in events:
             if source_event.get("ph") != "X":
                 continue
             source_name = str(source_event.get("name", ""))
-            is_device = (
-                source_event.get("tid") == 1
-                or source_event.get("args", {}).get("attrs") == "clk=dev"
-            )
-            if is_device:
-                if args.host_only:
-                    continue
-                output_ts = projected_device_start + float(source_event["ts"]) - origin_us
-                stage = source_name.removeprefix("simpler_run.runner_run.device_wall")
-                stage = "device.wall" if not stage else f"device{stage}"
-                clock_note = "visual projection: device wall right-aligned to host runner_run end"
-                category = "strace.device.projected"
-                stage_color = "thread_state_iowait"
-            else:
-                output_ts = float(source_event["ts"]) - origin_us
-                stage = source_name.removeprefix("simpler_run")
-                stage = "simpler_run" if not stage else stage.removeprefix(".")
-                clock_note = "host CLOCK_MONOTONIC"
-                category = "strace.host"
-                stage_color = color if stage == "simpler_run" else "thread_state_running"
+            stage = source_name.removeprefix("simpler_run")
+            stage = "simpler_run" if not stage else stage.removeprefix(".")
             output_events.append(
                 {
                     "ph": "X",
                     "name": f"{event_name} | {stage}",
-                    "cat": category,
+                    "cat": "strace.host",
                     "pid": process_id,
                     "tid": device,
-                    "ts": output_ts,
+                    "ts": float(source_event["ts"]) - origin_us,
                     "dur": float(source_event["dur"]),
-                    "cname": stage_color,
+                    "cname": color if stage == "simpler_run" else "thread_state_running",
                     "args": {
                         **event_args,
                         "strace_name": source_name,
-                        "clock": clock_note,
+                        "clock": "host CLOCK_MONOTONIC",
                         "strace_depth": source_event.get("args", {}).get("depth"),
                     },
                 }
             )
 
+    def sort_number(value: object) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return float("inf")
+
     output_events.sort(
         key=lambda event: (
             0 if event.get("ph") == "M" else 1,
-            int(event.get("tid", 0)),
+            sort_number(event.get("pid", 0)),
+            sort_number(event.get("tid", 0)),
             float(event.get("ts", 0)),
         )
     )
-    description = "Exactly eight NPU tracks. Collapsed simpler_run bars use host CLOCK_MONOTONIC."
-    if args.detailed and args.host_only:
-        description = "Exactly eight NPU tracks with authoritative host CLOCK_MONOTONIC spans only."
-    elif args.detailed:
-        description = (
-            "Exactly eight NPU tracks. Host spans use CLOCK_MONOTONIC; device-clock spans are "
-            "visual projections right-aligned to runner_run end and are not cross-rank timestamps."
-        )
+    description = (
+        "Serving SA_PROFILE spans and eight detailed one-L2 Simpler host STRACE lanes "
+        "aligned on their shared host monotonic clock."
+    )
     payload = {
         "displayTimeUnit": "ms",
         "traceEvents": output_events,
-        "metadata": {"description": description, "source": str(args.input)},
+        "metadata": {
+            "description": description,
+            "sources": [str(args.serving_trace), str(args.input)],
+        },
     }
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
     slice_count = sum(event.get("ph") == "X" for event in output_events)

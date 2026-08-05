@@ -11,6 +11,7 @@ Usage: run_profile.sh --model-dir DIR [options]
 
 Options:
   --artifact-dir DIR       Output directory (default: artifacts/<timestamp>)
+  --kernel-cache-dir DIR   Reuse compiled kernels across launches
   --python PATH            Python interpreter (default: current python3/python)
   --devices IDS            Eight comma-separated device IDs (default: allocation env)
   --max-tokens N           Output-token limit (default: 20)
@@ -33,11 +34,16 @@ PROMPT="Huawei is"
 SERVED_MODEL_NAME=dsv4-flash-w8a8
 RUN_ID=${PYPTO_PROFILE_RUN_ID:-unknown}
 ARTIFACT_DIR=
+KERNEL_CACHE_DIR=${PYPTO_KERNEL_CACHE_DIR:-}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --artifact-dir)
       ARTIFACT_DIR=$2
+      shift 2
+      ;;
+    --kernel-cache-dir)
+      KERNEL_CACHE_DIR=$2
       shift 2
       ;;
     --python)
@@ -96,6 +102,9 @@ fi
 
 ARTIFACT_DIR=$(realpath -m "$ARTIFACT_DIR")
 MODEL_DIR=$(realpath -m "$MODEL_DIR")
+if [[ -n "$KERNEL_CACHE_DIR" ]]; then
+  KERNEL_CACHE_DIR=$(realpath -m "$KERNEL_CACHE_DIR")
+fi
 trap 'printf "Artifacts: %s\n" "$ARTIFACT_DIR"' EXIT
 mkdir -p "$ARTIFACT_DIR"
 
@@ -116,20 +125,24 @@ export no_proxy=${no_proxy:-127.0.0.1,localhost}
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$REPO_ROOT"
+PROFILE_ARGS=(
+  --artifact-dir "$ARTIFACT_DIR"
+  --model-dir "$MODEL_DIR"
+  --devices "$DEVICES"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --max-tokens "$MAX_TOKENS"
+  --prompt "$PROMPT"
+)
+if [[ -n "$KERNEL_CACHE_DIR" ]]; then
+  PROFILE_ARGS+=(--kernel-cache-dir "$KERNEL_CACHE_DIR")
+fi
 "$PYTHON_BIN" "$SCRIPT_DIR/run_profile.py" \
-  --artifact-dir "$ARTIFACT_DIR" \
-  --model-dir "$MODEL_DIR" \
-  --devices "$DEVICES" \
-  --served-model-name "$SERVED_MODEL_NAME" \
-  --max-tokens "$MAX_TOKENS" \
-  --prompt "$PROMPT" \
+  "${PROFILE_ARGS[@]}" \
   2>&1 | tee "$ARTIFACT_DIR/run.log"
 
 "$PYTHON_BIN" "$SCRIPT_DIR/analyze_profile.py" "$ARTIFACT_DIR" \
   --run-id "$RUN_ID" --expected-tokens "$MAX_TOKENS"
 "$PYTHON_BIN" "$SCRIPT_DIR/render_8lane.py" \
   "$ARTIFACT_DIR/simpler-swimlane.json" "$ARTIFACT_DIR/server.log" \
-  "$ARTIFACT_DIR/strace-8lane.json"
-"$PYTHON_BIN" "$SCRIPT_DIR/render_8lane.py" \
-  "$ARTIFACT_DIR/simpler-swimlane.json" "$ARTIFACT_DIR/server.log" \
-  "$ARTIFACT_DIR/strace-8lane-host-clock.json" --detailed --host-only
+  "$ARTIFACT_DIR/serving-strace-swimlane.json" \
+  --serving-trace "$ARTIFACT_DIR/serving-trace/trace.json"
