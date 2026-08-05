@@ -54,7 +54,7 @@ from pypto_serving.tools import prepack_deepseek_v4
 
 
 def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
-    kernel_dir = tmp_path / "models" / "deepseek" / "v4-flash"
+    kernel_dir = tmp_path / "models" / "deepseek_v4_flash_mtp"
     kernel_dir.mkdir(parents=True)
 
     assert npu_executor._find_pypto_lib_deepseek_v4_dir(str(tmp_path)) == kernel_dir

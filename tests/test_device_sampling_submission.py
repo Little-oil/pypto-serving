@@ -14,7 +14,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QWEN = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+QWEN = ROOT / "pypto-lib" / "models" / "qwen3_14b"
 QWEN_SERVING = ROOT / "pypto_serving" / "model" / "qwen"
 REAL_VOCAB = 151936
 PADDED_VOCAB = 152064

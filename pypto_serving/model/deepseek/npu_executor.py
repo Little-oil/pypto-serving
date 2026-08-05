@@ -64,7 +64,7 @@ _PYPTO_TORCH_DTYPES = {
     "int64": torch.int64,
     "uint8": torch.uint8,
 }
-_DEEPSEEK_V4_KERNEL_DIRNAME = "v4-flash"
+_DEEPSEEK_V4_KERNEL_DIRNAME = "deepseek_v4_flash_mtp"
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
@@ -113,7 +113,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
         pypto_root = os.environ.get("PYPTO_ROOT")
     if pypto_root:
         root = Path(pypto_root)
-        candidate = root / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
+        candidate = root / "models" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
         raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_ROOT={pypto_root!r}")
@@ -121,7 +121,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
         pypto_lib_dir = directory / "pypto-lib"
-        candidate = pypto_lib_dir / "models" / "deepseek" / _DEEPSEEK_V4_KERNEL_DIRNAME
+        candidate = pypto_lib_dir / "models" / _DEEPSEEK_V4_KERNEL_DIRNAME
         if candidate.is_dir():
             return candidate
 
@@ -189,9 +189,8 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     if resolved.is_relative_to(kernel_dir):
         return True
     parts = resolved.parts
-    return len(parts) >= 4 and parts[-4:-1] == (
+    return len(parts) >= 3 and parts[-3:-1] == (
         "models",
-        "deepseek",
         _DEEPSEEK_V4_KERNEL_DIRNAME,
     )
 
@@ -511,7 +510,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
         """Import DeepSeekV4 pypto-lib modules with EP fixed to the serving world size."""
-        pypto_root = self._kernel_dir.parents[2]
+        pypto_root = self._kernel_dir.parents[1]
         ranks = layout.ranks
         fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
         with _deepseek_v4_import_context(
