@@ -1526,7 +1526,6 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
     runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
     runner._decode_fwd_args = lambda *_args: ()
     runner._fused_mtp_decode_args = lambda _main_args, _active_tokens: ("fused",)
-    runner._debug_decode_dispatch = lambda *_args: None
 
     def fake_run_l3(callable_spec, *args):
         dispatches.append((callable_spec.name, args))
