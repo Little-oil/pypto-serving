@@ -129,8 +129,14 @@ _PACKED_NP_DTYPE = {
 _PACKED_VIEW_DTYPE = {"BF16": torch.bfloat16, "F16": torch.float16}
 
 
-def _map_shared_prepacked_tensors(path: Path, names: Iterable[str]) -> dict[str, torch.Tensor]:
+def _map_shared_prepacked_tensors(fd: int, names: Iterable[str]) -> dict[str, torch.Tensor]:
     """Map the prepacked sidecar shared/read-only and return zero-copy tensors.
+
+    Takes an already-open descriptor rather than a path: the caller validates
+    metadata, fingerprint and residency against that same descriptor, and the
+    sidecar is published with an atomic ``os.replace``, so re-opening the name
+    here could map a different inode than the one that was validated. The
+    mapping outlives the descriptor — closing an fd does not unmap it.
 
     ``safetensors`` has to hand PyTorch a *writable* buffer, so it maps the file
     ``MAP_PRIVATE`` (``rw-p``) — copy-on-write. The resident upload then reads
@@ -142,13 +148,9 @@ def _map_shared_prepacked_tensors(path: Path, names: Iterable[str]) -> dict[str,
     through. The returned tensors keep the mapping alive through the numpy base
     chain, so the caller does not have to hold it.
     """
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        header_len = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
-        header = json.loads(os.pread(fd, header_len, 8))
-        mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)  # MAP_SHARED | PROT_READ
-    finally:
-        os.close(fd)
+    header_len = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+    header = json.loads(os.pread(fd, header_len, 8))
+    mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)  # MAP_SHARED | PROT_READ
 
     data_start = 8 + header_len
     tensors: dict[str, torch.Tensor] = {}
@@ -310,14 +312,17 @@ def deepseek_v4_packed_weights_path(model_dir: str | Path, *, ranks: int) -> Pat
     return Path(model_dir) / f"pypto-deepseek-v4-stacked-r{int(ranks)}.safetensors"
 
 
-def _sample_file_page_cache_residency(path: Path) -> float | None:
-    """Estimate Linux page-cache residency without reading the sampled pages."""
-    fd: int | None = None
+def _sample_file_page_cache_residency(fd: int, path: Path) -> float | None:
+    """Estimate Linux page-cache residency without reading the sampled pages.
+
+    Samples the descriptor the caller will go on to validate and map, so the
+    answer cannot describe a sidecar that a concurrent publish has since
+    replaced. *path* is only used to name the file in diagnostics.
+    """
     mapping: mmap.mmap | None = None
     anchor: ctypes.c_char | None = None
     result: float | None = None
     try:
-        fd = os.open(path, os.O_RDONLY)
         size = os.fstat(fd).st_size
         if size <= 0:
             result = 0.0
@@ -366,12 +371,6 @@ def _sample_file_page_cache_residency(path: Path) -> float | None:
                 mapping.close()
             except (BufferError, OSError):
                 logger.warning("Could not close page-cache residency mapping for %s", path, exc_info=True)
-                result = None
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                logger.warning("Could not close page-cache residency file %s", path, exc_info=True)
                 result = None
     return result
 
@@ -867,73 +866,82 @@ class DeepSeekV4WeightStore:
         )
         if not packed_path.is_file():
             return None
-        cache_residency = _sample_file_page_cache_residency(packed_path)
-        if cache_residency is None or cache_residency < _PREPACKED_MIN_CACHE_RESIDENCY:
-            logger.info(
-                "Skipping cold DeepSeekV4 packed weights sidecar %s "
-                "(sampled page-cache residency %.1f%%; requires %.1f%%)",
-                packed_path,
-                0.0 if cache_residency is None else 100.0 * cache_residency,
-                100.0 * _PREPACKED_MIN_CACHE_RESIDENCY,
-            )
-            return None
+        # One descriptor for residency, validation and mapping. The sidecar is
+        # published with an atomic os.replace, so re-opening the name between
+        # those steps could validate one inode and then map another; /proc/self/fd
+        # keeps every step on the instance opened here. The mapping outlives the
+        # descriptor, so it is closed as soon as the tensors exist.
+        fd = os.open(packed_path, os.O_RDONLY)
         try:
-            from safetensors import safe_open
-        except ImportError as exc:
-            raise RuntimeError("safetensors is required to read DeepSeekV4 W8A8 weights.") from exc
-
-        expected_fingerprint = self.packed_stacked_layer_weights_fingerprint(
-            ranks=ranks,
-            n_routed_experts=n_routed_experts,
-            compress_ratios=compress_ratios,
-            num_hash_layers=num_hash_layers,
-        )
-        with safe_open(str(packed_path), framework="pt", device="cpu") as reader:
-            metadata = reader.metadata() or {}
-            if (
-                metadata.get("format") != DEEPSEEK_V4_PACKED_FORMAT
-                or metadata.get("source_fingerprint") != expected_fingerprint
-            ):
-                logger.warning(
-                    "Ignoring stale DeepSeekV4 packed weights sidecar: %s",
+            cache_residency = _sample_file_page_cache_residency(fd, packed_path)
+            if cache_residency is None or cache_residency < _PREPACKED_MIN_CACHE_RESIDENCY:
+                logger.info(
+                    "Skipping cold DeepSeekV4 packed weights sidecar %s "
+                    "(sampled page-cache residency %.1f%%; requires %.1f%%)",
                     packed_path,
+                    0.0 if cache_residency is None else 100.0 * cache_residency,
+                    100.0 * _PREPACKED_MIN_CACHE_RESIDENCY,
                 )
                 return None
-            names = frozenset(reader.keys())
-            if names != _DEEPSEEK_V4_PACKED_WEIGHT_NAMES:
-                missing = sorted(_DEEPSEEK_V4_PACKED_WEIGHT_NAMES - names)
-                extra = sorted(names - _DEEPSEEK_V4_PACKED_WEIGHT_NAMES)
-                logger.warning(
-                    "Ignoring DeepSeekV4 packed weights sidecar %s with invalid tensor names; "
-                    "missing=%s, extra=%s",
-                    packed_path,
-                    missing,
-                    extra,
-                )
-                return None
-        # Read the payload through our own shared mapping rather than the
-        # safetensors reader; see _map_shared_prepacked_tensors for why.
-        tensors = _map_shared_prepacked_tensors(packed_path, names)
+            try:
+                from safetensors import safe_open
+            except ImportError as exc:
+                raise RuntimeError("safetensors is required to read DeepSeekV4 W8A8 weights.") from exc
 
-        # Deliberately strict from here on, unlike the `return None` paths above: a
-        # missing, cold, stale or wrong-named sidecar is an expected miss that falls
-        # back to packing from the shards, but one whose format and fingerprint match
-        # while its payload does not describe [ranks, ...] tensors is corrupt (or was
-        # written by a buggy packer). Failing loudly beats silently taking the slow
-        # path and leaving the bad artifact in place for every later start.
-        for name, tensor in tensors.items():
-            if tensor.device.type != "cpu" or not tensor.is_contiguous():
-                raise ValueError(
-                    f"DeepSeekV4 packed weight {name} must be a contiguous CPU tensor, "
-                    f"got device={tensor.device} shape={tuple(tensor.shape)}"
-                )
-            if tensor.ndim < 2 or int(tensor.shape[0]) != int(ranks):
-                raise ValueError(
-                    f"DeepSeekV4 packed weight {name} must have leading rank dimension {ranks}, "
-                    f"got shape={tuple(tensor.shape)}"
-                )
-        logger.info("Mapped prepacked DeepSeekV4 layer weights from %s", packed_path)
-        return DeepSeekV4StackedLayerWeights(tensors=tensors)
+            expected_fingerprint = self.packed_stacked_layer_weights_fingerprint(
+                ranks=ranks,
+                n_routed_experts=n_routed_experts,
+                compress_ratios=compress_ratios,
+                num_hash_layers=num_hash_layers,
+            )
+            with safe_open(f"/proc/self/fd/{fd}", framework="pt", device="cpu") as reader:
+                metadata = reader.metadata() or {}
+                if (
+                    metadata.get("format") != DEEPSEEK_V4_PACKED_FORMAT
+                    or metadata.get("source_fingerprint") != expected_fingerprint
+                ):
+                    logger.warning(
+                        "Ignoring stale DeepSeekV4 packed weights sidecar: %s",
+                        packed_path,
+                    )
+                    return None
+                names = frozenset(reader.keys())
+                if names != _DEEPSEEK_V4_PACKED_WEIGHT_NAMES:
+                    missing = sorted(_DEEPSEEK_V4_PACKED_WEIGHT_NAMES - names)
+                    extra = sorted(names - _DEEPSEEK_V4_PACKED_WEIGHT_NAMES)
+                    logger.warning(
+                        "Ignoring DeepSeekV4 packed weights sidecar %s with invalid tensor names; "
+                        "missing=%s, extra=%s",
+                        packed_path,
+                        missing,
+                        extra,
+                    )
+                    return None
+            # Read the payload through our own shared mapping rather than the
+            # safetensors reader; see _map_shared_prepacked_tensors for why.
+            tensors = _map_shared_prepacked_tensors(fd, names)
+
+            # Deliberately strict from here on, unlike the `return None` paths above: a
+            # missing, cold, stale or wrong-named sidecar is an expected miss that falls
+            # back to packing from the shards, but one whose format and fingerprint match
+            # while its payload does not describe [ranks, ...] tensors is corrupt (or was
+            # written by a buggy packer). Failing loudly beats silently taking the slow
+            # path and leaving the bad artifact in place for every later start.
+            for name, tensor in tensors.items():
+                if tensor.device.type != "cpu" or not tensor.is_contiguous():
+                    raise ValueError(
+                        f"DeepSeekV4 packed weight {name} must be a contiguous CPU tensor, "
+                        f"got device={tensor.device} shape={tuple(tensor.shape)}"
+                    )
+                if tensor.ndim < 2 or int(tensor.shape[0]) != int(ranks):
+                    raise ValueError(
+                        f"DeepSeekV4 packed weight {name} must have leading rank dimension {ranks}, "
+                        f"got shape={tuple(tensor.shape)}"
+                    )
+            logger.info("Mapped prepacked DeepSeekV4 layer weights from %s", packed_path)
+            return DeepSeekV4StackedLayerWeights(tensors=tensors)
+        finally:
+            os.close(fd)
 
     def load_stacked_layer_weights(
         self,
