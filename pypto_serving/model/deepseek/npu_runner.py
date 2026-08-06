@@ -46,29 +46,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _kernel_trace_name(kernel_name: str) -> str:
-    """Map model-specific L3 callable names to stable profiling lanes."""
-    if "prefill" in kernel_name:
-        return "kernel.prefill_fwd"
-    if "decode" in kernel_name:
-        return "kernel.decode_fwd"
-    return f"kernel.{kernel_name}"
-
-
-def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
-    """Attach runtime host/device timings to a profiling event when available."""
-    if timing is None:
-        return
-    host_wall_us = getattr(timing, "host_wall_us", None)
-    device_wall_us = getattr(timing, "device_wall_us", None)
-    if host_wall_us is not None:
-        args["host_wall_us"] = float(host_wall_us)
-        args["host_wall_ms"] = float(host_wall_us) / 1000.0
-    if device_wall_us is not None:
-        args["device_wall_us"] = float(device_wall_us)
-        args["device_wall_ms"] = float(device_wall_us) / 1000.0
-
-
 DEEPSEEK_V4_RANKS = 8
 DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_VOCAB_SIZE = 129280
@@ -3807,32 +3784,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
         normed = collapsed * norm_inv * weights.final_norm_weight.double()
         return normed.to(torch.float32).to(torch.bfloat16).contiguous()
 
-    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
+    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> None:
         """Dispatch one DeepSeek L3 program and emit Qwen-compatible timing traces."""
         if self._l3_worker is None:
             self._assert_l3_args_shared_before_worker(callable_spec, args)
-        trace_name = _kernel_trace_name(callable_spec.name)
         span_args = {
-            "kernel": callable_spec.name,
             "block_dim": callable_spec.block_dim,
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
         }
-        with profile_span(trace_name, cat="kernel", level="kernel", args=span_args):
+        with profile_span(callable_spec.name, cat="kernel", level="kernel", args=span_args):
             worker = self._shared_l3_worker()
             uploaded: list[DeviceTensor] = []
             try:
                 l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
                 worker_run_args = dict(span_args)
                 with profile_span(
-                    f"{trace_name}.worker_run",
+                    f"{callable_spec.name}.worker_run",
                     cat="kernel",
                     level="kernel",
                     args=worker_run_args,
                 ):
-                    timing = worker.run(callable_spec.compiled, *l3_args)
-                    _add_run_timing_args(worker_run_args, timing)
-                _add_run_timing_args(span_args, timing)
-                return timing
+                    worker.run(callable_spec.compiled, *l3_args)
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
