@@ -1279,6 +1279,15 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_logit_row_indices: torch.Tensor
 
 
+@dataclass
+class _DeepSeekV4MtpPrefillDeviceOutputs:
+    """Worker-resident MTP prefill outputs shared across requests."""
+
+    hidden_out: StackedDeviceTensor
+    pre_hc_hidden_out: StackedDeviceTensor
+    logits: StackedDeviceTensor
+
+
 @dataclass(frozen=True)
 class _DeepSeekV4MtpPrefillContext:
     """Request-local inputs retained until the first sampled token is known."""
@@ -1426,6 +1435,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
         self._mtp_decode_inputs_initialized = False
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
+        self._mtp_prefill_device_outputs: _DeepSeekV4MtpPrefillDeviceOutputs | None = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
@@ -2731,6 +2741,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         kv_cache = self._materialize_mtp_device_kv_cache()
         if kv_cache is None:
             raise RuntimeError("DeepSeekV4 MTP KV cache is unavailable")
+        outputs = self._materialize_mtp_prefill_device_outputs(
+            int(buffers.prefill_hidden_in.shape[-1])
+        )
         values = dict(self._mtp_device_weights or buffers.weights)
         values.update(
             {
@@ -2744,9 +2757,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "position_ids": buffers.prefill_position_ids,
                 "input_ids": buffers.prefill_input_ids,
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": buffers.prefill_hidden_out,
-                "pre_hc_hidden_out": buffers.prefill_pre_hc_out,
-                "logits": buffers.prefill_logits,
+                "hidden_out": outputs.hidden_out,
+                "pre_hc_hidden_out": outputs.pre_hc_hidden_out,
+                "logits": outputs.logits,
                 "logit_row_indices": buffers.prefill_logit_row_indices,
             }
         )
@@ -2924,9 +2937,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         buffers.prefill_slot_mapping.fill_(-1)
         buffers.prefill_slot_mapping[owner_rank].copy_(context.slot_mapping)
-        buffers.prefill_hidden_out.zero_()
-        buffers.prefill_pre_hc_out.zero_()
-        buffers.prefill_logits.zero_()
         buffers.prefill_logit_row_indices.fill_(-1)
         buffers.prefill_logit_row_indices[owner_rank, 0] = n - 1
         with profile_span(
@@ -2939,7 +2949,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 *self._mtp_prefill_args(),
                 self._int32_scalar(n),
             )
-        state.draft_token_id = int(buffers.prefill_logits[owner_rank, 0].argmax().item())
+            with profile_span(
+                "DeepSeekV4ModelRunner.mtp.prefill.read_logits",
+                cat="executor",
+                args={"bytes": DEEPSEEK_V4_VOCAB_SIZE * torch.float32.itemsize},
+            ):
+                logits = self._read_mtp_prefill_logits(owner_rank)
+        state.draft_token_id = int(logits.argmax().item())
         state.tail_token_id = int(first_token[0].item())
         self._initialize_mtp_tail_slot(
             state,
@@ -4096,6 +4112,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._materialize_main_pre_hc_device(hidden_size)
             if self._compiled.enable_mtp:
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
+                self._materialize_mtp_prefill_device_outputs(hidden_size)
         if self._stacked_device_weights is None:
             host_weights = self._stacked_host_weights
             if not host_weights:
@@ -4256,6 +4273,72 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._mtp_tail_pre_hc_pool = stacked
         return stacked
 
+    def _materialize_mtp_prefill_device_outputs(
+        self,
+        hidden_size: int,
+    ) -> _DeepSeekV4MtpPrefillDeviceOutputs:
+        """Allocate uninitialized MTP prefill outputs before KV-cache sizing."""
+        outputs = self._mtp_prefill_device_outputs
+        if outputs is not None:
+            return outputs
+
+        layout = self._compiled.layout
+        allocated: list[StackedDeviceTensor] = []
+
+        def resident(shape: tuple[int, ...], dtype: torch.dtype) -> StackedDeviceTensor:
+            tensor = self._alloc_empty_stacked_tensor(shape, dtype)
+            allocated.append(tensor)
+            return tensor
+
+        try:
+            outputs = _DeepSeekV4MtpPrefillDeviceOutputs(
+                hidden_out=resident(
+                    (layout.ranks, layout.prefill_seq, int(hidden_size)),
+                    torch.bfloat16,
+                ),
+                pre_hc_hidden_out=resident(
+                    (
+                        layout.ranks,
+                        layout.prefill_seq,
+                        layout.hc_mult,
+                        int(hidden_size),
+                    ),
+                    torch.float32,
+                ),
+                logits=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_MAX_LOGIT_ROWS,
+                        DEEPSEEK_V4_VOCAB_SIZE,
+                    ),
+                    torch.float32,
+                ),
+            )
+        except Exception:
+            worker = self._shared_l3_worker()
+            for tensor in reversed(allocated):
+                worker.free_stacked_tensor(tensor)
+            raise
+        self._mtp_prefill_device_outputs = outputs
+        return outputs
+
+    def _read_mtp_prefill_logits(self, owner_rank: int) -> torch.Tensor:
+        """Read only the valid owner logits row needed for Host argmax."""
+        buffers = self._require_mtp_buffers()
+        outputs = self._materialize_mtp_prefill_device_outputs(
+            int(buffers.prefill_hidden_in.shape[-1])
+        )
+        host_row = buffers.prefill_logits[owner_rank, 0]
+        shard = outputs.logits.shards[owner_rank]
+        worker_id = outputs.logits.worker_ids[owner_rank]
+        self._shared_l3_worker().copy_from(
+            host_row.data_ptr(),
+            shard.data_ptr,
+            host_row.numel() * host_row.element_size(),
+            worker_id=worker_id,
+        )
+        return host_row
+
     def _materialize_decode_device_cache(self) -> DeepSeekV4DeviceCache:
         """Allocate dynamically sized cache shards directly on each NPU."""
         cache = self._decode_device_cache
@@ -4414,6 +4497,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._embedding_device_weight = None
             self._main_pre_hc_device = None
             self._mtp_tail_pre_hc_pool = None
+            self._mtp_prefill_device_outputs = None
 
     def close(self) -> None:
         worker = self._l3_worker
@@ -4429,6 +4513,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._main_pre_hc_device = None
             self._mtp_tail_pre_hc_pool = None
             self._mtp_device_weights = None
+            self._mtp_prefill_device_outputs = None
             self._mtp_buffers = None
             self._mtp_decode_inputs_initialized = False
             self._global_weights = None

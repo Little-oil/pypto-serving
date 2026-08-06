@@ -1679,6 +1679,187 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
 
 
+def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        prefill_seq=3,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.allocations = []
+
+        def alloc_tensor(self, shape, dtype, init=None, *, worker_id=0):
+            tensor = DeviceTensor(
+                0x1000 + len(self.allocations) * 0x100000,
+                tuple(shape),
+                dtype,
+            )
+            self.allocations.append((tuple(shape), dtype, init, worker_id))
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            pass
+
+    worker = FakeWorker()
+    runner._l3_worker = worker
+
+    first = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
+    second = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
+
+    assert second is first
+    assert first.hidden_out.full_shape == (2, 3, 5)
+    assert first.pre_hc_hidden_out.full_shape == (2, 3, 4, 5)
+    assert first.logits.full_shape == (2, 8, 129280)
+    assert all(shard.dtype == torch.bfloat16 for shard in first.hidden_out.shards)
+    assert all(shard.dtype == torch.float32 for shard in first.pre_hc_hidden_out.shards)
+    assert all(shard.dtype == torch.float32 for shard in first.logits.shards)
+    assert len(worker.allocations) == 6
+    assert all(init is None for _shape, _dtype, init, _worker_id in worker.allocations)
+    assert [worker_id for _shape, _dtype, _init, worker_id in worker.allocations] == [0, 1] * 3
+
+
+def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        prefill_seq=1,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.allocations = []
+            self.copies = []
+
+        def alloc_tensor(self, shape, dtype, init=None, *, worker_id=0):
+            tensor = DeviceTensor(
+                0x10000000 + len(self.allocations) * 0x1000000,
+                tuple(shape),
+                dtype,
+            )
+            self.allocations.append((tensor, init, worker_id))
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            pass
+
+        def copy_from(self, dst, src, nbytes, *, worker_id=0):
+            self.copies.append((dst, src, nbytes, worker_id))
+
+    worker = FakeWorker()
+    runner._l3_worker = worker
+    runner._mtp_buffers = SimpleNamespace(
+        prefill_hidden_in=torch.empty((layout.ranks, layout.prefill_seq, 5), dtype=torch.bfloat16),
+        prefill_logits=torch.empty(
+            (layout.ranks, 8, 129280),
+            dtype=torch.float32,
+        ).share_memory_(),
+    )
+    outputs = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
+
+    host_row = runner._read_mtp_prefill_logits(owner_rank=1)
+
+    assert host_row.data_ptr() == runner._mtp_buffers.prefill_logits[1, 0].data_ptr()
+    assert worker.copies == [
+        (
+            host_row.data_ptr(),
+            outputs.logits.shards[1].data_ptr,
+            129280 * torch.float32.itemsize,
+            1,
+        )
+    ]
+
+
+def test_deepseek_mtp_prefill_args_use_device_outputs():
+    layout = DeepSeekV4CacheLayout(
+        ranks=1,
+        prefill_seq=1,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.allocations = 0
+
+        def alloc_tensor(self, shape, dtype, init=None, *, worker_id=0):
+            tensor = DeviceTensor(0x1000 + self.allocations * 0x100000, tuple(shape), dtype)
+            self.allocations += 1
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            pass
+
+    runner._l3_worker = FakeWorker()
+    outputs = runner._materialize_mtp_prefill_device_outputs(hidden_size=1)
+    value = object()
+    runner._mtp_buffers = SimpleNamespace(
+        weights={},
+        prefill_hidden_in=torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        prefill_prev_hidden_in=value,
+        prefill_block_table=value,
+        prefill_slot_mapping=value,
+        prefill_position_ids=value,
+        prefill_input_ids=value,
+        prefill_logit_row_indices=value,
+    )
+    runner._mtp_device_weights = {}
+    runner._materialize_mtp_device_kv_cache = lambda: value
+    runner._static_freqs_cos_tensor = lambda: value
+    runner._static_freqs_sin_tensor = lambda: value
+    runner._static_lm_head_weight_tensor = lambda: value
+    runner._mark_resident_args = lambda values, _policy: values
+    runner._ordered_layer_args = lambda values, _order: values
+
+    named = runner._mtp_prefill_args()
+
+    assert named["hidden_out"] is outputs.hidden_out
+    assert named["pre_hc_hidden_out"] is outputs.pre_hc_hidden_out
+    assert named["logits"] is outputs.logits
+
+
 def test_deepseek_release_finished_requests_discards_mtp_state():
     runner, _model = _runner_for_prepared_inputs()
     runner._mtp_request_states = {
