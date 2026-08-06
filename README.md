@@ -19,6 +19,8 @@ platform/                      C++ platform-management layer (engine lifecycle, 
 examples/
   model/qwen3_14b/
     npu_generate.py            NPU generation/profiling example
+  model/deepseek_v4/
+    npu_generate.py            Eight-NPU offline generation example
 tests/                         host-side unit tests and CI NPU accuracy guards
 ```
 
@@ -66,6 +68,23 @@ python examples/model/qwen3_14b/npu_generate.py \
   --max-seq-len 512 \
   --max-new-tokens 5
 ```
+
+DeepSeek V4 Flash W8A8 offline generation reuses the serving scheduler and its
+grouped KV-cache implementation, but does not start an HTTP server:
+
+```bash
+python examples/model/deepseek_v4/npu_generate.py \
+  --model-dir /data/models/dsv4-flash-w8a8 \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --max-seq-len 512 \
+  --max-new-tokens 20
+```
+
+Add `--enable-mtp` for speculative decoding or `--num-prompts N` for offline
+continuous batching. DeepSeek V4 requires exactly eight devices with overlapped
+attention DP=8 and MoE EP=8.
 
 ## HTTP Serving (OpenAI-compatible API)
 

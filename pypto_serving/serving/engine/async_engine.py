@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
-from pypto_serving.config.types import RuntimeConfig
+from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
@@ -142,6 +142,10 @@ class TokenOutput:
     # OpenAI-style usage without re-tokenizing the prompt or counting deltas.
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Populated on the final output only. Keeping intermediate streaming
+    # outputs empty avoids copying the complete token history once per step,
+    # while offline callers can still build a structured GenerateResult.
+    token_ids: tuple[int, ...] = ()
 
 
 class ReplicaEngineCore:
@@ -809,6 +813,11 @@ class ReplicaEngineCore:
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
                 completion_tokens=len(ctx.request.output_token_ids),
+                token_ids=(
+                    tuple(ctx.request.output_token_ids)
+                    if req_output.finished
+                    else ()
+                ),
             )
             ctx.queue.put_nowait(token_output)
 
@@ -988,6 +997,61 @@ class AsyncLLMEngine:
     def pending_token_load(self) -> int:
         return sum(core.pending_token_load() for core in self._cores)
 
+    async def generate_result(
+        self,
+        prompt: str,
+        config: GenerateConfig | None = None,
+    ) -> GenerateResult:
+        """Generate one non-streaming result through the serving scheduler.
+
+        This is the offline counterpart to :meth:`add_request`. It deliberately
+        uses the same worker, scheduler, grouped-cache, and speculative-decode
+        paths as online serving, which is required by distributed model
+        integrations such as DeepSeek V4.
+        """
+        generate_config = config or GenerateConfig(stream=False)
+        if generate_config.stream:
+            raise ValueError("generate_result requires stream=False")
+
+        request_id = self.generate_request_id()
+        final_output: TokenOutput | None = None
+        async for output in self.add_request(request_id, prompt, generate_config):
+            if output.finished:
+                final_output = output
+
+        if final_output is None:
+            raise RuntimeError(f"Generation for request {request_id!r} ended without a final output")
+        if final_output.finish_reason == "error":
+            raise RuntimeError(f"Generation failed for request {request_id!r}")
+
+        return GenerateResult(
+            text=final_output.text,
+            token_ids=list(final_output.token_ids),
+            finish_reason=self.normalize_finish_reason(final_output.finish_reason),
+        )
+
+    async def generate_batch(
+        self,
+        prompts: Sequence[str],
+        config: GenerateConfig | None = None,
+    ) -> list[GenerateResult]:
+        """Generate non-streaming results for prompts with continuous batching."""
+        generate_config = config or GenerateConfig(stream=False)
+        if generate_config.stream:
+            raise ValueError("generate_batch requires stream=False")
+        tasks = [
+            asyncio.create_task(self.generate_result(prompt, generate_config))
+            for prompt in prompts
+        ]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     @property
     def scheduler(self) -> Scheduler:
         return self._single_core().scheduler
@@ -1071,3 +1135,13 @@ class AsyncLLMEngine:
     def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
         prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0
         return prompt_tokens + int(getattr(config, "max_new_tokens", 0))
+
+    @staticmethod
+    def normalize_finish_reason(reason: str) -> str:
+        """Map scheduler status names to the public GenerateResult values."""
+        return {
+            "FINISHED_EOS": "eos",
+            "FINISHED_LENGTH": "length",
+            "FINISHED_STOP": "stop",
+            "FINISHED_ABORTED": "aborted",
+        }.get(reason, reason.lower())
