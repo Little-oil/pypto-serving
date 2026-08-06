@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 import logging
-import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -45,29 +44,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _kernel_trace_name(kernel_name: str) -> str:
-    """Map model-specific L3 callable names to stable profiling lanes."""
-    if "prefill" in kernel_name:
-        return "kernel.prefill_fwd"
-    if "decode" in kernel_name:
-        return "kernel.decode_fwd"
-    return f"kernel.{kernel_name}"
-
-
-def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
-    """Attach runtime host/device timings to a profiling event when available."""
-    if timing is None:
-        return
-    host_wall_us = getattr(timing, "host_wall_us", None)
-    device_wall_us = getattr(timing, "device_wall_us", None)
-    if host_wall_us is not None:
-        args["host_wall_us"] = float(host_wall_us)
-        args["host_wall_ms"] = float(host_wall_us) / 1000.0
-    if device_wall_us is not None:
-        args["device_wall_us"] = float(device_wall_us)
-        args["device_wall_ms"] = float(device_wall_us) / 1000.0
 
 
 DEEPSEEK_V4_RANKS = 8
@@ -105,8 +81,6 @@ DEEPSEEK_V4_CSA_INNER_OUT_DIM = 256
 DEEPSEEK_V4_HCA_STATE_DIM = 2 * DEEPSEEK_V4_HCA_MAIN_OUT_DIM
 DEEPSEEK_V4_CSA_STATE_DIM = 2 * DEEPSEEK_V4_CSA_MAIN_OUT_DIM
 DEEPSEEK_V4_CSA_INNER_STATE_DIM = 2 * DEEPSEEK_V4_CSA_INNER_OUT_DIM
-DEEPSEEK_V4_RMS_NORM_EPS = 1e-6
-DEEPSEEK_V4_HC_EPS = 1e-6
 # Layer-stacking counts for the packed all-layer decode_fwd kernel.
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
@@ -2324,7 +2298,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             pre_hc_hidden_buffer.zero_()
             logits_buffer.zero_()
             args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
-        self._debug_prefill_dispatch(inputs, args)
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.prefill.l3_dispatch",
@@ -2343,9 +2316,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._prefill_completion(inputs, pre_hc_hidden_buffer)
 
         active_hidden = hidden_buffer[:, : max(inputs.actual_tokens), :]
-        self._debug_tensor_stats("prefill.output.hidden.active", active_hidden, per_rank=True)
-        if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
-            raise RuntimeError("DeepSeekV4 packed prefill produced non-finite active hidden rows")
 
         logits = torch.stack(
             tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
@@ -2411,7 +2381,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 decode_buffers.sampled_ids,
             )
             args = self._fused_mtp_decode_args(main_args, active_tokens)
-        self._debug_decode_dispatch(inputs, main_args)
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.l3_dispatch",
@@ -2528,7 +2497,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 logits_buffer,
                 sampled_ids_buffer,
             )
-        self._debug_decode_dispatch(inputs, args)
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.l3_dispatch",
@@ -2545,9 +2513,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
         active_hidden = hidden_buffer[:, :active_decode_tokens, :]
-        self._debug_tensor_stats("decode.output.hidden.active", active_hidden, per_rank=True)
-        if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
-            raise RuntimeError("DeepSeekV4 packed decode produced non-finite active hidden rows")
 
         return _DeepSeekV4MainDecodeOutput(
             inputs=inputs,
@@ -3248,151 +3213,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise KeyError(f"DeepSeekV4 layer dispatch is missing tensors: {', '.join(missing)}")
         return tuple(values[name] for name in names)
 
-    def _debug_prefill_dispatch(
-        self,
-        inputs: DeepSeekV4PreparedPrefillInputs,
-        args: Sequence[Any],
-    ) -> None:
-        if os.getenv("PYPTO_DSV4_DEBUG") != "1":
-            return
-        named_args = dict(zip(_PREFILL_FWD_TENSOR_ORDER, args, strict=True))
-        interesting = (
-            "x_hc",
-            "kv_cache",
-            "cmp_kv",
-            "idx_kv_cache",
-            "ori_block_table",
-            "cmp_block_table",
-            "idx_block_table",
-            "input_ids",
-            "hidden_out",
-            "logits",
-        )
-        tensor_names = [
-            name
-            for name, tensor in named_args.items()
-            if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
-        ]
-        non_shared = [name for name in tensor_names if not named_args[name].is_shared()]
-        parts = []
-        for name in interesting:
-            tensor = named_args[name]
-            if isinstance(tensor, torch.Tensor):
-                parts.append(f"{name}={tuple(tensor.shape)}/{tensor.dtype}/shared={tensor.is_shared()}")
-            elif isinstance(tensor, DeviceTensor):
-                parts.append(f"{name}=DeviceTensor")
-            else:
-                parts.append(f"{name}={type(tensor).__name__}")
-        print(
-            "DeepSeekV4 packed prefill dispatch "
-            f"tokens={inputs.actual_tokens} ranks={inputs.ranks} "
-            f"worker_started={self._l3_worker is not None} "
-            f"cpu_tensor_args={len(tensor_names)} non_shared={non_shared} "
-            + " ".join(parts),
-            flush=True,
-        )
-        if os.getenv("PYPTO_DSV4_DEBUG_ARGS") == "1":
-            for name in _PREFILL_FWD_TENSOR_ORDER:
-                tensor = named_args[name]
-                if isinstance(tensor, torch.Tensor):
-                    print(
-                        "DeepSeekV4 prefill arg "
-                        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-                        f"device={tensor.device} shared={tensor.is_shared()}",
-                        flush=True,
-                    )
-
-    def _debug_decode_dispatch(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        args: Sequence[Any],
-    ) -> None:
-        if os.getenv("PYPTO_DSV4_DEBUG") != "1":
-            return
-        named_args = dict(zip(_DECODE_FWD_TENSOR_ORDER, args, strict=True))
-        interesting = (
-            "x_hc",
-            "kv_cache",
-            "block_table",
-            "cmp_kv",
-            "cmp_block_table",
-            "idx_kv_cache",
-            "idx_block_table",
-            "block_counts",
-            "hca_compress_state",
-            "csa_compress_state",
-            "csa_inner_compress_state",
-            "position_ids",
-            "kv_seq_lens",
-            "input_ids",
-            "hidden_out",
-            "logits",
-        )
-        tensor_names = [
-            name
-            for name, tensor in named_args.items()
-            if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
-        ]
-        non_shared = [name for name in tensor_names if not named_args[name].is_shared()]
-        parts = []
-        for name in interesting:
-            tensor = named_args[name]
-            if isinstance(tensor, torch.Tensor):
-                parts.append(f"{name}={tuple(tensor.shape)}/{tensor.dtype}/shared={tensor.is_shared()}")
-            elif isinstance(tensor, DeviceTensor):
-                parts.append(f"{name}=DeviceTensor")
-            else:
-                parts.append(f"{name}={type(tensor).__name__}")
-        print(
-            "DeepSeekV4 packed decode dispatch "
-            f"actual_batch={inputs.actual_batch} "
-            f"active_tokens={max(inputs.per_rank_counts) * self._compiled.layout.decode_seq} "
-            f"ranks={inputs.ranks} "
-            f"worker_started={self._l3_worker is not None} "
-            f"cpu_tensor_args={len(tensor_names)} non_shared={non_shared} "
-            + " ".join(parts),
-            flush=True,
-        )
-        if os.getenv("PYPTO_DSV4_DEBUG_ARGS") == "1":
-            for name in _DECODE_FWD_TENSOR_ORDER:
-                tensor = named_args[name]
-                if isinstance(tensor, torch.Tensor):
-                    print(
-                        "DeepSeekV4 decode arg "
-                        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-                        f"device={tensor.device} shared={tensor.is_shared()}",
-                        flush=True,
-                    )
-                    self._debug_tensor_stats(f"dispatch.fwd.{name}", tensor)
-
-    @staticmethod
-    def _is_layer_weight_name(name: str) -> bool:
-        runtime_names = {
-            "x_hc",
-            "freqs_cos",
-            "freqs_sin",
-            "hca_compress_state_block_table",
-            "csa_compress_state_block_table",
-            "csa_inner_compress_state_block_table",
-            "kv_cache",
-            "ori_block_table",
-            "block_table",
-            "cmp_kv",
-            "cmp_block_table",
-            "idx_kv_cache",
-            "idx_kv_scale",
-            "idx_block_table",
-            "block_counts",
-            "position_ids",
-            "hca_compress_state",
-            "csa_compress_state",
-            "csa_inner_compress_state",
-            "kv_seq_lens",
-            "input_ids",
-            "x_next",
-        }
-        return name not in runtime_names
-
     def _ensure_decode_buffers(self, hidden_size: int) -> _DeepSeekV4DecodeSharedBuffers:
         buffers = self._decode_buffers
         if buffers is None:
@@ -3851,185 +3671,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
 
-    def _logits_for_hidden(
-        self,
-        x_hc: torch.Tensor,
-        *,
-        owner_rows: Sequence[tuple[int, int]] | None = None,
-        active_rows: Sequence[int] | None = None,
-        label: str = "unknown",
-    ) -> torch.Tensor:
-        global_weights = self.load_packed_global_weights()
-        if x_hc.ndim == 3:
-            # Decode output is already collapsed and final-normalized by
-            # ``l3_decode_fwd``; host LM-head consumes it directly.
-            hidden = x_hc
-        else:
-            hidden = self._final_hidden(x_hc)
-        if owner_rows is None:
-            owner_rows = tuple((0, int(row)) for row in (active_rows or ()))
-        owners = tuple((int(rank), int(row)) for rank, row in owner_rows)
-        if not owners:
-            raise ValueError("DeepSeekV4 LM-head requires at least one active row")
-        if any(rank < 0 or rank >= hidden.shape[0] for rank, _ in owners):
-            raise ValueError(
-                f"DeepSeekV4 LM-head owner ranks exceed hidden ranks={hidden.shape[0]}: {owners}"
-            )
-        if any(row < 0 or row >= hidden.shape[1] for _, row in owners):
-            raise ValueError(
-                f"DeepSeekV4 LM-head owner rows {owners} exceed hidden rows={hidden.shape[1]}"
-            )
-        if self._debug_tensor_stats_enabled():
-            print(f"DSV4_DEBUG lm_head.label={label} owner_rows={owners}", flush=True)
-
-        layout = global_weights.lm_head_layout
-        if global_weights.lm_head_weight.shape[0] != layout.ranks:
-            raise ValueError(
-                "DeepSeekV4 packed LM-head rank count mismatch: "
-                f"weight ranks={global_weights.lm_head_weight.shape[0]} layout ranks={layout.ranks}"
-            )
-        if global_weights.lm_head_weight.shape[1] < layout.vocab_per_rank:
-            raise ValueError(
-                "DeepSeekV4 packed LM-head shard is smaller than the real vocab shard: "
-                f"shape={tuple(global_weights.lm_head_weight.shape)} vocab_per_rank={layout.vocab_per_rank}"
-            )
-
-        selected = torch.stack(
-            [hidden[rank, row] for rank, row in owners],
-            dim=0,
-        ).detach().cpu().to(torch.float32).contiguous()
-        if self._debug_tensor_stats_enabled():
-            self._debug_tensor_stats("lm_head.hidden.active", selected)
-        logits_parts = []
-        for rank in range(layout.ranks):
-            shard = global_weights.lm_head_weight[rank, : layout.vocab_per_rank, :]
-            shard = shard.detach().cpu().to(torch.float32).contiguous()
-            logits_parts.append(torch.matmul(selected, shard.t()))
-        logits = torch.cat(logits_parts, dim=-1)
-        if logits.shape[-1] != layout.vocab_size:
-            logits = logits[:, : layout.vocab_size].contiguous()
-        else:
-            logits = logits.contiguous()
-        self._debug_tensor_stats("lm_head.logits.returned", logits)
-        return logits
-
-    @staticmethod
-    def _debug_tensor_stats_enabled() -> bool:
-        return os.getenv("PYPTO_DSV4_LOGIT_DEBUG") == "1"
-
-    @staticmethod
-    def _debug_tensor_stats(name: str, tensor: torch.Tensor, *, per_rank: bool = False) -> None:
-        if not DeepSeekV4ModelRunner._debug_tensor_stats_enabled():
-            return
-        data = tensor.detach().cpu().to(torch.float32)
-        finite = torch.isfinite(data)
-        finite_count = int(finite.sum().item())
-        total = data.numel()
-        nan_count = int(torch.isnan(data).sum().item())
-        pos_inf_count = int(torch.isposinf(data).sum().item())
-        neg_inf_count = int(torch.isneginf(data).sum().item())
-        if finite_count:
-            finite_values = data[finite]
-            min_value = float(finite_values.min().item())
-            max_value = float(finite_values.max().item())
-            absmax_value = float(finite_values.abs().max().item())
-        else:
-            min_value = float("nan")
-            max_value = float("nan")
-            absmax_value = float("nan")
-        print(
-            "DSV4_DEBUG "
-            f"{name} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-            f"finite={finite_count}/{total} nan={nan_count} "
-            f"+inf={pos_inf_count} -inf={neg_inf_count} "
-            f"min={min_value:.6g} max={max_value:.6g} absmax={absmax_value:.6g}",
-            flush=True,
-        )
-        if per_rank and data.ndim >= 1:
-            rank_view = data.reshape(data.shape[0], -1)
-            rank_finite = torch.isfinite(rank_view)
-            rank_counts = (rank_view.shape[1] - rank_finite.sum(dim=1)).tolist()
-            print(f"DSV4_DEBUG {name} nonfinite_by_rank={rank_counts}", flush=True)
-
-    @staticmethod
-    def _tensor_is_finite(tensor: torch.Tensor) -> bool:
-        return bool(torch.isfinite(tensor.detach().cpu().to(torch.float32)).all().item())
-
-    def _final_hidden(self, x_hc: torch.Tensor) -> torch.Tensor:
-        """Collapse a ``[ranks, T, HC_MULT, D]`` HC stack and apply the final norm."""
-        weights = self.load_packed_global_weights()
-        x_hc = x_hc.to(torch.bfloat16).cpu()
-        x_float = x_hc.float()
-        flat = x_float.flatten(2)
-        rms = torch.sqrt(flat.double().square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
-        normed_flat = flat / rms.to(torch.float32)
-        mixes = torch.matmul(normed_flat, weights.hc_head_fn.t())
-        pre = torch.sigmoid(mixes * weights.hc_head_scale + weights.hc_head_base) + DEEPSEEK_V4_HC_EPS
-        collapsed = torch.sum(pre.unsqueeze(-1).double() * x_float.double(), dim=2)
-        return self._final_norm(collapsed)
-
-    def _final_norm(self, collapsed: torch.Tensor) -> torch.Tensor:
-        """Apply the final RMS norm to an already-collapsed ``[ranks, T, D]`` hidden.
-
-        The packed ``l3_decode_fwd`` kernel collapses HC_MULT in-kernel via
-        ``hc_head`` and returns the collapsed (pre-final-norm) hidden, so decode
-        only needs the model's final RMS norm before the LM head.
-        """
-        collapsed = collapsed.cpu().double()
-        weights = self.load_packed_global_weights()
-        norm_inv = torch.rsqrt(collapsed.square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
-        normed = collapsed * norm_inv * weights.final_norm_weight.double()
-        return normed.to(torch.float32).to(torch.bfloat16).contiguous()
-
-    def _scope_stats_run_config(self) -> Any:
-        """Optional per-dispatch RunConfig that captures device scope stats.
-
-        Enabled with ``PYPTO_DSV4_SCOPE_STATS=1`` to dump per-scope
-        heap / task_window / tensormap peaks under ``<dir>/dfx_outputs/``.
-        """
-        if os.getenv("PYPTO_DSV4_SCOPE_STATS") != "1":
-            return None
-        from pypto.runtime import RunConfig  # noqa: PLC0415
-
-        out_dir = os.getenv("PYPTO_DSV4_SCOPE_STATS_DIR", "/data/liuxu/pypto-serving/dsv4_scope_stats")
-        return RunConfig(
-            platform=self._compiled.platform,
-            device_id=self._compiled.device_id,
-            enable_scope_stats=True,
-            save_kernels=True,
-            save_kernels_dir=out_dir,
-        )
-
-    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
+    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> None:
         """Dispatch one DeepSeek L3 program and emit Qwen-compatible timing traces."""
         if self._l3_worker is None:
             self._assert_l3_args_shared_before_worker(callable_spec, args)
-        trace_name = _kernel_trace_name(callable_spec.name)
         span_args = {
-            "kernel": callable_spec.name,
             "block_dim": callable_spec.block_dim,
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
         }
-        with profile_span(trace_name, cat="kernel", level="kernel", args=span_args):
+        with profile_span(callable_spec.name, cat="kernel", level="kernel", args=span_args):
             worker = self._shared_l3_worker()
-            run_config = self._scope_stats_run_config()
             uploaded: list[DeviceTensor] = []
             try:
                 l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
                 worker_run_args = dict(span_args)
                 with profile_span(
-                    f"{trace_name}.worker_run",
+                    f"{callable_spec.name}.worker_run",
                     cat="kernel",
                     level="kernel",
                     args=worker_run_args,
                 ):
-                    if run_config is not None:
-                        timing = worker.run(callable_spec.compiled, *l3_args, config=run_config)
-                    else:
-                        timing = worker.run(callable_spec.compiled, *l3_args)
-                    _add_run_timing_args(worker_run_args, timing)
-                _add_run_timing_args(span_args, timing)
-                return timing
+                    worker.run(callable_spec.compiled, *l3_args)
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
@@ -4202,18 +3864,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 parent_host_bytes,
             )
         worker.release_inherited_host_tensor_refs()
-
-    def _invalidate_resident_cache_tensors(self) -> None:
-        """Free resident KV/compressor state so the next request starts clean."""
-        worker = self._l3_worker
-        if worker is None:
-            self._l3_cache_tensor_keys.clear()
-            return
-        for key in tuple(self._l3_cache_tensor_keys):
-            tensor = self._l3_static_tensors.pop(key, None)
-            if tensor is not None:
-                worker.free_stacked_tensor(tensor)
-        self._l3_cache_tensor_keys.clear()
 
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
@@ -4550,25 +4200,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if not tensor.is_contiguous():
             raise ValueError("worker-resident tensor must be contiguous")
         return DeepSeekV4ModelRunner._share_cpu_tensor(tensor)
-
-    def _reset_l3_worker(self) -> None:
-        worker = self._l3_worker
-        if worker is None:
-            return
-        try:
-            worker.close()
-        finally:
-            self._l3_worker = None
-            self._l3_static_tensors.clear()
-            self._l3_cache_tensor_keys.clear()
-            self._decode_fwd_args_cache = None
-            self._mtp_decode_args_cache = None
-            self._fused_mtp_main_args = None
-            self._fused_mtp_args_cache.clear()
-            self._embedding_device_weight = None
-            self._main_pre_hc_device = None
-            self._mtp_tail_pre_hc_pool = None
-            self._mtp_prefill_device_outputs = None
 
     def close(self) -> None:
         worker = self._l3_worker

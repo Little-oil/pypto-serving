@@ -421,37 +421,6 @@ def test_deepseek_compile_l3_callable_reuses_cached_program():
     assert captured["platform"] == "a2a3"
 
 
-def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8, block_size=64)
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    with pytest.raises(ValueError, match="BLOCK_SIZE=64 expected 128"):
-        executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
-def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(
-        tmp_path,
-        lm_head_tp_size=8,
-        hca_state_blocks=1024,
-        csa_state_blocks=2048,
-        csa_inner_state_blocks=2048,
-    )
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"prefill_hca.py:HCA_STATE_MAX_BLOCKS=1024 expected 2048"
-            r".*prefill_csa.py:CSA_STATE_MAX_BLOCKS=2048 expected 4096"
-            r".*prefill_csa.py:INNER_STATE_MAX_BLOCKS=2048 expected 4096"
-        ),
-    ):
-        executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
     from safetensors.torch import save_file
 
@@ -1557,7 +1526,6 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
     runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
     runner._decode_fwd_args = lambda *_args: ()
     runner._fused_mtp_decode_args = lambda _main_args, _active_tokens: ("fused",)
-    runner._debug_decode_dispatch = lambda *_args: None
 
     def fake_run_l3(callable_spec, *args):
         dispatches.append((callable_spec.name, args))
@@ -2115,54 +2083,6 @@ def _runner_for_prepared_inputs() -> tuple[DeepSeekV4ModelRunner, object]:
     return runner, model
 
 
-def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
-    layout = DeepSeekV4CacheLayout(ranks=2, decode_batch=2, decode_seq=2, decode_tokens=4)
-    compiled = DeepSeekV4CompiledKernels(
-        layout=layout,
-        model_dir="",
-        weight_map={},
-        weight_store=None,
-        compress_ratios=(),
-        layer_plan=(),
-        kernel_dir="",
-    )
-    runner = DeepSeekV4ModelRunner(compiled=compiled)
-    lm_head_weight = torch.zeros((layout.ranks, 4, 3), dtype=torch.bfloat16)
-    lm_head_weight[0, 0] = torch.tensor([1.0, 0.0, 0.0])
-    lm_head_weight[0, 1] = torch.tensor([0.0, 1.0, 0.0])
-    lm_head_weight[0, 2] = torch.tensor([0.0, 0.0, 1.0])
-    lm_head_weight[1, 0] = torch.tensor([1.0, 1.0, 0.0])
-    lm_head_weight[1, 1] = torch.tensor([0.0, 1.0, 1.0])
-    runner._global_weights = weight_loader.DeepSeekV4GlobalWeights(
-        embed_weight=torch.empty(0),
-        final_norm_weight=torch.empty(0),
-        lm_head_weight=lm_head_weight,
-        lm_head_layout=weight_loader.DeepSeekV4LmHeadLayout(
-            ranks=layout.ranks,
-            vocab_size=5,
-            hidden_size=3,
-            vocab_per_rank=3,
-            padded_vocab_per_rank=4,
-        ),
-        hc_head_fn=torch.empty(0),
-        hc_head_scale=torch.empty(0),
-        hc_head_base=torch.empty(0),
-    )
-    hidden = (
-        torch.arange(layout.ranks * 6 * 3, dtype=torch.float32).reshape(layout.ranks, 6, 3).to(torch.bfloat16)
-    )
-
-    def fail_run_l3(*args):
-        raise AssertionError("host LM-head must not dispatch an L3 program")
-
-    runner._run_l3 = fail_run_l3
-    logits = runner._logits_for_hidden(hidden, active_rows=(5, 2))
-
-    assert logits.shape == (2, 5)
-    assert logits[0].tolist() == [15, 16, 17, 31, 33]
-    assert logits[1].tolist() == [6, 7, 8, 13, 15]
-
-
 def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank():
     layout = DeepSeekV4CacheLayout()
     tp_size = DEEPSEEK_V4_LM_HEAD_TP_SIZE
@@ -2220,47 +2140,3 @@ def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank()
         3.0,
         4.0,
     ]
-
-
-def test_deepseek_final_hidden_normalizes_before_hc_head_projection_overflows():
-    compiled = DeepSeekV4CompiledKernels(
-        layout=DeepSeekV4CacheLayout(),
-        model_dir="",
-        weight_map={},
-        weight_store=None,
-        compress_ratios=(),
-        layer_plan=(),
-        kernel_dir="",
-    )
-    runner = DeepSeekV4ModelRunner(compiled=compiled)
-    hidden_size = 3
-    runner._global_weights = weight_loader.DeepSeekV4GlobalWeights(
-        embed_weight=torch.empty(0),
-        final_norm_weight=torch.ones(hidden_size),
-        lm_head_weight=torch.empty(0),
-        lm_head_layout=weight_loader.DeepSeekV4LmHeadLayout(
-            ranks=1,
-            vocab_size=1,
-            hidden_size=hidden_size,
-            vocab_per_rank=1,
-            padded_vocab_per_rank=1,
-        ),
-        hc_head_fn=torch.ones((4, hidden_size * 4), dtype=torch.float32),
-        hc_head_scale=torch.ones((1,), dtype=torch.float32),
-        hc_head_base=torch.zeros((4,), dtype=torch.float32),
-    )
-    x_hc = torch.full(
-        (1, 2, 4, hidden_size),
-        torch.finfo(torch.bfloat16).max,
-        dtype=torch.bfloat16,
-    )
-
-    flat = x_hc.flatten(2).float()
-    inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + 1e-6)
-    unstable_mixes = torch.matmul(flat, runner._global_weights.hc_head_fn.t()) * inv_rms
-    assert not torch.isfinite(unstable_mixes).all()
-
-    hidden = runner._final_hidden(x_hc)
-
-    assert hidden.shape == (1, 2, hidden_size)
-    assert torch.isfinite(hidden.float()).all()

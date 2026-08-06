@@ -39,36 +39,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _kernel_trace_name(kernel_name: str) -> str:
-    if "prefill" in kernel_name:
-        return "kernel.prefill_fwd"
-    if "decode" in kernel_name:
-        return "kernel.decode_fwd"
-    return f"kernel.{kernel_name}"
-
-
-def _run_timing_us(timing: Any) -> tuple[float | None, float | None]:
-    if timing is None:
-        return None, None
-    host_wall_us = getattr(timing, "host_wall_us", None)
-    device_wall_us = getattr(timing, "device_wall_us", None)
-    if host_wall_us is not None:
-        host_wall_us = float(host_wall_us)
-    if device_wall_us is not None:
-        device_wall_us = float(device_wall_us)
-    return host_wall_us, device_wall_us
-
-
-def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
-    host_wall_us, device_wall_us = _run_timing_us(timing)
-    if host_wall_us is not None:
-        args["host_wall_us"] = host_wall_us
-        args["host_wall_ms"] = host_wall_us / 1000.0
-    if device_wall_us is not None:
-        args["device_wall_us"] = device_wall_us
-        args["device_wall_ms"] = device_wall_us / 1000.0
-
-
 @dataclass
 class _L3Callable:
     """HOST-dispatched compiled program and launch metadata."""
@@ -859,14 +829,14 @@ class Qwen314BModelRunner(ModelRunner):
             next_hidden_arg,
         )
 
-    def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
+    def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> None:
         """Run a compiled HOST wrapper through the shared PyPTO L3 worker."""
         span_args = {
             "kernel": callable_spec.name,
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
         }
         with profile_span(
-            _kernel_trace_name(callable_spec.name),
+            callable_spec.name,
             cat="kernel",
             level="kernel",
             args=span_args,
@@ -875,15 +845,12 @@ class Qwen314BModelRunner(ModelRunner):
             l3_args = callable_spec.dispatch_args + tuple(self._coerce_l3_arg(worker, arg) for arg in args)
             worker_run_args = dict(span_args)
             with profile_span(
-                f"{_kernel_trace_name(callable_spec.name)}.worker_run",
+                f"{callable_spec.name}.worker_run",
                 cat="kernel",
                 level="kernel",
                 args=worker_run_args,
             ):
-                timing = worker.run(callable_spec.compiled, *l3_args)
-                _add_run_timing_args(worker_run_args, timing)
-            _add_run_timing_args(span_args, timing)
-            return timing
+                worker.run(callable_spec.compiled, *l3_args)
 
     def _store_kernel_binaries(self) -> None:
         """Persist each kernel's build dir into the kernel cache.
