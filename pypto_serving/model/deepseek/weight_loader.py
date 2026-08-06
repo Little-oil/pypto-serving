@@ -15,11 +15,14 @@ import json
 import logging
 import mmap
 import os
+import struct
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ContextManager, Protocol
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -111,6 +114,68 @@ DEEPSEEK_V4_PACKED_FORMAT = "pypto-deepseek-v4-stacked-v1"
 _PREPACKED_CACHE_SAMPLE_WINDOWS = 64
 _PREPACKED_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
 _PREPACKED_MIN_CACHE_RESIDENCY = 0.95
+
+
+_PACKED_NP_DTYPE = {
+    "F32": np.float32,
+    "I32": np.int32,
+    "I8": np.int8,
+    "U8": np.uint8,
+    # No numpy dtype matches these, so they are read as same-width integers and
+    # reinterpreted with torch.Tensor.view below.
+    "BF16": np.int16,
+    "F16": np.int16,
+}
+_PACKED_VIEW_DTYPE = {"BF16": torch.bfloat16, "F16": torch.float16}
+
+
+def _map_shared_prepacked_tensors(path: Path, names: Iterable[str]) -> dict[str, torch.Tensor]:
+    """Map the prepacked sidecar shared/read-only and return zero-copy tensors.
+
+    ``safetensors`` has to hand PyTorch a *writable* buffer, so it maps the file
+    ``MAP_PRIVATE`` (``rw-p``) — copy-on-write. The resident upload then reads
+    those pages from the forked chip children, and the driver must break the
+    copy-on-write of every page it pins for the H2D DMA: measured at 0.6 GB/s
+    against 7.3 GB/s for the same bytes behind a shared mapping, which made the
+    upload 90% of a warm start. A read-only shared mapping has no copy-on-write
+    to break, and the file is opened ``O_RDONLY`` so it still cannot be written
+    through. The returned tensors keep the mapping alive through the numpy base
+    chain, so the caller does not have to hold it.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        header_len = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+        header = json.loads(os.pread(fd, header_len, 8))
+        mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)  # MAP_SHARED | PROT_READ
+    finally:
+        os.close(fd)
+
+    data_start = 8 + header_len
+    tensors: dict[str, torch.Tensor] = {}
+    for name in names:
+        spec = header[name]
+        dtype = spec["dtype"]
+        if dtype not in _PACKED_NP_DTYPE:
+            raise ValueError(f"DeepSeekV4 packed weight {name} has unsupported dtype {dtype}")
+        shape = tuple(int(dim) for dim in spec["shape"])
+        count = 1
+        for dim in shape:
+            count *= dim
+        begin, end = spec["data_offsets"]
+        array = np.frombuffer(mapping, dtype=_PACKED_NP_DTYPE[dtype], count=count, offset=data_start + begin)
+        if array.nbytes != end - begin:
+            raise ValueError(
+                f"DeepSeekV4 packed weight {name} declares {end - begin} bytes but {dtype}{shape} needs "
+                f"{array.nbytes}"
+            )
+        with warnings.catch_warnings():
+            # The mapping is read-only on purpose, so the tensor is non-writable.
+            warnings.simplefilter("ignore")
+            tensor = torch.from_numpy(array)
+        if dtype in _PACKED_VIEW_DTYPE:
+            tensor = tensor.view(_PACKED_VIEW_DTYPE[dtype])
+        tensors[name] = tensor.reshape(shape)
+    return tensors
 
 
 def _default_safe_open(path: Path, device: str) -> ContextManager[_SafeTensorReader]:
@@ -846,8 +911,16 @@ class DeepSeekV4WeightStore:
                     extra,
                 )
                 return None
-            tensors = {name: reader.get_tensor(name) for name in names}
+        # Read the payload through our own shared mapping rather than the
+        # safetensors reader; see _map_shared_prepacked_tensors for why.
+        tensors = _map_shared_prepacked_tensors(packed_path, names)
 
+        # Deliberately strict from here on, unlike the `return None` paths above: a
+        # missing, cold, stale or wrong-named sidecar is an expected miss that falls
+        # back to packing from the shards, but one whose format and fingerprint match
+        # while its payload does not describe [ranks, ...] tensors is corrupt (or was
+        # written by a buggy packer). Failing loudly beats silently taking the slow
+        # path and leaving the bad artifact in place for every later start.
         for name, tensor in tensors.items():
             if tensor.device.type != "cpu" or not tensor.is_contiguous():
                 raise ValueError(
