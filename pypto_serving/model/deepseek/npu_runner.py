@@ -81,8 +81,6 @@ DEEPSEEK_V4_CSA_INNER_OUT_DIM = 256
 DEEPSEEK_V4_HCA_STATE_DIM = 2 * DEEPSEEK_V4_HCA_MAIN_OUT_DIM
 DEEPSEEK_V4_CSA_STATE_DIM = 2 * DEEPSEEK_V4_CSA_MAIN_OUT_DIM
 DEEPSEEK_V4_CSA_INNER_STATE_DIM = 2 * DEEPSEEK_V4_CSA_INNER_OUT_DIM
-DEEPSEEK_V4_RMS_NORM_EPS = 1e-6
-DEEPSEEK_V4_HC_EPS = 1e-6
 # Layer-stacking counts for the packed all-layer decode_fwd kernel.
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
@@ -3215,34 +3213,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise KeyError(f"DeepSeekV4 layer dispatch is missing tensors: {', '.join(missing)}")
         return tuple(values[name] for name in names)
 
-    @staticmethod
-    def _is_layer_weight_name(name: str) -> bool:
-        runtime_names = {
-            "x_hc",
-            "freqs_cos",
-            "freqs_sin",
-            "hca_compress_state_block_table",
-            "csa_compress_state_block_table",
-            "csa_inner_compress_state_block_table",
-            "kv_cache",
-            "ori_block_table",
-            "block_table",
-            "cmp_kv",
-            "cmp_block_table",
-            "idx_kv_cache",
-            "idx_kv_scale",
-            "idx_block_table",
-            "block_counts",
-            "position_ids",
-            "hca_compress_state",
-            "csa_compress_state",
-            "csa_inner_compress_state",
-            "kv_seq_lens",
-            "input_ids",
-            "x_next",
-        }
-        return name not in runtime_names
-
     def _ensure_decode_buffers(self, hidden_size: int) -> _DeepSeekV4DecodeSharedBuffers:
         buffers = self._decode_buffers
         if buffers is None:
@@ -3701,89 +3671,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
 
-    def _logits_for_hidden(
-        self,
-        x_hc: torch.Tensor,
-        *,
-        owner_rows: Sequence[tuple[int, int]] | None = None,
-        active_rows: Sequence[int] | None = None,
-        label: str = "unknown",
-    ) -> torch.Tensor:
-        global_weights = self.load_packed_global_weights()
-        if x_hc.ndim == 3:
-            # Decode output is already collapsed and final-normalized by
-            # ``l3_decode_fwd``; host LM-head consumes it directly.
-            hidden = x_hc
-        else:
-            hidden = self._final_hidden(x_hc)
-        if owner_rows is None:
-            owner_rows = tuple((0, int(row)) for row in (active_rows or ()))
-        owners = tuple((int(rank), int(row)) for rank, row in owner_rows)
-        if not owners:
-            raise ValueError("DeepSeekV4 LM-head requires at least one active row")
-        if any(rank < 0 or rank >= hidden.shape[0] for rank, _ in owners):
-            raise ValueError(
-                f"DeepSeekV4 LM-head owner ranks exceed hidden ranks={hidden.shape[0]}: {owners}"
-            )
-        if any(row < 0 or row >= hidden.shape[1] for _, row in owners):
-            raise ValueError(
-                f"DeepSeekV4 LM-head owner rows {owners} exceed hidden rows={hidden.shape[1]}"
-            )
-
-        layout = global_weights.lm_head_layout
-        if global_weights.lm_head_weight.shape[0] != layout.ranks:
-            raise ValueError(
-                "DeepSeekV4 packed LM-head rank count mismatch: "
-                f"weight ranks={global_weights.lm_head_weight.shape[0]} layout ranks={layout.ranks}"
-            )
-        if global_weights.lm_head_weight.shape[1] < layout.vocab_per_rank:
-            raise ValueError(
-                "DeepSeekV4 packed LM-head shard is smaller than the real vocab shard: "
-                f"shape={tuple(global_weights.lm_head_weight.shape)} vocab_per_rank={layout.vocab_per_rank}"
-            )
-
-        selected = torch.stack(
-            [hidden[rank, row] for rank, row in owners],
-            dim=0,
-        ).detach().cpu().to(torch.float32).contiguous()
-        logits_parts = []
-        for rank in range(layout.ranks):
-            shard = global_weights.lm_head_weight[rank, : layout.vocab_per_rank, :]
-            shard = shard.detach().cpu().to(torch.float32).contiguous()
-            logits_parts.append(torch.matmul(selected, shard.t()))
-        logits = torch.cat(logits_parts, dim=-1)
-        if logits.shape[-1] != layout.vocab_size:
-            logits = logits[:, : layout.vocab_size].contiguous()
-        else:
-            logits = logits.contiguous()
-        return logits
-
-    def _final_hidden(self, x_hc: torch.Tensor) -> torch.Tensor:
-        """Collapse a ``[ranks, T, HC_MULT, D]`` HC stack and apply the final norm."""
-        weights = self.load_packed_global_weights()
-        x_hc = x_hc.to(torch.bfloat16).cpu()
-        x_float = x_hc.float()
-        flat = x_float.flatten(2)
-        rms = torch.sqrt(flat.double().square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
-        normed_flat = flat / rms.to(torch.float32)
-        mixes = torch.matmul(normed_flat, weights.hc_head_fn.t())
-        pre = torch.sigmoid(mixes * weights.hc_head_scale + weights.hc_head_base) + DEEPSEEK_V4_HC_EPS
-        collapsed = torch.sum(pre.unsqueeze(-1).double() * x_float.double(), dim=2)
-        return self._final_norm(collapsed)
-
-    def _final_norm(self, collapsed: torch.Tensor) -> torch.Tensor:
-        """Apply the final RMS norm to an already-collapsed ``[ranks, T, D]`` hidden.
-
-        The packed ``l3_decode_fwd`` kernel collapses HC_MULT in-kernel via
-        ``hc_head`` and returns the collapsed (pre-final-norm) hidden, so decode
-        only needs the model's final RMS norm before the LM head.
-        """
-        collapsed = collapsed.cpu().double()
-        weights = self.load_packed_global_weights()
-        norm_inv = torch.rsqrt(collapsed.square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
-        normed = collapsed * norm_inv * weights.final_norm_weight.double()
-        return normed.to(torch.float32).to(torch.bfloat16).contiguous()
-
     def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> None:
         """Dispatch one DeepSeek L3 program and emit Qwen-compatible timing traces."""
         if self._l3_worker is None:
@@ -3977,18 +3864,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 parent_host_bytes,
             )
         worker.release_inherited_host_tensor_refs()
-
-    def _invalidate_resident_cache_tensors(self) -> None:
-        """Free resident KV/compressor state so the next request starts clean."""
-        worker = self._l3_worker
-        if worker is None:
-            self._l3_cache_tensor_keys.clear()
-            return
-        for key in tuple(self._l3_cache_tensor_keys):
-            tensor = self._l3_static_tensors.pop(key, None)
-            if tensor is not None:
-                worker.free_stacked_tensor(tensor)
-        self._l3_cache_tensor_keys.clear()
 
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
@@ -4325,25 +4200,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if not tensor.is_contiguous():
             raise ValueError("worker-resident tensor must be contiguous")
         return DeepSeekV4ModelRunner._share_cpu_tensor(tensor)
-
-    def _reset_l3_worker(self) -> None:
-        worker = self._l3_worker
-        if worker is None:
-            return
-        try:
-            worker.close()
-        finally:
-            self._l3_worker = None
-            self._l3_static_tensors.clear()
-            self._l3_cache_tensor_keys.clear()
-            self._decode_fwd_args_cache = None
-            self._mtp_decode_args_cache = None
-            self._fused_mtp_main_args = None
-            self._fused_mtp_args_cache.clear()
-            self._embedding_device_weight = None
-            self._main_pre_hc_device = None
-            self._mtp_tail_pre_hc_pool = None
-            self._mtp_prefill_device_outputs = None
 
     def close(self) -> None:
         worker = self._l3_worker
