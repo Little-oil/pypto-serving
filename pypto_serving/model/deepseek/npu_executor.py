@@ -9,13 +9,10 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import ctypes
 import importlib
-import importlib.util
 import inspect
-import operator
 import os
 import sys
 from collections.abc import Iterable, Sequence
@@ -46,12 +43,6 @@ from pypto_serving.model.deepseek.weight_loader import (
 )
 from pypto_serving.tools.profile import profile_span
 
-_AST_INT_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.FloorDiv: operator.floordiv,
-}
 _PYPTO_TORCH_DTYPES = {
     "bfloat16": torch.bfloat16,
     "bool": torch.bool,
@@ -128,58 +119,6 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
         "Cannot locate DeepSeekV4 kernels. Run from a checkout with pypto-lib available "
         "or set PYPTO_ROOT to a pypto-lib checkout."
     )
-
-
-def _int_constant_from_file(path: Path, name: str) -> int | None:
-    """Read a simple integer module constant without importing kernel code."""
-    tree = ast.parse(path.read_text(), filename=str(path))
-    assignments = {
-        target.id: node.value
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    config_assignments = None
-
-    def _eval_int(node: ast.AST) -> int | None:
-        nonlocal config_assignments
-        if isinstance(node, ast.Constant) and isinstance(node.value, int):
-            return int(node.value)
-        if isinstance(node, ast.Name):
-            if node.id in assignments:
-                return _eval_int(assignments[node.id])
-            if config_assignments is None:
-                config_path = path.parent / "config.py"
-                if config_path == path or not config_path.exists():
-                    config_assignments = {}
-                else:
-                    config_tree = ast.parse(config_path.read_text(), filename=str(config_path))
-                    config_assignments = {
-                        target.id: cfg_node.value
-                        for cfg_node in config_tree.body
-                        if isinstance(cfg_node, ast.Assign)
-                        for target in cfg_node.targets
-                        if isinstance(target, ast.Name)
-                    }
-            config_node = config_assignments.get(node.id)
-            return _eval_int(config_node) if config_node is not None else None
-        if isinstance(node, ast.BinOp):
-            left = _eval_int(node.left)
-            right = _eval_int(node.right)
-            op = _AST_INT_OPERATORS.get(type(node.op))
-            if left is None or right is None or op is None:
-                return None
-            return int(op(left, right))
-        return None
-
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
-            continue
-        return _eval_int(node.value)
-    return None
 
 
 def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
@@ -303,7 +242,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         pypto_root: str | None = None,
         compile_kernels: bool = False,
         enable_mtp: bool = False,
-        l3_trace: bool = False,
         kernel_cache_dir: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
@@ -319,18 +257,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # Keep production serving opt-in because older checkpoints may not carry
         # MTP weights. The CLI passes this model-specific feature flag explicitly.
         self._enable_mtp = bool(enable_mtp)
-        self._l3_trace = l3_trace
         self._embedding_cache: dict[str, torch.Tensor] = {}
         self._kernel_cache = (
             KernelCache(kernel_cache_dir, compute_code_fingerprint(pypto_root))
             if kernel_cache_dir
             else None
         )
-
-    @property
-    def profile_verbose(self) -> bool:
-        """Return whether compile and L3 execution timing logs are enabled."""
-        return self._l3_trace
 
     @property
     def max_prefill_batch_size(self) -> int:
@@ -412,7 +344,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             decode_tokens=8,
         )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
-        self._validate_kernel_contract(layout)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) != model.config.num_hidden_layers + 1:
             raise ValueError("DeepSeekV4 compress_ratios must include hidden layers plus MTP/final entry")
@@ -635,64 +566,3 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             dtype=torch.bfloat16,
         )
         return freqs_cos.contiguous().cpu(), freqs_sin.contiguous().cpu()
-
-    def _validate_kernel_contract(self, layout: DeepSeekV4CacheLayout) -> None:
-        """Fail fast when the checked-out pypto-lib kernels do not match serving topology."""
-        required_modules = (
-            "config.py",
-            "prefill_hca.py",
-            "prefill_csa.py",
-            "prefill_layer.py",
-            "prefill_fwd.py",
-            "prefill_mtp.py",
-            "lm_head.py",
-            "decode_layer.py",
-            "decode_fwd.py",
-            "decode_mtp.py",
-        )
-        missing = [name for name in required_modules if not (self._kernel_dir / name).is_file()]
-        if missing:
-            raise FileNotFoundError(
-                "DeepSeekV4 kernel directory is missing required modules: " + ", ".join(missing)
-            )
-
-        config_path = self._kernel_dir / "config.py"
-        expected_config = {
-            "BLOCK_SIZE": layout.block_size,
-            # B/S are serving-selected specializations (B8/S1 for normal
-            # decode, B4/S2 for MTP) and are overridden before module import.
-            # The checked-in source must retain the common eight-token tile.
-            "DECODE_TOKENS": layout.decode_tokens,
-            "PREFILL_BATCH": layout.prefill_batch,
-            "PREFILL_SEQ": layout.prefill_seq,
-            "KV_ORI_MAX_BLOCKS": layout.decode_ori_max_blocks,
-            "KV_ORI_TABLE_MAX_BLOCKS": layout.ori_table_max_blocks,
-            "KV_CMP_MAX_BLOCKS": layout.cmp_max_blocks,
-            "IDX_CACHE_MAX_BLOCKS": layout.idx_max_blocks,
-            "PREFILL_ORI_MAX_BLOCKS": layout.prefill_ori_max_blocks,
-            "PREFILL_CMP_MAX_BLOCKS": layout.prefill_cmp_max_blocks,
-            "PREFILL_IDX_MAX_BLOCKS": layout.prefill_idx_max_blocks,
-            "EP_WORLD_SIZE": layout.ranks,
-        }
-        mismatched = []
-        for name, expected in expected_config.items():
-            actual = _int_constant_from_file(config_path, name)
-            if actual is not None and actual != expected:
-                mismatched.append(f"{name}={actual} expected {expected}")
-        expected_module_constants = {
-            "prefill_hca.py": {
-                "HCA_STATE_MAX_BLOCKS": layout.prefill_hca_state_max_blocks,
-            },
-            "prefill_csa.py": {
-                "CSA_STATE_MAX_BLOCKS": layout.prefill_csa_state_max_blocks,
-                "INNER_STATE_MAX_BLOCKS": layout.prefill_csa_inner_state_max_blocks,
-            },
-        }
-        for filename, expected_constants in expected_module_constants.items():
-            module_path = self._kernel_dir / filename
-            for name, expected in expected_constants.items():
-                actual = _int_constant_from_file(module_path, name)
-                if actual is not None and actual != expected:
-                    mismatched.append(f"{filename}:{name}={actual} expected {expected}")
-        if mismatched:
-            raise ValueError("DeepSeekV4 kernel config does not match serving layout: " + ", ".join(mismatched))

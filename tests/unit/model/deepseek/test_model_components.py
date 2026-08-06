@@ -421,37 +421,6 @@ def test_deepseek_compile_l3_callable_reuses_cached_program():
     assert captured["platform"] == "a2a3"
 
 
-def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8, block_size=64)
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    with pytest.raises(ValueError, match="BLOCK_SIZE=64 expected 128"):
-        executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
-def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(
-        tmp_path,
-        lm_head_tp_size=8,
-        hca_state_blocks=1024,
-        csa_state_blocks=2048,
-        csa_inner_state_blocks=2048,
-    )
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"prefill_hca.py:HCA_STATE_MAX_BLOCKS=1024 expected 2048"
-            r".*prefill_csa.py:CSA_STATE_MAX_BLOCKS=2048 expected 4096"
-            r".*prefill_csa.py:INNER_STATE_MAX_BLOCKS=2048 expected 4096"
-        ),
-    ):
-        executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
     from safetensors.torch import save_file
 
