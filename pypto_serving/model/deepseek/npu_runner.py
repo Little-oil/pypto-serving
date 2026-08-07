@@ -1262,6 +1262,17 @@ class _DeepSeekV4MtpPrefillDeviceOutputs:
     logits: StackedDeviceTensor
 
 
+@dataclass
+class _DeepSeekV4FusedMtpDecodeDeviceOutputs:
+    """Pure outputs kept on-device across fused MTP decode steps."""
+
+    main_hidden_out: StackedDeviceTensor
+    main_logits: StackedDeviceTensor
+    mtp_hidden_out: StackedDeviceTensor
+    mtp_next_pre_hc_hidden: StackedDeviceTensor
+    mtp_logits: StackedDeviceTensor
+
+
 @dataclass(frozen=True)
 class _DeepSeekV4MtpPrefillContext:
     """Request-local inputs retained until the first sampled token is known."""
@@ -1420,6 +1431,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_decode_inputs_initialized = False
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
         self._mtp_prefill_device_outputs: _DeepSeekV4MtpPrefillDeviceOutputs | None = None
+        self._fused_mtp_decode_device_outputs: (
+            _DeepSeekV4FusedMtpDecodeDeviceOutputs | None
+        ) = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
@@ -2365,9 +2379,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         layout = self._compiled.layout
         decode_buffers = self._require_decode_buffers()
         mtp_buffers = self._require_mtp_buffers()
-        hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
+        device_outputs = self._materialize_fused_mtp_decode_device_outputs(
+            model.config.hidden_size
+        )
+        hidden_buffer = device_outputs.main_hidden_out
         pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
-        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
+        logits_buffer = device_outputs.main_logits
         with profile_span(
             "DeepSeekV4ModelRunner.decode.prepare_fwd_args",
             cat="executor",
@@ -2685,8 +2702,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         inputs: DeepSeekV4PreparedDecodeInputs,
         pre_hc_hidden_out: StackedDeviceTensor,
-        hidden_out: torch.Tensor,
-        logits: torch.Tensor,
+        hidden_out: torch.Tensor | StackedDeviceTensor,
+        logits: torch.Tensor | StackedDeviceTensor,
         sampled_ids: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
@@ -2785,6 +2802,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if cached is not None:
             return cached
         buffers = self._require_mtp_buffers()
+        hidden_size = int(self.load_packed_global_weights().embed_weight.shape[1])
+        outputs = self._materialize_fused_mtp_decode_device_outputs(hidden_size)
         kv_cache = self._materialize_mtp_device_kv_cache()
         if kv_cache is None:
             raise RuntimeError("DeepSeekV4 MTP KV cache is unavailable")
@@ -2792,12 +2811,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         values.update(
             {
                 "embed_weight": self._materialize_embedding_device_weight(),
-                "main_pre_hc_hidden": self._materialize_main_pre_hc_device(
-                    int(self.load_packed_global_weights().embed_weight.shape[1])
-                ),
-                "tail_pre_hc_pool": self._materialize_mtp_tail_pre_hc_pool(
-                    int(self.load_packed_global_weights().embed_weight.shape[1])
-                ),
+                "main_pre_hc_hidden": self._materialize_main_pre_hc_device(hidden_size),
+                "tail_pre_hc_pool": self._materialize_mtp_tail_pre_hc_pool(hidden_size),
                 "accepted_counts": buffers.decode_accepted_counts,
                 "tail_slot_ids": buffers.decode_tail_slot_ids,
                 "position_ids": buffers.decode_position_ids,
@@ -2807,9 +2822,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "ori_block_table": self._require_decode_buffers().tensors["block_table"],
                 "input_ids": buffers.decode_input_ids,
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": buffers.decode_hidden_out,
-                "next_pre_hc_hidden": buffers.decode_pre_hc_out,
-                "logits": buffers.decode_logits,
+                "hidden_out": outputs.mtp_hidden_out,
+                "next_pre_hc_hidden": outputs.mtp_next_pre_hc_hidden,
+                "logits": outputs.mtp_logits,
                 "sampled_ids": buffers.decode_sampled_ids,
                 "logit_row_indices": buffers.decode_logit_row_indices,
             }
@@ -3837,6 +3852,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if self._compiled.enable_mtp:
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
                 self._materialize_mtp_prefill_device_outputs(hidden_size)
+                self._materialize_fused_mtp_decode_device_outputs(hidden_size)
         if self._stacked_device_weights is None:
             host_weights = self._stacked_host_weights
             if not host_weights:
@@ -4051,6 +4067,67 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         return host_row
 
+    def _materialize_fused_mtp_decode_device_outputs(
+        self,
+        hidden_size: int,
+    ) -> _DeepSeekV4FusedMtpDecodeDeviceOutputs:
+        """Allocate uninitialized scratch for fused outputs never read by Host."""
+        outputs = self._fused_mtp_decode_device_outputs
+        if outputs is not None:
+            return outputs
+
+        layout = self._compiled.layout
+        allocated: list[StackedDeviceTensor] = []
+
+        def resident(shape: tuple[int, ...], dtype: torch.dtype) -> StackedDeviceTensor:
+            tensor = self._alloc_empty_stacked_tensor(shape, dtype)
+            allocated.append(tensor)
+            return tensor
+
+        try:
+            outputs = _DeepSeekV4FusedMtpDecodeDeviceOutputs(
+                main_hidden_out=resident(
+                    (layout.ranks, layout.decode_tokens, int(hidden_size)),
+                    torch.bfloat16,
+                ),
+                main_logits=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_MAX_LOGIT_ROWS,
+                        DEEPSEEK_V4_VOCAB_SIZE,
+                    ),
+                    torch.float32,
+                ),
+                mtp_hidden_out=resident(
+                    (layout.ranks, layout.decode_tokens, int(hidden_size)),
+                    torch.bfloat16,
+                ),
+                mtp_next_pre_hc_hidden=resident(
+                    (
+                        layout.ranks,
+                        layout.decode_tokens,
+                        layout.hc_mult,
+                        int(hidden_size),
+                    ),
+                    torch.float32,
+                ),
+                mtp_logits=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_MAX_LOGIT_ROWS,
+                        DEEPSEEK_V4_VOCAB_SIZE,
+                    ),
+                    torch.float32,
+                ),
+            )
+        except Exception:
+            worker = self._shared_l3_worker()
+            for tensor in reversed(allocated):
+                worker.free_stacked_tensor(tensor)
+            raise
+        self._fused_mtp_decode_device_outputs = outputs
+        return outputs
+
     def _materialize_decode_device_cache(self) -> DeepSeekV4DeviceCache:
         """Allocate dynamically sized cache shards directly on each NPU."""
         cache = self._decode_device_cache
@@ -4216,6 +4293,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._mtp_tail_pre_hc_pool = None
             self._mtp_device_weights = None
             self._mtp_prefill_device_outputs = None
+            self._fused_mtp_decode_device_outputs = None
             self._mtp_buffers = None
             self._mtp_decode_inputs_initialized = False
             self._global_weights = None

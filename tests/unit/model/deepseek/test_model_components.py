@@ -1514,6 +1514,13 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
         per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
     )
     dispatches = []
+    device_outputs = SimpleNamespace(
+        main_hidden_out=object(),
+        main_logits=object(),
+        mtp_hidden_out=object(),
+        mtp_next_pre_hc_hidden=object(),
+        mtp_logits=object(),
+    )
 
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner.prepare_mtp_decode_inputs = lambda _model, _batch: staged
@@ -1521,10 +1528,17 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
     runner._stage_fused_mtp_metadata = lambda _inputs: layout.decode_seq
     runner._require_decode_buffers = lambda: SimpleNamespace(sampled_ids=main_sampled_ids)
     runner._require_mtp_buffers = lambda: mtp_buffers
-    runner._require_decode_output_buffer = lambda _hidden_size: torch.empty(0)
+    runner._materialize_fused_mtp_decode_device_outputs = (
+        lambda _hidden_size: device_outputs
+    )
     runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(0)
-    runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
-    runner._decode_fwd_args = lambda *_args: ()
+
+    def fake_decode_fwd_args(_inputs, _pre_hc, hidden_out, logits, _sampled_ids):
+        assert hidden_out is device_outputs.main_hidden_out
+        assert logits is device_outputs.main_logits
+        return ()
+
+    runner._decode_fwd_args = fake_decode_fwd_args
     runner._fused_mtp_decode_args = lambda _main_args, _active_tokens: ("fused",)
 
     def fake_run_l3(callable_spec, *args):
@@ -1826,6 +1840,146 @@ def test_deepseek_mtp_prefill_args_use_device_outputs():
     assert named["hidden_out"] is outputs.hidden_out
     assert named["pre_hc_hidden_out"] is outputs.pre_hc_hidden_out
     assert named["logits"] is outputs.logits
+
+
+def test_deepseek_fused_mtp_decode_outputs_allocate_empty_rank_shards_once():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        decode_batch=2,
+        decode_seq=2,
+        decode_tokens=4,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            enable_mtp=True,
+        )
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.allocations = []
+            self.closed = False
+
+        def alloc_tensor(self, shape, dtype, init=None, *, worker_id=0):
+            tensor = DeviceTensor(
+                0x1000 + len(self.allocations) * 0x100000,
+                tuple(shape),
+                dtype,
+            )
+            self.allocations.append((tuple(shape), dtype, init, worker_id))
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    worker = FakeWorker()
+    runner._l3_worker = worker
+
+    first = runner._materialize_fused_mtp_decode_device_outputs(hidden_size=5)
+    second = runner._materialize_fused_mtp_decode_device_outputs(hidden_size=5)
+
+    assert second is first
+    assert first.main_hidden_out.full_shape == (2, 4, 5)
+    assert first.main_logits.full_shape == (2, 8, 129280)
+    assert first.mtp_hidden_out.full_shape == (2, 4, 5)
+    assert first.mtp_next_pre_hc_hidden.full_shape == (2, 4, 4, 5)
+    assert first.mtp_logits.full_shape == (2, 8, 129280)
+    assert all(shard.dtype == torch.bfloat16 for shard in first.main_hidden_out.shards)
+    assert all(shard.dtype == torch.float32 for shard in first.main_logits.shards)
+    assert all(shard.dtype == torch.bfloat16 for shard in first.mtp_hidden_out.shards)
+    assert all(
+        shard.dtype == torch.float32 for shard in first.mtp_next_pre_hc_hidden.shards
+    )
+    assert all(shard.dtype == torch.float32 for shard in first.mtp_logits.shards)
+    assert len(worker.allocations) == 10
+    assert all(init is None for _shape, _dtype, init, _worker_id in worker.allocations)
+    assert [worker_id for _shape, _dtype, _init, worker_id in worker.allocations] == [
+        0,
+        1,
+    ] * 5
+
+    runner.close()
+    assert worker.closed
+    assert runner._fused_mtp_decode_device_outputs is None
+
+
+def test_deepseek_fused_mtp_decode_args_use_device_scratch_and_host_results():
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=DeepSeekV4CacheLayout(
+                ranks=1,
+                decode_batch=1,
+                decode_seq=1,
+                decode_tokens=1,
+            ),
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            enable_mtp=True,
+        )
+    )
+    host_result = object()
+    value = object()
+    runner._mtp_buffers = SimpleNamespace(
+        weights={},
+        decode_accepted_counts=host_result,
+        decode_tail_slot_ids=value,
+        decode_position_ids=host_result,
+        decode_input_ids=host_result,
+        decode_hidden_out=object(),
+        decode_pre_hc_out=object(),
+        decode_logits=object(),
+        decode_sampled_ids=host_result,
+        decode_logit_row_indices=value,
+    )
+    outputs = SimpleNamespace(
+        mtp_hidden_out=object(),
+        mtp_next_pre_hc_hidden=object(),
+        mtp_logits=object(),
+    )
+    runner._mtp_device_weights = {}
+    runner._materialize_fused_mtp_decode_device_outputs = lambda _hidden_size: outputs
+    runner._materialize_mtp_device_kv_cache = lambda: value
+    runner._materialize_embedding_device_weight = lambda: value
+    runner.load_packed_global_weights = lambda: SimpleNamespace(
+        embed_weight=torch.empty((1, 5), dtype=torch.bfloat16)
+    )
+    runner._materialize_main_pre_hc_device = lambda _hidden_size: value
+    runner._materialize_mtp_tail_pre_hc_pool = lambda _hidden_size: value
+    runner._static_freqs_cos_tensor = lambda: value
+    runner._static_freqs_sin_tensor = lambda: value
+    runner._require_decode_buffers = lambda: SimpleNamespace(
+        tensors={"block_table": value}
+    )
+    runner._static_lm_head_weight_tensor = lambda: value
+    runner._mark_resident_args = lambda values, _policy: values
+    runner._ordered_layer_args = lambda values, _order: values
+
+    named = runner._mtp_decode_args()
+    cached = runner._mtp_decode_args()
+
+    assert cached is named
+    assert named["hidden_out"] is outputs.mtp_hidden_out
+    assert named["next_pre_hc_hidden"] is outputs.mtp_next_pre_hc_hidden
+    assert named["logits"] is outputs.mtp_logits
+    assert named["accepted_counts"] is host_result
+    assert named["position_ids"] is host_result
+    assert named["input_ids"] is host_result
+    assert named["sampled_ids"] is host_result
 
 
 def test_deepseek_release_finished_requests_discards_mtp_state():
