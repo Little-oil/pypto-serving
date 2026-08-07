@@ -164,6 +164,7 @@ def test_non_streaming_suppresses_intermediate_outputs():
     final = ns_ctx.queue.get_nowait()
     assert final.finished is True
     assert final.text == "abc"  # full cumulative text on the final output
+    assert final.token_ids == (1, 2, 3)
     assert "r" in core._pending_free_ids
 
     # --- streaming: stream=True -> one TokenOutput per token ---

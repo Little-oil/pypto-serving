@@ -4,6 +4,19 @@ These commands are for DeepSeek V4 Flash W8A8 serving checks on shared Ascend
 development machines with `task-submit`. Run them from the pypto-serving
 checkout.
 
+## 8-Device Offline Generation
+
+The offline entry uses the same scheduler, worker process, rank-partitioned
+cache pools, and MTP acceptance path as HTTP serving, without opening a port:
+
+```bash
+task-submit --device 8,9,10,11,12,13,14,15 --max-time 0 --timeout 0 --ptoas 0.48 --run "PYPTO_RUNTIME_LOG=error PTO2_RING_DEP_POOL=131072 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_HEAP=2147483648 PTO2_OP_EXECUTE_TIMEOUT_US=400000000 PTO2_STREAM_SYNC_TIMEOUT_MS=440000 PTO2_SCHEDULER_TIMEOUT_MS=320000 SERVING_WORKER_STEP_TIMEOUT=1800 python examples/model/deepseek_v4/npu_generate.py --model-dir /data/models/dsv4-flash-w8a8 --prompt 'Huawei is' --platform a2a3 --devices 8,9,10,11,12,13,14,15 --max-seq-len 512 --max-new-tokens 20 --enable-mtp"
+```
+
+Use `--num-prompts N` to exercise continuous batching, or add
+`--profile --profile-output /path/to/profile` to capture only the generation
+window after model initialization.
+
 ## 8-Device DP/EP Serving
 
 Use the quantized checkpoint under `/data/models/dsv4-flash-w8a8` and run with

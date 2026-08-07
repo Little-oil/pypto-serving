@@ -30,6 +30,10 @@ def test_async_llm_engine_cleans_up_failed_startup():
     asyncio.run(_check_async_llm_engine_cleans_up_failed_startup())
 
 
+def test_async_llm_engine_generates_structured_offline_batch():
+    asyncio.run(_check_async_llm_engine_generates_structured_offline_batch())
+
+
 async def _check_async_llm_engine_routes_to_least_pending_tokens():
     created: list[_FakeCore] = []
     tokenizer = _Tokenizer()
@@ -153,6 +157,30 @@ async def _check_async_llm_engine_cleans_up_failed_startup():
     assert [core.stopped for core in created] == [True, True]
 
 
+async def _check_async_llm_engine_generates_structured_offline_batch():
+    engine = AsyncLLMEngine(
+        EngineConfig(
+            model_id="model",
+            model_dir="/tmp/model",
+            parallel_config=ParallelConfig(devices=(0,)),
+        ),
+        tokenizer=_Tokenizer(),
+        core_factory=_ResultCore,
+    )
+
+    results = await engine.generate_batch(
+        ["first", "second"],
+        GenerateConfig(max_new_tokens=2, stream=False),
+    )
+
+    assert [result.text for result in results] == ["FIRST", "SECOND"]
+    assert [result.token_ids for result in results] == [[10, 11], [10, 11]]
+    assert [result.finish_reason for result in results] == ["length", "length"]
+
+    with pytest.raises(ValueError, match="stream=False"):
+        await engine.generate_result("streaming", GenerateConfig(stream=True))
+
+
 async def _collect_outputs(outputs):
     return [output async for output in outputs]
 
@@ -220,6 +248,22 @@ class _BlockingCore(_FakeCore):
         if request_id == "req-0":
             await self.release.wait()
         yield TokenOutput(finished=True, finish_reason="FINISHED_LENGTH")
+
+
+class _ResultCore(_FakeCore):
+    async def add_request(
+        self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None
+    ):
+        if on_queued is not None:
+            on_queued()
+        yield TokenOutput(
+            text=prompt.upper(),
+            finished=True,
+            finish_reason="FINISHED_LENGTH",
+            prompt_tokens=len(prompt_token_ids),
+            completion_tokens=2,
+            token_ids=(10, 11),
+        )
 
 
 class _StartupCore(_FakeCore):
