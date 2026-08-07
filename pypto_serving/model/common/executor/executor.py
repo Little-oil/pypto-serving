@@ -63,6 +63,63 @@ class ModelExecutor(ABC):
         """Return an executor-specific prefill dispatch limit, if any."""
         return None
 
+    @property
+    def supports_async_decode_prepare(self) -> bool:
+        """Return whether decode metadata can be prepared ahead of execution.
+
+        Implementations advertising this capability must keep the returned
+        preparation independent from any decode invocation currently executing.
+        The worker may call :meth:`prepare_decode` on its command thread while
+        :meth:`run_prepared_decode` is running on the device thread.
+        """
+        return False
+
+    def prepare_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        buffer_slot: int,
+    ) -> object:
+        """Prepare one decode execution snapshot without dispatching the model."""
+        raise NotImplementedError(f"{type(self).__name__} does not support async decode prepare")
+
+    def run_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> DecodeResult:
+        """Late-bind and execute a snapshot returned by :meth:`prepare_decode`."""
+        raise NotImplementedError(f"{type(self).__name__} does not support prepared decode")
+
+    @property
+    def supports_async_decode_reclaim(self) -> bool:
+        """Return whether dispatch and host output reclaim can run independently.
+
+        The device lane calls :meth:`dispatch_prepared_decode`; after the runtime
+        call returns, a separate output lane calls :meth:`reclaim_prepared_decode`.
+        Implementations must keep every host-visible output alive until reclaim.
+        """
+        return False
+
+    def dispatch_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> object:
+        """Execute device work and return an executor-owned reclaim ticket."""
+        raise NotImplementedError(f"{type(self).__name__} does not support split decode dispatch")
+
+    def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
+        """Materialize host output from a completed dispatch ticket."""
+        raise NotImplementedError(f"{type(self).__name__} does not support split decode reclaim")
+
+    def prepared_decode_requires_token(self, prepared: object) -> bool:
+        """Return whether dispatch still needs the prior host-sampled token."""
+        return True
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
@@ -103,6 +160,20 @@ class ModelExecutor(ABC):
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run prompt prefill and return logits for the next token."""
         raise NotImplementedError
+
+    def finalize_prefill(
+        self,
+        model: RuntimeModel,
+        request_ids: list[str],
+        sampled_token_ids: list[int],
+    ) -> None:
+        """Finalize model-specific state after terminal-prefill sampling.
+
+        This hook remains part of the prefill command. Model integrations may
+        use the sampled first output token to seed decode-only persistent state
+        before the command is made visible to the scheduler.
+        """
+        return None
 
     @abstractmethod
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:

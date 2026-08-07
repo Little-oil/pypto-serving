@@ -44,6 +44,17 @@ each request addresses it with the scheduler-owned rank-local `ori` block IDs.
 The scheduler reserves the extra speculative position before dispatch, including
 when a draft crosses a 128-token page boundary.
 
+Before the first decode is prepared, each request owns a stable rank-local
+device-state slot and reuse generation. Terminal prefill fills that reserved
+slot with the committed tail token, next draft token, tail position, and
+committed count. The fused decode kernel
+uses `(rank, slot, generation)` to build the next `[tail, draft]` input rows and
+sequence metadata before main decode, then updates the same slot after MTP
+verification. Host output processing mirrors the state for scheduling and
+statistics, but is not an input dependency of the next steady-state decode.
+Generation matching prevents a stale queued step from updating a slot after
+preemption and reuse.
+
 The seven main-model KV/state pools are allocated during runner preflight as
 rank-sharded worker-resident tensors. Prefill and decode pass the same device
 handles and address them with scheduler-owned group block IDs; there is no

@@ -166,6 +166,35 @@ def test_async_decode_seq_len_excludes_inflight_placeholders():
     assert second.seq_len < req.num_tokens
 
 
+def test_eos_from_step_n_keeps_n_plus_1_but_prevents_n_plus_2(monkeypatch):
+    """EOS is discovered from N output: N+1 is stale, N+2 is not scheduled."""
+
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, dispatched = _async_pipeline_core()
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    req.eos_token_id = 51
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+
+    assert core._try_dispatch_step() is True  # N
+    assert core._try_dispatch_step() is True  # N+1, prepared optimistically
+    assert len(dispatched) == 2
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert req.status is RequestStatus.FINISHED_EOS
+    # Processing N output affects the next schedule decision, not the already
+    # dispatched N+1 snapshot.
+    assert core._try_dispatch_step() is False
+    assert len(dispatched) == 2
+
+    # N+1 still drains in FIFO order, but its token is discarded for finished A.
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert req.output_token_ids == [50, 51]
+
+
 def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     """If the oldest in-flight step errors while a later step is queued, the
     later step's result (already in transit from the FIFO worker) must be drained

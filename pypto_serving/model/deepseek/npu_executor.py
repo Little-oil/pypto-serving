@@ -46,6 +46,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_csa",
     "decode_hca",
     "decode_swa",
+    "decode_device_state",
     "decode_fwd",
     "decode_fwd_mtp",
     "decode_input_pack",
