@@ -908,12 +908,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_task_args: TaskArgs | None = None
-        # Per ping-pong slot: the host-shared ``_DECODE_FWD_TENSOR_ORDER``
-        # buffers (metadata inputs, sampled_ids, hidden/logits outputs) live on
-        # the decode TaskArgs; the device-resident pre-HC output is a
-        # device-resident slot on the same TaskArgs.  ``_decode_input_slots``
-        # keeps only the MTP-specific reclaimed buffers until the MTP builders
-        # migrate (Step 5).
+        # Per ping-pong slot, decode buffers live on the decode TaskArgs. Fused
+        # K=1 write-only outputs and pre-HC are device-resident; scheduler-visible
+        # inputs and sampled IDs remain shared on Host.
         self._decode_task_args: list[TaskArgs] = []
         self._decode_input_slots: list[dict[str, torch.Tensor]] = []
         self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
@@ -3604,14 +3601,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if self._global_weights is not None:
             hidden_size = int(self.load_packed_global_weights().embed_weight.shape[1])
             self._materialize_embedding_device_weight()
-            # Allocate the decode TaskArgs device-resident slots (the pre-HC
-            # output) once, here on the init lane.  This must NOT happen lazily
-            # on the prepare lane: prepare runs concurrently with in-flight
-            # dispatches in the depth-2 pipeline, and a worker.alloc_tensor
-            # racing worker.run corrupts the device state.
+            # Allocate TaskArgs device-resident slots once on the init lane.
+            # This must NOT happen lazily on the prepare lane: prepare runs
+            # concurrently with in-flight dispatches in the depth-2 pipeline,
+            # and a worker.alloc_tensor racing worker.run corrupts device state.
             for task_args in self._decode_task_args:
                 task_args.allocate_device(worker, None)
             if self._compiled.num_speculative_tokens:
+                for task_args in self._mtp_decode_task_args:
+                    task_args.allocate_device(worker, None)
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
                 self._mtp_prefill_task_args.allocate_device(worker, None)
                 self._materialize_mtp_device_state_tokens()

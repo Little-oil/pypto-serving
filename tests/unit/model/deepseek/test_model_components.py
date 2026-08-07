@@ -2905,7 +2905,10 @@ class _TaskArgsStubRunner:
             _prefill_slot_specs,
         )
 
-        self._compiled = SimpleNamespace(layout=DeepSeekV4CacheLayout())
+        self._compiled = SimpleNamespace(
+            layout=DeepSeekV4CacheLayout(),
+            num_speculative_tokens=0,
+        )
         layout = self._compiled.layout
         covered = set(_PREFILL_STATIC_WEIGHTS) | set(_PREFILL_CACHE_POOLS)
         covered |= set(_prefill_slot_specs(layout, hidden, vocab))
@@ -3059,3 +3062,37 @@ def test_deepseek_mtp_task_args_classify_kinds():
     built = decode.build()
     assert isinstance(built[decode.names.index("freqs_cos")], StaticDeviceTensor)
     assert decode.names[decode.names.index("state_tokens") - 1] == "state_generations"
+
+
+def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
+    class _AllocWorker:
+        def __init__(self):
+            self.next_ptr = 0x1000
+
+        def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
+            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
+            self.next_ptr += 0x100000
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            return None
+
+    runner = _TaskArgsStubRunner()
+    runner._compiled.num_speculative_tokens = 1
+    worker = _AllocWorker()
+
+    decode = decode_task_args(runner, 4096, 129280)
+    decode.allocate_host_shared(None)
+    decode.allocate_device(worker, None)
+    for name in ("hidden_out", "logits", "pre_hc_hidden_out"):
+        assert isinstance(decode.tensors[name], StackedDeviceTensor)
+    assert isinstance(decode.tensors["sampled_ids"], torch.Tensor)
+
+    mtp = mtp_decode_task_args(runner, 4096)
+    mtp.allocate_host_shared(None)
+    mtp.allocate_device(worker, None)
+    for name in ("hidden_out", "next_pre_hc_hidden", "logits"):
+        assert isinstance(mtp.tensors[name], StackedDeviceTensor)
+    for name in ("accepted_counts", "input_ids", "position_ids", "sampled_ids"):
+        assert isinstance(mtp.tensors[name], torch.Tensor)
