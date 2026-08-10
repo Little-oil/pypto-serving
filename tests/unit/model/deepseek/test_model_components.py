@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import stat
 import sys
@@ -301,23 +300,20 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
     assert compiled.mtp_decode is None
 
 
-def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors():
-    """Runtime scalars become meta-tensor/ctypes compile args forwarded to the compiler."""
+def test_deepseek_l3_compile_passes_runtime_scalars_unspecialized():
+    """Runtime scalars are passed as pl.RUNTIME (unspecialized) to the compiler."""
+    from pypto.language import RUNTIME
+
     captured: dict[str, object] = {}
 
     class _FakeCompiler:
-        def compile(self, name, jit_fn, compile_args, *, use_cache=False):
+        def compile(self, name, jit_fn, *, use_cache=False, **compile_kwargs):
             captured["name"] = name
-            captured["compile_args"] = compile_args
+            captured["compile_kwargs"] = compile_kwargs
             return "compiled"
 
     def _kernel(x, num_tokens):
         pass
-
-    _kernel.__annotations__ = {
-        "x": SimpleNamespace(shape=(2, 3), dtype="fp32"),
-        "num_tokens": SimpleNamespace(dtype="int32"),
-    }
 
     class _JitFunction:
         def __init__(self) -> None:
@@ -336,14 +332,7 @@ def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors():
 
     assert compiled == "compiled"
     assert captured["name"] == "deepseek_v4_mtp_prefill"
-    args = captured["compile_args"]
-    assert len(args) == 2
-    assert isinstance(args[0], torch.Tensor)
-    assert args[0].device.type == "meta"
-    assert args[0].shape == (2, 3)
-    assert args[0].dtype == torch.float32
-    assert isinstance(args[1], ctypes.c_int32)
-    assert args[1].value == 0
+    assert captured["compile_kwargs"] == {"num_tokens": RUNTIME}
 
 
 def test_deepseek_compile_l3_callable_threads_use_cache_to_compiler():
@@ -351,7 +340,7 @@ def test_deepseek_compile_l3_callable_threads_use_cache_to_compiler():
     captured: dict[str, object] = {}
 
     class _FakeCompiler:
-        def compile(self, name, jit_fn, compile_args, *, use_cache=False):
+        def compile(self, name, jit_fn, *, use_cache=False, **compile_kwargs):
             captured["name"] = name
             captured["use_cache"] = use_cache
             return "compiled"

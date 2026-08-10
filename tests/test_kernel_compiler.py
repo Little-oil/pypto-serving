@@ -39,12 +39,10 @@ class _FakeJitFn:
     def __init__(self, program: object) -> None:
         self._program = program
         self.last_config: RunConfig | None = None
-        self.last_dummy_args: tuple[object, ...] = ()
         self.compile_calls = 0
 
-    def compile(self, *dummy_args: object, config: RunConfig) -> object:
+    def compile(self, *, config: RunConfig, **compile_kwargs: object) -> object:
         self.last_config = config
-        self.last_dummy_args = dummy_args
         self.compile_calls += 1
         return self._program
 
@@ -60,7 +58,7 @@ def test_compile_threads_enable_scope_stats_into_run_config() -> None:
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler(enable_scope_stats=True)
 
-    result = compiler.compile("prefill", jit_fn, [], use_cache=True)
+    result = compiler.compile("prefill", jit_fn, use_cache=True)
 
     assert jit_fn.last_config is not None
     assert jit_fn.last_config.enable_scope_stats is True
@@ -75,7 +73,7 @@ def test_compile_defaults_disable_scope_stats() -> None:
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler()
 
-    compiler.compile("decode", jit_fn, [])
+    compiler.compile("decode", jit_fn)
 
     assert jit_fn.last_config.enable_scope_stats is False
 
@@ -88,7 +86,7 @@ def test_compile_carries_aicpu_thread_num_from_run_config_to_callable() -> None:
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = KernelCompiler(run_config=run_config)
 
-    result = compiler.compile("prefill", jit_fn, [], use_cache=True)
+    result = compiler.compile("prefill", jit_fn, use_cache=True)
 
     distributed_config = jit_fn.last_config.distributed_config
     assert distributed_config.aicpu_thread_num == 8
@@ -97,16 +95,16 @@ def test_compile_carries_aicpu_thread_num_from_run_config_to_callable() -> None:
     assert result.aicpu_thread_num == 8
 
 
-def test_compile_forwards_dummy_args_to_jit_fn() -> None:
-    """The dummy-arg signature is passed through verbatim."""
+def test_compile_forwards_runtime_scalar_kwargs_to_jit_fn() -> None:
+    """Extra compile kwargs (e.g. ``name=pl.RUNTIME``) reach ``jit_fn.compile``."""
+    from pypto.language import RUNTIME
+
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler()
-    dummy_args = (MagicMock(name="arg0"), MagicMock(name="arg1"))
 
-    compiler.compile("prefill", jit_fn, dummy_args)
+    compiler.compile("mtp_prefill", jit_fn, num_tokens=RUNTIME)
 
     assert jit_fn.compile_calls == 1
-    assert jit_fn.last_dummy_args == dummy_args
 
 
 def test_compile_raises_on_non_distributed_compiled_program() -> None:
@@ -115,7 +113,7 @@ def test_compile_raises_on_non_distributed_compiled_program() -> None:
     compiler = _make_compiler()
 
     with pytest.raises(TypeError, match="DistributedCompiledProgram"):
-        compiler.compile("prefill", jit_fn, [])
+        compiler.compile("prefill", jit_fn)
 
 
 # --- on-disk cache (load) ----------------------------------------------------
@@ -134,7 +132,7 @@ def test_cache_miss_compiles_into_per_kernel_slot(tmp_path: Path) -> None:
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler(cache_dir=str(tmp_path))
 
-    result = compiler.compile("prefill", jit_fn, [], use_cache=True)
+    result = compiler.compile("prefill", jit_fn, use_cache=True)
 
     assert jit_fn.compile_calls == 1
     assert result.compiled is jit_fn._program
@@ -158,7 +156,7 @@ def test_cache_hit_reloads_program_and_skips_jit(
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler(cache_dir=str(tmp_path))
 
-    result = compiler.compile("prefill", jit_fn, [], use_cache=True)
+    result = compiler.compile("prefill", jit_fn, use_cache=True)
 
     assert jit_fn.compile_calls == 0
     assert result.compiled is cached
@@ -179,7 +177,7 @@ def test_cache_disabled_recompiles_even_when_slot_populated(
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = _make_compiler(cache_dir=str(tmp_path))
 
-    result = compiler.compile("prefill", jit_fn, [], use_cache=False)
+    result = compiler.compile("prefill", jit_fn, use_cache=False)
 
     assert jit_fn.compile_calls == 1
     assert result.compiled is jit_fn._program

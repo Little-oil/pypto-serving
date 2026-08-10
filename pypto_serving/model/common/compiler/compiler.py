@@ -13,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -69,13 +68,19 @@ class KernelCompiler:
         self,
         name: str,
         jit_fn: object,
-        dummy_args: Sequence[Any],
+        *,
         use_cache: bool = False,
+        **compile_kwargs: Any,
     ) -> L3Callable:
         """Compile a HOST wrapper into a PyPTO ``DistributedCompiledProgram``.
 
         With a ``cache_dir``, a populated ``cache_dir/<name>`` slot is reloaded
         (skipping the JIT); otherwise the kernel compiles straight into that slot.
+
+        Compiles in annotation-driven signature mode: tensor shapes/dtypes are
+        read from the wrapper's ``pl.Tensor[[...], dtype]`` annotations, so no
+        positional sample tensors are passed. ``compile_kwargs`` are forwarded to
+        ``jit_fn.compile`` (e.g. ``name=pl.RUNTIME`` for runtime scalars).
         """
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
@@ -106,7 +111,7 @@ class KernelCompiler:
         # ``DistributedConfig`` and any new pypto RunConfig fields are forwarded
         # automatically) and re-runs ``__post_init__``.
         run_config = dataclasses.replace(self._run_config, **configs)
-        compiled = jit_fn.compile(*dummy_args, config=run_config)
+        compiled = jit_fn.compile(config=run_config, **compile_kwargs)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(
                 f"{name} did not compile to DistributedCompiledProgram; "

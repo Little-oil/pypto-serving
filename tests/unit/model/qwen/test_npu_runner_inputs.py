@@ -34,7 +34,6 @@ from pypto_serving.worker.worker import WorkerTensor
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 

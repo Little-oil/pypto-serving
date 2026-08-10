@@ -13,7 +13,6 @@ from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as Pypto
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 
@@ -43,7 +42,6 @@ def test_qwen_compile_uses_current_distributed_config_interface(monkeypatch):
     callable_spec = executor._compile_jit_fwd_callable(
         "fake",
         FakeJitFunction(),
-        [],
     )
 
     run_config = captured["config"]
@@ -59,7 +57,7 @@ def test_qwen_compile_threads_use_cache_to_compiler():
     captured: dict[str, object] = {}
 
     class _FakeCompiler:
-        def compile(self, name, jit_fn, dummy_args, *, use_cache=False):
+        def compile(self, name, jit_fn, *, use_cache=False):
             captured["name"] = name
             captured["use_cache"] = use_cache
             return "compiled"
@@ -67,7 +65,7 @@ def test_qwen_compile_threads_use_cache_to_compiler():
     executor = PyptoExecutor(device_ids=(3,), use_compile_cache=True)
     executor._compiler = _FakeCompiler()
 
-    callable_spec = executor._compile_jit_fwd_callable("fake", object(), [])
+    callable_spec = executor._compile_jit_fwd_callable("fake", object())
 
     assert callable_spec == "compiled"
     assert captured["use_cache"] is True
