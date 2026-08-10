@@ -589,10 +589,43 @@ runs:
         # turned out to be the only thing pinning it. The serving deps installed
         # further down (transformers et al.) depend on torch too, so this must
         # come first for them as well.
-        if ! pip install torch --index-url https://download.pytorch.org/whl/cpu; then
-          echo "note: download.pytorch.org unreachable — falling back to a pinned torch"
-          pip install 'torch==2.6.0'
+        #
+        # Pinned to what the conda env this migration replaces carried, so the
+        # toolchain is the only thing that changes: py310-lib resolved
+        # torch>=2.0.0 to 2.6.0, while an unpinned install takes the newest
+        # (2.13.0 today). It is also forced from below — torch_npu requires an
+        # exact torch, and the 2.6.0 line requires torch==2.6.0.
+        #
+        # The CPU index is not a preference either, so an unreachable one is
+        # retried rather than swapped for the default index: the same pin resolves
+        # to a CUDA-bundling wheel there, which is the whole thing this is
+        # avoiding. Better to fail naming the index than to quietly install a
+        # different build of the version the pin asks for.
+        TORCH_PIN='torch==2.6.0'
+        torch_ok=0
+        for attempt in 1 2 3; do
+          if pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
+            torch_ok=1
+            break
+          fi
+          echo "::warning::$TORCH_PIN attempt $attempt failed; retrying in $((attempt * 10))s"
+          sleep $((attempt * 10))
+        done
+        if [ "$torch_ok" -ne 1 ]; then
+          echo "::error::cannot install $TORCH_PIN from download.pytorch.org/whl/cpu"
+          exit 1
         fi
+        # torch_npu is what puts `torch.npu` on the torch module, and this
+        # repo's NPU runners call torch.npu.mem_get_info to size the KV cache.
+        # It was another thing --system-site-packages was quietly supplying from
+        # the conda env, with nothing declaring it.
+        #
+        # Not on PyPI (which stops at 2.3.1), so the index is named explicitly.
+        # The version must track TORCH_PIN exactly: the wheel's metadata is
+        # `Requires-Dist: torch==2.6.0`, satisfied by the 2.6.0+cpu installed
+        # above because a specifier without a local label ignores one.
+        pip install 'torch_npu==2.6.0.post5' \
+          --index-url https://mirrors.huaweicloud.com/repository/pypi/simple
         # The from-source pypto / simpler builds compile native code (libbacktrace
         # et al.), which intermittently fails to configure on this host ("C
         # compiler cannot create executables"). Retry a few times, purging the
