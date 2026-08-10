@@ -28,7 +28,10 @@ jobs:
 
   unit-tests:
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 90
+    # The DeepSeek step alone is bounded at --timeout 1200 queue + --max-time
+    # 2700 run, and the venv no longer inherits a base env's torch, so a cold
+    # pip cache is paid here too. 90 left no headroom for both at once.
+    timeout-minutes: 120
     env:
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
@@ -84,6 +87,7 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
           # never land on one dir.
