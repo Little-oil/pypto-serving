@@ -424,7 +424,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
-    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0, simpler_committed=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(
@@ -467,6 +467,76 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         ),
     )
     manager.free(decode_alloc)
+
+
+def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed(monkeypatch):
+    """non_kv = max(peak_non_kv, simpler_committed); kv_budget = total*util - non_kv.
+
+    The driver-visible peak and simpler's committed total overlap (both cover
+    weights + arenas), so the larger one must win to avoid over-provisioning.
+    ``simpler_committed=0`` (worker/API unknown) must reproduce peak-only sizing.
+    """
+    model = _model(max_batch_size=1, page_size=64)
+    config, runtime = model.config, model.runtime
+
+    total = 10_000_000_000
+    free = 6_000_000_000  # peak_non_kv = total - free = 4 GB
+    monkeypatch.setattr(torch.npu, "mem_get_info", lambda device: (free, total))
+
+    bytes_per_page = (
+        config.num_hidden_layers * 2 * config.num_key_value_heads
+        * runtime.page_size * config.head_dim * getattr(torch, runtime.kv_dtype).itemsize
+    )
+    util = runtime.npu_memory_utilization
+
+    def expected(non_kv):
+        return max(int(total * util - non_kv) // bytes_per_page, 1)
+
+    # simpler_committed (5 GB) > peak_non_kv (4 GB): the committed view wins.
+    pages_committed_dominates = ModelRunner._compute_kv_cache_pages(
+        config, runtime, device_id=0, simpler_committed=5_000_000_000,
+    )
+    assert pages_committed_dominates == expected(5_000_000_000)
+
+    # simpler_committed (2 GB) < peak_non_kv (4 GB): the driver peak wins.
+    pages_peak_dominates = ModelRunner._compute_kv_cache_pages(
+        config, runtime, device_id=0, simpler_committed=2_000_000_000,
+    )
+    assert pages_peak_dominates == expected(4_000_000_000)
+
+    # Unknown committed (0) reproduces the pre-commit peak-only behaviour.
+    assert ModelRunner._compute_kv_cache_pages(
+        config, runtime, device_id=0, simpler_committed=0,
+    ) == pages_peak_dominates
+
+    # A larger non-KV footprint leaves fewer KV pages.
+    assert pages_committed_dominates < pages_peak_dominates
+
+
+@pytest.mark.parametrize("device_id, device_ids, expected_chip", [
+    (5, (2, 5, 7), 1),   # device 5 -> chip index 1
+    (7, (2, 5, 7), 2),   # device 7 -> chip index 2
+    (99, (2, 5, 7), 0),  # device absent from the list -> chip 0
+])
+def test_query_simpler_committed_queries_current_device_chip(device_id, device_ids, expected_chip):
+    committed = {0: 1_000_000_000, 1: 2_000_000_000, 2: 3_000_000_000}
+    runner = ModelRunner(compiled=None, device_id=device_id)
+    runner._l3_worker = _CommittedFakeWorker(committed, device_ids)
+
+    assert runner._query_simpler_committed() == committed[expected_chip]
+    assert runner._l3_worker.queried_chip == expected_chip
+
+
+def test_query_simpler_committed_returns_zero_when_worker_unavailable():
+    runner = ModelRunner(compiled=None, device_id=0)
+    runner._l3_worker = None
+    assert runner._query_simpler_committed() == 0
+
+
+def test_query_simpler_committed_returns_zero_when_worker_raises():
+    runner = ModelRunner(compiled=None, device_id=0)
+    runner._l3_worker = _CommittedFakeWorker({}, device_ids=(0,), raises=True)
+    assert runner._query_simpler_committed() == 0
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -521,3 +591,19 @@ class _FakeWorker:
 
     def run(self, compiled, *args, **kwargs):
         return None
+
+
+class _CommittedFakeWorker:
+    """Stand-in for simpler's L3 Worker exposing only committed_device_memory."""
+
+    def __init__(self, committed_by_chip, device_ids, *, raises=False):
+        self._committed = committed_by_chip
+        self.device_ids = device_ids
+        self.raises = raises
+        self.queried_chip = None
+
+    def committed_device_memory(self, chip):
+        self.queried_chip = chip
+        if self.raises:
+            raise RuntimeError("worker not ready")
+        return self._committed[chip]
