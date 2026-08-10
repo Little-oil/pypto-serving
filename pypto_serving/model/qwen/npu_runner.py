@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -32,25 +32,13 @@ from pypto_serving.config.types import (
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.tools.profile import profile_span
 
-if TYPE_CHECKING:
-    from pypto_serving.model.qwen.kernel_cache import KernelCache
-
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _L3Callable:
-    """HOST-dispatched compiled program and launch metadata."""
-
-    compiled: object
-    name: str
-    aicpu_thread_num: int
-    dispatch_args: tuple[Any, ...] = ()
-    #: Fingerprint of this kernel's compile parameters; written into the cache
-    #: slot marker at store time so a later launch only reuses it on an exact
-    #: config match. Empty for kernels compiled without a cache.
-    params_fingerprint: str = ""
+# HOST-dispatched compiled program + launch metadata. Unified with DeepSeek's
+# DeepSeekV4L3Callable in pypto_serving.model.common.compiler.l3_callable.
+from pypto_serving.model.common.compiler.l3_callable import L3Callable as _L3Callable
 
 
 @dataclass
@@ -140,12 +128,10 @@ class Qwen314BModelRunner(ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
-        kernel_cache: KernelCache | None = None,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
-        self._kernel_cache = kernel_cache
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         # Device-resident decode output scratch (greedy path): allocated directly on
@@ -196,10 +182,9 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
             self._shared_l3_worker()
-        # Worker creation compiled the device kernel binaries into each build
-        # dir; persist them to the kernel cache so a later launch reloads them
-        # (via DistributedCompiledProgram.from_dir) and skips the ~30s recompile.
-        self._store_kernel_binaries()
+        # The L3 worker assembles the device binaries into each program's
+        # output_dir, which (via the compiler's save_kernels_dir) already is the
+        # kernel-cache slot -- so the cache is populated directly, no store step.
 
         logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
@@ -893,25 +878,6 @@ class Qwen314BModelRunner(ModelRunner):
                 args=worker_run_args,
             ):
                 worker.run(callable_spec.compiled, *l3_args)
-
-    def _store_kernel_binaries(self) -> None:
-        """Persist each kernel's build dir into the kernel cache.
-
-        Called right after the L3 worker is created, i.e. after
-        ``compile_and_assemble`` has written the device binaries
-        (``cache/*.bin`` + ``kernels/*.o``) into each build dir. Storing the
-        whole dir means a later launch can reload it via
-        ``DistributedCompiledProgram.from_dir`` and skip both the JIT and the
-        ~30s device-binary compile.
-
-        Delegates per-kernel to the shared ``KernelCache``, which is a no-op
-        when caching is disabled or when a kernel was itself loaded from the
-        cache. Best-effort: failures are logged there, never raised.
-        """
-        if self._kernel_cache is None:
-            return
-        for spec in (self._compiled.prefill, self._compiled.decode, self._compiled.topk_select):
-            self._kernel_cache.store(spec.name, spec.compiled, spec.params_fingerprint)
 
     def _shared_l3_worker(self) -> Any:
         """Return the worker shared by the generation prefill/decode path."""

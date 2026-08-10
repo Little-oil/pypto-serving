@@ -13,7 +13,7 @@ import math
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
@@ -38,9 +38,6 @@ from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4WeightStore,
 )
 from pypto_serving.tools.profile import profile_span
-
-if TYPE_CHECKING:
-    from pypto_serving.model.common.kernel_cache import KernelCache
 
 
 logger = logging.getLogger(__name__)
@@ -1035,15 +1032,9 @@ class DeepSeekV4InputBuilder:
         )
 
 
-@dataclass
-class DeepSeekV4L3Callable:
-    """Compiled HOST-dispatched DeepSeekV4 program."""
-
-    compiled: object
-    name: str
-    block_dim: int | None = None
-    aicpu_thread_num: int = 4
-    params_fingerprint: str = ""
+# Compiled HOST-dispatched program. Unified with qwen's _L3Callable in
+# pypto_serving.model.common.compiler.l3_callable.
+from pypto_serving.model.common.compiler.l3_callable import L3Callable as DeepSeekV4L3Callable
 
 
 @dataclass
@@ -1370,11 +1361,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         *,
         compiled: DeepSeekV4CompiledKernels,
-        kernel_cache: KernelCache | None = None,
     ) -> None:
         super().__init__()
         self._compiled = compiled
-        self._kernel_cache = kernel_cache
         self.cache_metadata = DeepSeekV4CacheMetadataBuilder(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._l3_worker: Any | None = None
@@ -3887,19 +3876,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     inherited_host_tensors=self._inherited_host_weights(),
                 )
             self._l3_worker = worker
-            self._store_kernel_binaries()
         return worker
-
-    def _store_kernel_binaries(self) -> None:
-        """Persist fully assembled programs for reuse by a later launch."""
-        if self._kernel_cache is None:
-            return
-        for callable_spec in self._compiled.l3_callables():
-            self._kernel_cache.store(
-                callable_spec.name,
-                callable_spec.compiled,
-                callable_spec.params_fingerprint,
-            )
 
     def _inherited_host_weights(self) -> list[torch.Tensor]:
         """Return immutable main and MTP weights that must be visible at worker fork."""

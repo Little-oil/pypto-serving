@@ -157,8 +157,7 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
             "--dtype",
             "int8",
             "--enable-mtp",
-            "--kernel-cache-dir",
-            str(tmp_path / "kernel-cache"),
+            "--use-compile-cache",
         ]
     )
 
@@ -171,7 +170,7 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.runtime_config.weight_dtype == "int8"
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["enable_mtp"] is True
-    assert config.executor_kwargs["kernel_cache_dir"] == str((tmp_path / "kernel-cache").resolve())
+    assert config.executor_kwargs["use_compile_cache"] is True
 
 
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
@@ -302,46 +301,15 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
     assert compiled.mtp_decode is None
 
 
-def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors(monkeypatch):
-    import pypto.ir.distributed_compiled_program as distributed_program_module
-    import pypto.runtime as runtime_module
+def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors():
+    """Runtime scalars become meta-tensor/ctypes compile args forwarded to the compiler."""
+    captured: dict[str, object] = {}
 
-    class _DistributedCompiledProgram:
-        pass
-
-    class _DistributedConfig:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    class _RunConfig:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    monkeypatch.setattr(
-        distributed_program_module,
-        "DistributedCompiledProgram",
-        _DistributedCompiledProgram,
-    )
-    monkeypatch.setattr(distributed_program_module, "DistributedConfig", _DistributedConfig)
-    monkeypatch.setattr(runtime_module, "RunConfig", _RunConfig)
-
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._device_ids = tuple(range(8))
-    executor._platform = "a2a3"
-    executor._kernel_cache = None
-    executor._run_config = lambda *, codegen_only: SimpleNamespace(
-        platform="a2a3",
-        device_id=0,
-        backend_type="pto",
-        strategy=None,
-        dump_passes=False,
-        save_kernels=False,
-        save_kernels_dir=None,
-        diagnostic_phase=None,
-        disabled_diagnostics=(),
-        compile_profiling=False,
-    )
-    compile_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    class _FakeCompiler:
+        def compile(self, name, jit_fn, compile_args, *, use_cache=False):
+            captured["name"] = name
+            captured["compile_args"] = compile_args
+            return "compiled"
 
     def _kernel(x, num_tokens):
         pass
@@ -352,13 +320,12 @@ def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors(monkeyp
     }
 
     class _JitFunction:
-        def __init__(self):
+        def __init__(self) -> None:
             self._func = _kernel
 
-        @staticmethod
-        def compile(*args, **kwargs):
-            compile_calls.append((args, kwargs))
-            return _DistributedCompiledProgram()
+    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
+    executor._compiler = _FakeCompiler()
+    executor._use_compile_cache = False
 
     compiled = executor._compile_l3_callable(
         "deepseek_v4_mtp_prefill",
@@ -367,9 +334,9 @@ def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors(monkeyp
         runtime_scalar_names=frozenset({"num_tokens"}),
     )
 
-    assert isinstance(compiled.compiled, _DistributedCompiledProgram)
-    assert len(compile_calls) == 1
-    args, kwargs = compile_calls[0]
+    assert compiled == "compiled"
+    assert captured["name"] == "deepseek_v4_mtp_prefill"
+    args = captured["compile_args"]
     assert len(args) == 2
     assert isinstance(args[0], torch.Tensor)
     assert args[0].device.type == "meta"
@@ -377,48 +344,35 @@ def test_deepseek_l3_compile_preserves_runtime_scalars_with_meta_tensors(monkeyp
     assert args[0].dtype == torch.float32
     assert isinstance(args[1], ctypes.c_int32)
     assert args[1].value == 0
-    assert set(kwargs) == {"config"}
-    assert isinstance(kwargs["config"], _RunConfig)
 
 
-def test_deepseek_compile_l3_callable_reuses_cached_program():
-    cached = object()
-    captured = {}
+def test_deepseek_compile_l3_callable_threads_use_cache_to_compiler():
+    """_compile_l3_callable forwards use_compile_cache to the shared compiler."""
+    captured: dict[str, object] = {}
+
+    class _FakeCompiler:
+        def compile(self, name, jit_fn, compile_args, *, use_cache=False):
+            captured["name"] = name
+            captured["use_cache"] = use_cache
+            return "compiled"
 
     def _kernel(x: tuple[int, int]):
         pass
 
-    class FakeCache:
-        def load(self, name, params_fingerprint, *, platform, distributed_config):
-            captured.update(
-                name=name,
-                params_fingerprint=params_fingerprint,
-                platform=platform,
-                distributed_config=distributed_config,
-            )
-            return cached
-
-    class FakeJit:
+    class _JitFunction:
         _func = _kernel
 
-        def compile(self, *_args, **_kwargs):
-            raise AssertionError("cache hit must skip JIT compilation")
-
     executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._device_ids = tuple(range(8))
-    executor._platform = "a2a3"
-    executor._kernel_cache = FakeCache()
-    executor._run_config = lambda *, codegen_only: object()
+    executor._compiler = _FakeCompiler()
+    executor._use_compile_cache = True
 
-    callable_spec = executor._compile_l3_callable(
-        "deepseek_v4_decode",
-        FakeJit(),
-        layout=DeepSeekV4CacheLayout(),
+    compiled = executor._compile_l3_callable(
+        "deepseek_v4_decode", _JitFunction(), layout=DeepSeekV4CacheLayout()
     )
-    assert callable_spec.compiled is cached
-    assert callable_spec.params_fingerprint == captured["params_fingerprint"]
+
+    assert compiled == "compiled"
     assert captured["name"] == "deepseek_v4_decode"
-    assert captured["platform"] == "a2a3"
+    assert captured["use_cache"] is True
 
 
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
@@ -858,10 +812,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     compiled_program = object()
     captured = {}
 
-    class FakeKernelCache:
-        def store(self, name, compiled, params_fingerprint):
-            captured["stored"] = (name, compiled, params_fingerprint)
-
     class FakeDistributedWorker:
         def __init__(
             self,
@@ -879,7 +829,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._l3_worker = None
-    runner._kernel_cache = FakeKernelCache()
     runner._stacked_host_weights = {"main": main_weight}
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._compiled = type(
@@ -890,7 +839,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
                 DeepSeekV4L3Callable(
                     compiled_program,
                     "decode",
-                    params_fingerprint="params",
                 ),
             )
         },
@@ -904,7 +852,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert captured["persistent"] is True
     assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
-    assert captured["stored"] == ("decode", compiled_program, "params")
 
 
 def test_deepseek_resident_upload_releases_inherited_host_references():

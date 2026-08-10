@@ -9,9 +9,6 @@
 
 from pathlib import Path
 
-import torch
-
-from pypto_serving.model.qwen.kernel_cache import compute_params_fingerprint
 from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 
 
@@ -57,40 +54,21 @@ def test_qwen_compile_uses_current_distributed_config_interface(monkeypatch):
     assert callable_spec.aicpu_thread_num == 4
 
 
-def test_qwen_kernel_cache_hit_uses_current_callable_interface():
-    cached_program = object()
-    captured = {}
+def test_qwen_compile_threads_use_cache_to_compiler():
+    """_compile_jit_fwd_callable forwards use_compile_cache to the compiler."""
+    captured: dict[str, object] = {}
 
-    class FakeKernelCache:
-        def load(self, name, params_fingerprint, *, platform, distributed_config):
+    class _FakeCompiler:
+        def compile(self, name, jit_fn, dummy_args, *, use_cache=False):
             captured["name"] = name
-            captured["params_fingerprint"] = params_fingerprint
-            captured["platform"] = platform
-            captured["distributed_config"] = distributed_config
-            return cached_program
+            captured["use_cache"] = use_cache
+            return "compiled"
 
-    class CompileMustNotRun:
-        def compile(self, *args, config):
-            raise AssertionError("a kernel-cache hit must skip JIT compilation")
+    executor = PyptoExecutor(device_ids=(3,), use_compile_cache=True)
+    executor._compiler = _FakeCompiler()
 
-    executor = PyptoExecutor(device_ids=(3,))
-    executor._kernel_cache = FakeKernelCache()
+    callable_spec = executor._compile_jit_fwd_callable("fake", object(), [])
 
-    callable_spec = executor._compile_jit_fwd_callable(
-        "fake",
-        CompileMustNotRun(),
-        [torch.empty((2, 4), dtype=torch.bfloat16)],
-    )
-
-    assert callable_spec.compiled is cached_program
-    assert callable_spec.name == "fake"
-    assert callable_spec.aicpu_thread_num == 4
-    assert not hasattr(callable_spec, "block_dim")
+    assert callable_spec == "compiled"
+    assert captured["use_cache"] is True
     assert captured["name"] == "fake"
-    assert captured["params_fingerprint"] == compute_params_fingerprint(
-        "fake",
-        [torch.empty((2, 4), dtype=torch.bfloat16)],
-        platform=executor._platform,
-    )
-    assert captured["platform"] == executor._platform
-    assert captured["distributed_config"].device_ids == [3]
