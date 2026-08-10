@@ -1268,6 +1268,22 @@ def test_deepseek_early_decode_prepare_uses_isolated_ping_pong_slots():
     assert first.input_ids.eq(0).all()
 
 
+@pytest.mark.parametrize("buffer_slot", [-1, 2])
+def test_deepseek_early_decode_prepare_rejects_invalid_buffer_slot(buffer_slot):
+    runner, model = _runner_for_prepared_inputs()
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[99]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+        cache_partitions=[0],
+    )
+
+    with pytest.raises(ValueError, match="decode buffer_slot must be 0 or 1"):
+        runner.prepare_decode(model, batch, buffer_slot=buffer_slot)
+
+
 def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.enable_mtp = True
@@ -1310,7 +1326,7 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.enable_mtp = True
     runner._l3_shared_buffers_ready = True
-    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size: replace(
+    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
         inputs,
         dispatch_args=("fused",),
     )
@@ -1612,7 +1628,7 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
     runner._decode_fwd_args = lambda *_args: ()
     runner._fused_mtp_decode_args = lambda _main_args, _inputs, _active_tokens: ("fused",)
-    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size: replace(
+    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
         inputs,
         dispatch_args=("fused",),
     )

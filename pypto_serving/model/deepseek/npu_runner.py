@@ -1685,11 +1685,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
             with self._mtp_state_lock:
                 state = self._mtp_request_states.pop(request_id, None)
                 if state is not None and state.tail_rank is not None and state.tail_slot_id is not None:
-                    # Device STATE_VALID remains 1.  Lifecycle changes execute on
-                    # the FIFO device lane, so no older kernel can reach this point
-                    # after release; a future owner receives a new generation and
-                    # overwrites the complete meta row before its descriptor is
-                    # published.
+                    # Lifecycle release runs on the FIFO device lane. A future
+                    # owner receives a new generation and overwrites the complete
+                    # meta row before publishing its descriptor. The kernel also
+                    # requires STATE_VALID and an exact generation match.
                     self._mtp_free_tail_slots[state.tail_rank].append(state.tail_slot_id)
             if state is None:
                 continue
@@ -2016,7 +2015,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 and prepared.mtp_tail_slot_ids is not None
                 and self._l3_shared_buffers_ready
             ):
-                prepared = self._bind_prepared_mtp_dispatch(prepared, model.config.hidden_size)
+                prepared = self._bind_prepared_mtp_dispatch(
+                    prepared,
+                    model.config.hidden_size,
+                    model.config.vocab_size,
+                )
             if self._compiled.enable_mtp and self._l3_shared_buffers_ready:
                 if prepared.mtp_tail_slot_ids is None or prepared.dispatch_args is None:
                     raise RuntimeError("DeepSeekV4 MTP prepare did not produce a complete dispatch")
@@ -2166,10 +2169,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
 
         self._ensure_decode_buffers(model.config.hidden_size)
-        try:
-            staged = self._decode_input_slots[buffer_slot]
-        except IndexError as exc:
-            raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}") from exc
+        if not 0 <= buffer_slot < len(self._decode_input_slots):
+            raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
+        staged = self._decode_input_slots[buffer_slot]
         staged["num_tokens_per_owner"].zero_()
         staged["logit_row_indices"].fill_(-1)
         self._stage_decode_dynamic_inputs(
@@ -2585,7 +2587,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 cat="executor",
                 args={"actual_tokens": max(inputs.per_rank_counts) * self._compiled.layout.decode_seq},
             ):
-                inputs = self._bind_prepared_mtp_dispatch(inputs, model.config.hidden_size)
+                inputs = self._bind_prepared_mtp_dispatch(
+                    inputs,
+                    model.config.hidden_size,
+                    model.config.vocab_size,
+                )
         if getattr(inputs, "dispatch_args", None) is None:
             raise RuntimeError("DeepSeekV4 fused decode arguments were not bound")
         return self.dispatch_prepared_decode(model, batch, inputs)
@@ -2630,9 +2636,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_reclaim", cat="executor"):
             accepted_counts_list = []
             accepted = []
-            states = []
-            for request_id, rank, local_row in zip(
-                inputs.request_ids,
+            states = pending.states
+            for state, rank, local_row in zip(
+                states,
                 inputs.ranks,
                 inputs.local_rows,
                 strict=True,
@@ -2648,7 +2654,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 )
                 accepted_counts_list.append(accepted_count)
                 accepted.append([int(token) for token in main_tokens[:accepted_count]])
-                states.append(pending.states[len(states)])
             accepted_counts = tuple(accepted_counts_list)
             self._mtp_proposed_tokens += inputs.actual_batch
             self._mtp_accepted_tokens += sum(count == decode_seq for count in accepted_counts)
@@ -2697,13 +2702,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run the mode-independent packed main-model decode kernel."""
         with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
             inputs = prepared
-        decode_buffers = self._require_decode_buffers()
+        self._require_decode_buffers()
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
 
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
         logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
-        sampled_ids_buffer = decode_buffers.sampled_ids
+        sampled_ids_buffer = self._decode_input_slots[inputs.buffer_slot]["sampled_ids"]
         # The active hidden/pre-HC rows are pl.Out tensors and the grouped LM
         # head overwrites every logits row, including rows selected with -1.
         # Pre-clearing these reusable buffers only adds host memory bandwidth.
@@ -3099,12 +3104,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         inputs: DeepSeekV4PreparedDecodeInputs,
         hidden_size: int,
+        vocab_size: int,
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Bind all steady L3 arguments on the prepare lane."""
         staged = self._decode_input_slots[inputs.buffer_slot]
         hidden_buffer = self._require_decode_output_buffer(hidden_size)
         pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(hidden_size)
-        logits_buffer = self._require_decode_logits_buffer(DEEPSEEK_V4_VOCAB_SIZE)
+        logits_buffer = self._require_decode_logits_buffer(vocab_size)
         main_args = self._decode_fwd_args(
             inputs,
             pre_hc_hidden_buffer,
@@ -3594,26 +3600,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
             inputs.local_rows,
             strict=True,
         ):
-            state = self._mtp_request_states.get(request_id)
-            if state is None:
-                if require_ready:
+            with self._mtp_state_lock:
+                state = self._mtp_request_states.get(request_id)
+                if state is None:
+                    if require_ready:
+                        raise RuntimeError(
+                            f"DeepSeekV4 MTP state is missing for request {request_id!r}"
+                        )
+                    return inputs
+                if state.tail_slot_id is None:
+                    if require_ready:
+                        raise RuntimeError(
+                            f"DeepSeekV4 MTP tail slot is not reserved for {request_id!r}"
+                        )
+                    return inputs
+                if state.tail_rank != rank:
                     raise RuntimeError(
-                        f"DeepSeekV4 MTP state is missing for request {request_id!r}"
+                        f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
+                        f"slot rank={state.tail_rank}, decode rank={rank}"
                     )
-                return inputs
-            if state.tail_slot_id is None:
-                if require_ready:
-                    raise RuntimeError(
-                        f"DeepSeekV4 MTP tail slot is not reserved for {request_id!r}"
-                    )
-                return inputs
-            if state.tail_rank != rank:
-                raise RuntimeError(
-                    f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
-                    f"slot rank={state.tail_rank}, decode rank={rank}"
-                )
-            tail_slot_ids[rank, local_row] = state.tail_slot_id
-            state_generations[rank, local_row] = state.generation
+                tail_slot_ids[rank, local_row] = state.tail_slot_id
+                state_generations[rank, local_row] = state.generation
             # The MTP model emits one next draft per request.  It must consume
             # the hidden state at the end of that request's committed window,
             # not every main-model verifier row.
@@ -3760,8 +3767,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     ),
                 }
 
-            # Two immutable execution snapshots let the command thread prepare
-            # step N+1 while the device thread consumes step N.
+            # Two execution snapshots let the command thread prepare step N+1
+            # while the device thread consumes step N. Worker slot ownership is
+            # released only after output reclaim has finished reading the slot.
             self._decode_input_slots = [allocate_input_slot(0), allocate_input_slot(1)]
             buffers = _DeepSeekV4DecodeSharedBuffers(
                 x_out=self._shared_empty(

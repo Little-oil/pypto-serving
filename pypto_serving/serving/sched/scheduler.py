@@ -82,6 +82,11 @@ class Request:
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
     num_output_placeholders: int = 0
+    # Async scheduling must not turn a terminal prefill into a decode wave until
+    # the worker has initialized request-local decode state and confirmed the
+    # prefill result.  This is a per-request barrier, so unrelated ready requests
+    # can continue to use the depth-2 pipeline.
+    terminal_prefill_in_flight: bool = False
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -223,6 +228,9 @@ class Scheduler:
             # scheduling an earlier request. Do not schedule it again from the
             # stale iteration snapshot.
             if request.status is RequestStatus.PREEMPTED:
+                continue
+            if request.terminal_prefill_in_flight:
+                running_to_keep.append(request)
                 continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
                 running_to_keep.append(request)
@@ -423,6 +431,12 @@ class Scheduler:
                 reserved = 1 + self._speculative_tokens_for(request, scheduled)
                 request.num_output_placeholders += reserved
                 request.num_computed_tokens += reserved - 1
+            if (
+                scheduled.is_prefill
+                and completes_prompt
+                and self.config.num_speculative_tokens > 0
+            ):
+                request.terminal_prefill_in_flight = True
 
     def _speculative_tokens_for(
         self, request: "Request", scheduled: "ScheduledRequest"
@@ -460,6 +474,12 @@ class Scheduler:
             # also catch the preempt -> re-RUNNING case.
             if request.status.is_finished or request.status is RequestStatus.PREEMPTED:
                 continue
+            if (
+                scheduled.is_prefill
+                and scheduled.num_computed_tokens + scheduled.num_new_tokens
+                >= request.num_prompt_tokens
+            ):
+                request.terminal_prefill_in_flight = False
             token_value = new_token_ids.get(request.request_id)
             token_ids = (
                 []
@@ -692,6 +712,7 @@ class Scheduler:
         # from a clean prefill state (its in-flight step's result, if any, is
         # discarded engine-side since the request left `running`).
         victim.num_output_placeholders = 0
+        victim.terminal_prefill_in_flight = False
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}

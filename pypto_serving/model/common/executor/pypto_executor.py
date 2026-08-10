@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -225,11 +224,6 @@ class PyptoExecutor(ModelExecutor, ABC):
             if callable(requires):
                 return bool(requires(prepared))
         return super().prepared_decode_requires_token(prepared)
-
-    @contextlib.contextmanager
-    def session(self):
-        """Provide a generation lifecycle hook for PyPTO runtimes."""
-        yield
 
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""

@@ -49,6 +49,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DECODE_PIPELINE_SLOTS = 2
+_MISSING_REQUEST = object()
+
 
 @dataclass(frozen=True)
 class _PreparedDecodeWork:
@@ -67,11 +70,20 @@ class _PendingDecodeOutput:
     cmd: StepCommand
     scheduled: tuple[DecodeRequest, ...]
     pending: object
+    buffer_slot: int
 
 
 @dataclass(frozen=True)
 class _CompletedStepOutput:
     """Already materialized fallback-path result."""
+
+    result: StepResult
+    buffer_slot: int | None = None
+
+
+@dataclass(frozen=True)
+class _DecodeCommandFailure:
+    """Malformed input forwarded through the ordered device/output lanes."""
 
     result: StepResult
 
@@ -246,11 +258,14 @@ class WorkerProcess:
         to the reclaim lane and immediately consumes the next prepared command.
         Prefill and lifecycle-heavy restart commands retain the serial fallback.
         """
-        work_queue: queue.Queue[tuple[object, _PreparedDecodeWork | None]] = queue.Queue(maxsize=2)
+        work_queue: queue.Queue[
+            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+        ] = queue.Queue(maxsize=_DECODE_PIPELINE_SLOTS)
         output_work_queue: queue.Queue[object] = queue.Queue()
+        slot_ownership = [threading.Semaphore(1) for _ in range(_DECODE_PIPELINE_SLOTS)]
         output_thread = threading.Thread(
             target=self._output_reclaim_loop,
-            args=(output_work_queue,),
+            args=(output_work_queue, slot_ownership),
             name="pypto-output",
         )
         device_thread = threading.Thread(
@@ -265,35 +280,58 @@ class WorkerProcess:
                 try:
                     raw: bytes = self.input_queue.get()
                 except Exception:
-                    work_queue.put((ShutdownCommand(), None))
+                    work_queue.put((ShutdownCommand(), None, {}))
                     break
                 try:
                     cmd = decode_command(raw)
                 except Exception as exc:
                     logger.error("Worker failed to decode command: %s", exc, exc_info=True)
-                    self.output_queue.put(
-                        encode_result(StepResult(new_tokens={}, error=str(exc)))
+                    work_queue.put(
+                        (
+                            _DecodeCommandFailure(
+                                StepResult(new_tokens={}, error=str(exc))
+                            ),
+                            None,
+                            {},
+                        )
                     )
                     continue
+                release_cache_entries: dict[str, object] = {}
                 if isinstance(cmd, StepCommand):
-                    # Publish immutable sampling/request configuration as soon
-                    # as the command enters the prepare lane.  A following
-                    # decode command may arrive while this command's prefill is
-                    # still executing on the device lane.  Executor-owned state
-                    # is intentionally still registered/released FIFO below.
+                    # Snapshot the entries this command intends to release before
+                    # publishing newer registrations. Lifecycle release remains
+                    # on the FIFO device lane; the snapshots prevent it from
+                    # deleting a later registration that reused the same ID.
+                    release_cache_entries = {
+                        request_id: self._req_cache.get(request_id, _MISSING_REQUEST)
+                        for request_id in cmd.finished_request_ids
+                    }
                     for new_request in cmd.new_requests:
                         self._req_cache[new_request.request_id] = new_request
+                owned_slot = None
+                if (
+                    isinstance(cmd, StepCommand)
+                    and cmd.decode_requests
+                    and not cmd.prefill_requests
+                    and self.executor.supports_device_decode_embedding
+                ):
+                    owned_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
+                    slot_ownership[owned_slot].acquire()
                 try:
-                    prepared = self._prepare_step_command(cmd) if isinstance(cmd, StepCommand) else None
+                    prepared = (
+                        self._prepare_step_command(cmd, buffer_slot=owned_slot)
+                        if isinstance(cmd, StepCommand)
+                        else None
+                    )
                 except Exception as exc:
                     logger.error("Worker decode preparation failed: %s", exc, exc_info=True)
                     prepared = _PreparedDecodeWork(
                         prepared=None,
-                        buffer_slot=getattr(cmd, "step_id", 0) % 2,
+                        buffer_slot=owned_slot if owned_slot is not None else 0,
                         batch=None,
                         error=str(exc),
                     )
-                work_queue.put((cmd, prepared))
+                work_queue.put((cmd, prepared, release_cache_entries))
                 if isinstance(cmd, ShutdownCommand):
                     break
         finally:
@@ -302,19 +340,36 @@ class WorkerProcess:
 
     def _device_execution_loop(
         self,
-        work_queue: queue.Queue[tuple[object, _PreparedDecodeWork | None]],
+        work_queue: queue.Queue[
+            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+        ],
         output_work_queue: queue.Queue[object],
     ) -> None:
         """Dispatch FIFO device work without reclaiming host outputs."""
         while True:
-            cmd, prepared = work_queue.get()
+            cmd, prepared, release_cache_entries = work_queue.get()
             if isinstance(cmd, ShutdownCommand):
                 output_work_queue.put(cmd)
                 return
+            if isinstance(cmd, _DecodeCommandFailure):
+                output_work_queue.put(_CompletedStepOutput(cmd.result))
+                continue
             if isinstance(cmd, ProfileCommand):
                 barrier = _ProfileBarrier(command=cmd, completed=threading.Event())
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
+                continue
+            assert isinstance(cmd, StepCommand)
+            try:
+                self._apply_command_lifecycle(cmd, release_cache_entries)
+            except Exception as exc:
+                logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
+                output_work_queue.put(
+                    _CompletedStepOutput(
+                        StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                        buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                    )
+                )
                 continue
             if self._can_split_decode_output(cmd, prepared):
                 assert prepared is not None and prepared.batch is not None
@@ -324,34 +379,49 @@ class WorkerProcess:
                         cat="worker",
                         args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot},
                     ):
-                        with self.executor.session():
-                            dispatch_batch = self._late_bind_prepared_decode_batch(
-                                prepared,
-                                tuple(cmd.decode_requests),
-                            )
-                            pending = self.executor.dispatch_prepared_decode(
-                                self.model_record.runtime_model,
-                                dispatch_batch,
-                                prepared.prepared,
-                            )
+                        dispatch_batch = self._late_bind_prepared_decode_batch(
+                            prepared,
+                            tuple(cmd.decode_requests),
+                        )
+                        pending = self.executor.dispatch_prepared_decode(
+                            self.model_record.runtime_model,
+                            dispatch_batch,
+                            prepared.prepared,
+                        )
                     output_work_queue.put(
                         _PendingDecodeOutput(
                             cmd=cmd,
                             scheduled=tuple(cmd.decode_requests),
                             pending=pending,
+                            buffer_slot=prepared.buffer_slot,
                         )
                     )
                 except Exception as exc:
                     logger.error("Worker decode dispatch failed: %s", exc, exc_info=True)
                     output_work_queue.put(
                         _CompletedStepOutput(
-                            StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
+                            StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                            buffer_slot=prepared.buffer_slot,
                         )
                     )
                 continue
-            output_work_queue.put(_CompletedStepOutput(self._run_step_command(cmd, prepared)))
+            try:
+                result = self._execute_step(cmd, prepared_decode=prepared)
+            except Exception as exc:
+                logger.error("Worker step failed: %s", exc, exc_info=True)
+                result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
+            output_work_queue.put(
+                _CompletedStepOutput(
+                    result,
+                    buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                )
+            )
 
-    def _output_reclaim_loop(self, output_work_queue: queue.Queue[object]) -> None:
+    def _output_reclaim_loop(
+        self,
+        output_work_queue: queue.Queue[object],
+        slot_ownership: list[threading.Semaphore],
+    ) -> None:
         """Reclaim completed outputs and publish StepResults in dispatch order."""
         while True:
             work = output_work_queue.get()
@@ -365,10 +435,14 @@ class WorkerProcess:
                 continue
             if isinstance(work, _CompletedStepOutput):
                 result = work.result
+                buffer_slot = work.buffer_slot
             elif isinstance(work, _PendingDecodeOutput):
                 result = self._reclaim_pending_decode(work)
+                buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
+            if buffer_slot is not None:
+                slot_ownership[buffer_slot].release()
             self.output_queue.put(encode_result(result))
 
     def _can_split_decode_output(
@@ -402,7 +476,6 @@ class WorkerProcess:
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
-                self._release_finished_request_state(work.cmd.finished_request_ids)
             return StepResult(new_tokens=new_tokens, step_id=work.cmd.step_id)
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
@@ -466,22 +539,31 @@ class WorkerProcess:
     ) -> StepResult:
         """Apply lifecycle deltas and execute one FIFO command."""
         try:
-            # 1. Release finished or preempted requests. Release precedes
-            # registration because a preempted request can restart in this
-            # same command with fresh NewRequestData.
-            self._release_finished_request_state(cmd.finished_request_ids)
-
-            # 2. Register new and restarted requests into the cache.
-            for nr in cmd.new_requests:
-                self._req_cache[nr.request_id] = nr
-
-            # 3. Execute the step and return the encoded result.
+            self._apply_command_lifecycle(cmd)
             return self._execute_step(cmd, prepared_decode=prepared)
         except Exception as e:
             logger.error(f"Worker step failed: {e}", exc_info=True)
             return StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id)
 
-    def _release_finished_request_state(self, request_ids: list[str]) -> None:
+    def _apply_command_lifecycle(
+        self,
+        cmd: StepCommand,
+        expected_cache_entries: dict[str, object] | None = None,
+    ) -> None:
+        """Apply request release and registration on the FIFO device lane."""
+        self._release_finished_request_state(
+            cmd.finished_request_ids,
+            expected_cache_entries=expected_cache_entries,
+        )
+        for new_request in cmd.new_requests:
+            self._req_cache[new_request.request_id] = new_request
+
+    def _release_finished_request_state(
+        self,
+        request_ids: list[str],
+        *,
+        expected_cache_entries: dict[str, object] | None = None,
+    ) -> None:
         """Release executor and worker mirrors after older device work is safe."""
         if not request_ids:
             return
@@ -489,6 +571,11 @@ class WorkerProcess:
         if callable(release_finished):
             release_finished(request_ids)
         for req_id in request_ids:
+            if expected_cache_entries is not None:
+                expected = expected_cache_entries.get(req_id, _MISSING_REQUEST)
+                current = self._req_cache.get(req_id, _MISSING_REQUEST)
+                if current is not expected:
+                    continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
 
@@ -506,26 +593,25 @@ class WorkerProcess:
             cat="worker",
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
-            with self.executor.session():
-                if cmd.prefill_requests:
-                    max_prefill_batch = self.executor.max_prefill_batch_size
-                    if max_prefill_batch is None:
-                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
-                    else:
-                        if max_prefill_batch <= 0:
-                            raise ValueError("executor max_prefill_batch_size must be positive")
-                        for chunk in self._partitioned_prefill_chunks(
-                            cmd.prefill_requests,
-                            max_prefill_batch,
-                        ):
-                            self._batch_prefill(chunk, runtime_model, new_tokens)
-                if cmd.decode_requests:
-                    self._batch_decode(
-                        cmd.decode_requests,
-                        runtime_model,
-                        new_tokens,
-                        prepared_decode=prepared_decode,
-                    )
+            if cmd.prefill_requests:
+                max_prefill_batch = self.executor.max_prefill_batch_size
+                if max_prefill_batch is None:
+                    self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
+                else:
+                    if max_prefill_batch <= 0:
+                        raise ValueError("executor max_prefill_batch_size must be positive")
+                    for chunk in self._partitioned_prefill_chunks(
+                        cmd.prefill_requests,
+                        max_prefill_batch,
+                    ):
+                        self._batch_prefill(chunk, runtime_model, new_tokens)
+            if cmd.decode_requests:
+                self._batch_decode(
+                    cmd.decode_requests,
+                    runtime_model,
+                    new_tokens,
+                    prepared_decode=prepared_decode,
+                )
 
         # Retain the tokens just sampled so a following pipelined decode step can
         # resolve its PLACEHOLDER_TOKEN input from the worker cache.
@@ -676,12 +762,22 @@ class WorkerProcess:
             )
         return recent[-1]
 
-    def _prepare_step_command(self, cmd: StepCommand) -> _PreparedDecodeWork | None:
+    def _prepare_step_command(
+        self,
+        cmd: StepCommand,
+        *,
+        buffer_slot: int | None = None,
+    ) -> _PreparedDecodeWork | None:
         """Prepare decode-only metadata without touching request output state."""
         if cmd.prefill_requests or not cmd.decode_requests:
             return None
+        if not self.executor.supports_device_decode_embedding:
+            # Placeholder tokens cannot be embedded correctly until the prior
+            # device result is available. Keep this executor on the serial path.
+            return None
         runtime_model = self.model_record.runtime_model
-        buffer_slot = cmd.step_id % 2
+        if buffer_slot is None:
+            buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
         allow_device_greedy_sampling = (
             self.executor.supports_device_sampling
             and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in cmd.decode_requests)

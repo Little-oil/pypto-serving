@@ -9,7 +9,6 @@
 
 import signal
 import threading
-from contextlib import nullcontext
 from queue import Queue
 from types import SimpleNamespace
 
@@ -119,6 +118,25 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
     assert len(results) == 1
 
 
+def test_worker_release_does_not_remove_a_later_same_id_registration():
+    released: list[str] = []
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    old = NewRequestData("req", [0], 0.0, 1.0, None)
+    replacement = NewRequestData("req", [1], 0.0, 1.0, None)
+    worker._req_cache = {"req": replacement}
+    worker._last_tokens = {"req": [7]}
+
+    worker._release_finished_request_state(
+        ["req"],
+        expected_cache_entries={"req": old},
+    )
+
+    assert released == ["req"]
+    assert worker._req_cache["req"] is replacement
+    assert worker._last_tokens["req"] == [7]
+
+
 def test_serving_worker_packs_variable_length_prefill_chunks():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()
@@ -200,6 +218,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     first_running = threading.Event()
     allow_first_finish = threading.Event()
     second_prepared = threading.Event()
+    third_prepared = threading.Event()
     second_dispatched = threading.Event()
     first_reclaim_running = threading.Event()
     allow_first_reclaim = threading.Event()
@@ -215,18 +234,17 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         device_token = 10
 
         @staticmethod
-        def session():
-            return nullcontext()
-
-        @staticmethod
         def prepared_decode_requires_token(_prepared):
             return False
 
         @staticmethod
         def prepare_decode(_model, batch, *, buffer_slot):
             calls.append(("prepare", buffer_slot))
-            if len([call for call in calls if call[0] == "prepare"]) == 2:
+            prepare_count = len([call for call in calls if call[0] == "prepare"])
+            if prepare_count == 2:
                 second_prepared.set()
+            elif prepare_count == 3:
+                third_prepared.set()
             # Step N+1 may carry an optimistically resolved old host token.  The
             # simulated persistent device state below is authoritative.
             return SimpleNamespace(slot=buffer_slot)
@@ -288,6 +306,13 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         finished_request_ids=["old"],
         step_id=2,
     )
+    third = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 4, [])],
+        finished_request_ids=[],
+        step_id=3,
+    )
     thread = threading.Thread(target=worker.busy_loop)
     thread.start()
     input_queue.put(encode_command(first))
@@ -305,11 +330,17 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     # N's host-side output processing.
     assert first_reclaim_running.wait(timeout=5)
     assert second_dispatched.wait(timeout=5)
+    input_queue.put(encode_command(third))
+    # Step N+2 maps back to N's slot and must not prepare until reclaim has
+    # finished reading that slot's captured outputs.
+    assert not third_prepared.wait(timeout=0.1)
     assert output_queue.empty()
     allow_first_reclaim.set()
+    assert third_prepared.wait(timeout=5)
 
     first_result = decode_result(output_queue.get(timeout=5))
     second_result = decode_result(output_queue.get(timeout=5))
+    third_result = decode_result(output_queue.get(timeout=5))
     input_queue.put(encode_command(ShutdownCommand()))
     thread.join(timeout=5)
 
@@ -318,6 +349,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     # The optimistic host placeholder may still be stale here; persistent
     # device state supplies the authoritative token to N+1.
     assert second_result.new_tokens == {"req": [12]}
+    assert third_result.new_tokens == {"req": [13]}
     assert released == ["old"]
     assert calls.index(("prepare", 0)) < calls.index(("execute", 0))
     assert calls.index(("execute", 0)) < calls.index(("reclaim", 0))
@@ -334,6 +366,57 @@ def test_worker_does_not_prepare_prefill_asynchronously():
     )
 
     assert worker._prepare_step_command(command) is None
+
+
+def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(supports_device_decode_embedding=False)
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [])],
+        finished_request_ids=[],
+        step_id=1,
+    )
+
+    assert worker._prepare_step_command(command) is None
+
+
+def test_worker_routes_decode_failures_through_device_fifo():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._apply_command_lifecycle = lambda _cmd, _entries: None
+    worker._can_split_decode_output = lambda _cmd, _prepared: False
+    worker._execute_step = lambda cmd, prepared_decode=None: StepResult(step_id=cmd.step_id)
+    work_queue: Queue = Queue()
+    output_work_queue: Queue = Queue()
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[],
+        finished_request_ids=[],
+        step_id=7,
+    )
+    work_queue.put((command, None, {}))
+    work_queue.put(
+        (
+            serving_worker._DecodeCommandFailure(
+                StepResult(new_tokens={}, error="malformed")
+            ),
+            None,
+            {},
+        )
+    )
+    work_queue.put((ShutdownCommand(), None, {}))
+
+    worker._device_execution_loop(work_queue, output_work_queue)
+
+    first = output_work_queue.get_nowait()
+    second = output_work_queue.get_nowait()
+    assert isinstance(first, serving_worker._CompletedStepOutput)
+    assert first.result.step_id == 7
+    assert isinstance(second, serving_worker._CompletedStepOutput)
+    assert second.result.error == "malformed"
+    assert isinstance(output_work_queue.get_nowait(), ShutdownCommand)
 
 
 def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():
