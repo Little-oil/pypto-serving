@@ -10,9 +10,7 @@
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import importlib
-import inspect
 import os
 import sys
 from collections.abc import Iterable, Sequence
@@ -40,18 +38,6 @@ from pypto_serving.model.deepseek.weight_loader import (
 )
 from pypto_serving.tools.profile import profile_span
 
-_PYPTO_TORCH_DTYPES = {
-    "bfloat16": torch.bfloat16,
-    "bool": torch.bool,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "fp64": torch.float64,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "int32": torch.int32,
-    "int64": torch.int64,
-    "uint8": torch.uint8,
-}
 _DEEPSEEK_V4_KERNEL_DIRNAME = "deepseek_v4_flash_mtp"
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
@@ -128,53 +114,6 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
         "models",
         _DEEPSEEK_V4_KERNEL_DIRNAME,
     )
-
-
-def _runtime_scalar_compile_args(
-    jit_fn: object,
-    runtime_scalar_names: frozenset[str],
-) -> tuple[object, ...]:
-    """Build zero-storage tensor samples while preserving runtime scalar params."""
-    function = getattr(jit_fn, "_func", jit_fn)
-    signature = inspect.signature(function)
-    annotations = inspect.get_annotations(function, eval_str=True)
-    args: list[object] = []
-    remaining_scalars = set(runtime_scalar_names)
-    for parameter in signature.parameters.values():
-        annotation = annotations.get(parameter.name, parameter.annotation)
-        shape = getattr(annotation, "shape", None)
-        dtype = getattr(annotation, "dtype", None)
-        if shape is not None and dtype is not None:
-            dtype_name = str(dtype)
-            torch_dtype = _PYPTO_TORCH_DTYPES.get(dtype_name)
-            if torch_dtype is None:
-                raise TypeError(
-                    f"Unsupported PyPTO dtype {dtype_name!r} on parameter {parameter.name!r}"
-                )
-            extents: list[int] = []
-            for dim in shape:
-                try:
-                    extents.append(int(dim))
-                except (TypeError, ValueError):
-                    extents.append(1)
-            args.append(torch.empty(tuple(extents), dtype=torch_dtype, device="meta"))
-            continue
-        if parameter.name in runtime_scalar_names:
-            if str(dtype) != "int32":
-                raise TypeError(
-                    f"Runtime scalar parameter {parameter.name!r} must be pl.INT32; got {dtype!r}"
-                )
-            args.append(ctypes.c_int32())
-            remaining_scalars.remove(parameter.name)
-            continue
-        raise TypeError(
-            f"Cannot build a compile sample for parameter {parameter.name!r} "
-            f"with annotation {annotation!r}"
-        )
-    if remaining_scalars:
-        names = ", ".join(sorted(remaining_scalars))
-        raise TypeError(f"Runtime scalar parameters are absent from the JIT signature: {names}")
-    return tuple(args)
 
 
 @contextlib.contextmanager
@@ -505,14 +444,20 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         on the signature for the call sites but is not needed now that the
         layout-aware fingerprint is gone.
         """
-        compile_args = (
-            _runtime_scalar_compile_args(jit_fn, runtime_scalar_names)
+        from pypto.language import RUNTIME  # noqa: PLC0415
+
+        # Runtime scalars (mtp_num_tokens / num_tokens) vary per step, so leave
+        # them unspecialized: RUNTIME keeps them out of the compiled artifact and
+        # the cache key, like a pl.dynamic extent. Tensor params are read from
+        # their annotations, so no sample tensors are required.
+        runtime_scalars = (
+            {name: RUNTIME for name in runtime_scalar_names}
             if runtime_scalar_names
-            else ()
+            else {}
         )
         with profile_span(f"DeepSeekV4PyptoExecutor.compile.{name}", cat="executor"):
             return self._compiler.compile(
-                name, jit_fn, compile_args, use_cache=self._use_compile_cache
+                name, jit_fn, use_cache=self._use_compile_cache, **runtime_scalars
             )
 
 
