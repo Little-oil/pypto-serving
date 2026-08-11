@@ -33,10 +33,11 @@ requests in one global step. MTP decode uses B4S2 on each rank, for a maximum of
 32 global active rows. The scheduler may admit fewer long-context requests when
 a rank's fixed pypto-lib cache pools are full.
 
-For repeated launches, add `--kernel-cache-dir /persistent/path/deepseek-kernels`.
-The first launch populates the directory after executable assembly. Later
-launches reuse all four compiled programs when their source, PyPTO version,
-platform, tensor signatures, and scalar specializations still match.
+For repeated launches, set `PYPTO_PROG_BUILD_DIR` to a persistent directory and
+add `--use-compile-cache`. The first launch populates a device-specific worker
+subdirectory after executable assembly. Later launches reuse the compiled
+programs without fingerprint validation, so use the same model configuration,
+assigned devices, and kernel sources, and clear the directory after any change.
 
 MTP prefill context, draft token, committed tail, and acceptance counters are
 owned by request ID. MTP prefill and decode share one worker-resident cache, but

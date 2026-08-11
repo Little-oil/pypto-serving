@@ -33,7 +33,7 @@ POLL_SECONDS = 2
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-dir", type=Path, required=True)
-    parser.add_argument("--kernel-cache-dir", type=Path)
+    parser.add_argument("--use-compile-cache", action="store_true")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--devices", required=True)
     parser.add_argument("--served-model-name", default="dsv4-flash-w8a8")
@@ -206,8 +206,8 @@ def main(args: argparse.Namespace) -> int:
         "--profile-level",
         "verbose",
     ]
-    if args.kernel_cache_dir is not None:
-        command.extend(("--kernel-cache-dir", str(args.kernel_cache_dir.resolve())))
+    if args.use_compile_cache:
+        command.append("--use-compile-cache")
     print(f"Server command: {' '.join(command)}", flush=True)
     print(f"Server log: {server_log}", flush=True)
     with server_log.open("w", encoding="utf-8") as log_stream:
