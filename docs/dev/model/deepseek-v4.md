@@ -4,6 +4,67 @@ These commands are for DeepSeek V4 Flash W8A8 serving checks on shared Ascend
 development machines with `task-submit`. Run them from the pypto-serving
 checkout.
 
+## Prepare the W8A8 Checkpoint
+
+PyPTO serving expects a compressed-tensors W8A8 checkpoint. The released
+[`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+checkpoint instead mixes FP8 weights with packed MXFP4 expert weights, so it
+must be converted before serving. The conversion can run on CPU and does not
+require `torch_npu`, but the source and output checkpoints must use different
+directories. Make sure the machine has enough free disk space for both copies.
+
+Install the download and safetensors dependencies, then verify that the active
+PyPTO environment already provides PyTorch. Use the PyTorch build appropriate
+for that environment instead of replacing it with a generic wheel.
+
+```bash
+python -m pip install --upgrade huggingface_hub safetensors
+python -c "import torch, safetensors; print(torch.__version__)"
+```
+
+Download the original Hybrid FP8/MXFP4 checkpoint. If it is already available
+from another official mirror, use that snapshot directory as `--input-dir`
+instead.
+
+```bash
+hf download deepseek-ai/DeepSeek-V4-Flash \
+  --local-dir /data/models/DeepSeek-V4-Flash
+```
+
+Validate the source checkpoint and print the conversion plan without writing
+any output:
+
+```bash
+python scripts/convert_deepseek_v4_to_w8a8.py \
+  --input-dir /data/models/DeepSeek-V4-Flash \
+  --output-dir /data/models/dsv4-flash-w8a8 \
+  --dry-run
+```
+
+Run the conversion:
+
+```bash
+python scripts/convert_deepseek_v4_to_w8a8.py \
+  --input-dir /data/models/DeepSeek-V4-Flash \
+  --output-dir /data/models/dsv4-flash-w8a8
+```
+
+The converter writes one safetensors shard at a time using atomic replacement.
+If the process is interrupted, rerun the same command with `--resume`:
+
+```bash
+python scripts/convert_deepseek_v4_to_w8a8.py \
+  --input-dir /data/models/DeepSeek-V4-Flash \
+  --output-dir /data/models/dsv4-flash-w8a8 \
+  --resume
+```
+
+A successful run prints `Conversion complete` and leaves a converted
+`config.json`, `model.safetensors.index.json`, safetensors shards, and a
+`.pypto-w8a8-conversion.json` marker in the output directory. The resulting
+index records the total tensor payload size. The directory can be passed
+directly to `pypto-serving` as shown below.
+
 ## 8-Device Offline Generation
 
 The offline entry uses the same scheduler, worker process, rank-partitioned
