@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import stat
 import sys
 from dataclasses import replace
@@ -417,7 +419,7 @@ def test_deepseek_weight_store_maps_valid_prepacked_sidecar(tmp_path, monkeypatc
             "source_fingerprint": fingerprint,
         },
     )
-    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda path: 1.0)
+    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda fd, path: 1.0)
     monkeypatch.setattr(
         store,
         "load_packed_layer_weights",
@@ -462,7 +464,7 @@ def test_deepseek_weight_store_ignores_prepacked_sidecar_with_wrong_tensor_names
             "source_fingerprint": store.packed_stacked_layer_weights_fingerprint(**params),
         },
     )
-    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda path: 1.0)
+    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda fd, path: 1.0)
     caplog.set_level("WARNING")
 
     assert store.load_prepacked_stacked_layer_weights(**params) is None
@@ -478,7 +480,7 @@ def test_deepseek_weight_store_skips_cold_prepacked_sidecar(tmp_path, monkeypatc
         weight_map={"source.weight": shard_path.name},
     )
     deepseek_v4_packed_weights_path(tmp_path, ranks=2).write_bytes(b"not-opened")
-    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda path: 0.5)
+    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda fd, path: 0.5)
     caplog.set_level("INFO")
 
     packed = store.load_prepacked_stacked_layer_weights(
@@ -492,16 +494,19 @@ def test_deepseek_weight_store_skips_cold_prepacked_sidecar(tmp_path, monkeypatc
     assert "Skipping cold DeepSeekV4 packed weights sidecar" in caplog.text
 
 
-def test_deepseek_page_cache_probe_open_failure_falls_back(tmp_path, monkeypatch, caplog):
+def test_deepseek_page_cache_probe_unusable_descriptor_falls_back(tmp_path, caplog):
+    # The loader owns the descriptor now, so the probe's failure mode is a
+    # descriptor it cannot map rather than a path it cannot open.
     packed_path = tmp_path / "packed.safetensors"
-
-    def deny_open(*args, **kwargs):
-        raise PermissionError("denied")
-
-    monkeypatch.setattr(weight_loader.os, "open", deny_open)
-    caplog.set_level("WARNING")
-
-    assert weight_loader._sample_file_page_cache_residency(packed_path) is None
+    packed_path.write_bytes(b"")
+    fd = os.open(packed_path, os.O_RDONLY)
+    try:
+        caplog.set_level("WARNING")
+        os.close(fd)
+        assert weight_loader._sample_file_page_cache_residency(fd, packed_path) is None
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
     assert "Could not inspect page-cache residency" in caplog.text
 
 
@@ -2257,3 +2262,119 @@ def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank()
         3.0,
         4.0,
     ]
+
+
+def test_map_shared_prepacked_tensors_roundtrips_every_dtype_and_outlives_the_fd(tmp_path):
+    """Every sidecar dtype survives the mapping, including the reinterpreted ones.
+
+    BF16/F16 have no numpy dtype, so they are read as same-width integers and
+    reinterpreted; a wrong reinterpretation would silently corrupt weights. The
+    descriptor is closed before the assertions because the mapping is what keeps
+    the pages alive, not the fd.
+    """
+    from safetensors.torch import save_file
+
+    expected = {
+        "bf16": torch.tensor([[1.5, -2.25], [0.0, 7.0]], dtype=torch.bfloat16),
+        "f16": torch.tensor([[0.5, -4.0], [1.0, 3.5]], dtype=torch.float16),
+        "f32": torch.tensor([[1.0, -2.5], [3.25, 0.0]], dtype=torch.float32),
+        "i32": torch.tensor([[7, -9], [0, 2 ** 30]], dtype=torch.int32),
+        "i8": torch.tensor([[3, -4], [127, -128]], dtype=torch.int8),
+        "u8": torch.tensor([[200, 5], [0, 255]], dtype=torch.uint8),
+    }
+    sidecar = tmp_path / "packed.safetensors"
+    save_file(expected, str(sidecar))
+
+    fd = os.open(sidecar, os.O_RDONLY)
+    try:
+        mapped = weight_loader._map_shared_prepacked_tensors(fd, expected.keys())
+    finally:
+        os.close(fd)
+
+    assert mapped.keys() == expected.keys()
+    for name, tensor in expected.items():
+        assert mapped[name].dtype == tensor.dtype, name
+        assert torch.equal(mapped[name], tensor), name
+
+
+def test_mapped_prepacked_tensor_outlives_its_siblings_and_intermediates(tmp_path):
+    """One surviving tensor keeps its own mapping alive after everything else goes."""
+    import gc
+
+    from safetensors.torch import save_file
+
+    sidecar = tmp_path / "packed.safetensors"
+    save_file(
+        {
+            "keep": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            "drop": torch.ones((2, 4), dtype=torch.float32),
+        },
+        str(sidecar),
+    )
+    fd = os.open(sidecar, os.O_RDONLY)
+    try:
+        mapped = weight_loader._map_shared_prepacked_tensors(fd, ("keep", "drop"))
+    finally:
+        os.close(fd)
+
+    keep = mapped["keep"]
+    del mapped
+    gc.collect()
+
+    assert torch.equal(keep, torch.arange(8, dtype=torch.float32).reshape(2, 4))
+
+
+def test_prepacked_sidecar_replaced_after_validation_is_not_mapped(tmp_path, monkeypatch):
+    """A concurrent publish between validation and mapping must not be mapped.
+
+    The sidecar is published with an atomic ``os.replace``, so the name can point
+    at a different inode by the time the payload is read. Validation and mapping
+    share one descriptor, so the replacement is invisible to this load.
+    """
+    from safetensors.torch import save_file
+
+    shard_path = tmp_path / "model-00001-of-00001.safetensors"
+    shard_path.write_bytes(b"source-checkpoint")
+    store = DeepSeekV4WeightStore(
+        model_dir=tmp_path,
+        weight_map={"source.weight": shard_path.name},
+    )
+    params = {
+        "ranks": 2,
+        "n_routed_experts": 4,
+        "compress_ratios": (4,),
+        "num_hash_layers": 1,
+    }
+    metadata = {
+        "format": DEEPSEEK_V4_PACKED_FORMAT,
+        "source_fingerprint": store.packed_stacked_layer_weights_fingerprint(**params),
+    }
+    validated = {
+        name: torch.zeros((2, 1), dtype=torch.float32)
+        for name in weight_loader._DEEPSEEK_V4_PACKED_WEIGHT_NAMES
+    }
+    packed_path = deepseek_v4_packed_weights_path(tmp_path, ranks=2)
+    save_file(validated, str(packed_path), metadata=metadata)
+
+    # Same names, shapes and dtypes, so every structural check would still pass.
+    usurper = tmp_path / "usurper.safetensors"
+    save_file(
+        {name: torch.ones((2, 1), dtype=torch.float32) for name in validated},
+        str(usurper),
+        metadata=metadata,
+    )
+
+    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda fd, path: 1.0)
+    real_mapper = weight_loader._map_shared_prepacked_tensors
+
+    def publish_then_map(fd, names):
+        os.replace(usurper, packed_path)
+        return real_mapper(fd, names)
+
+    monkeypatch.setattr(weight_loader, "_map_shared_prepacked_tensors", publish_then_map)
+
+    packed = store.load_prepacked_stacked_layer_weights(**params)
+
+    assert packed is not None
+    for name, tensor in packed.tensors.items():
+        assert torch.equal(tensor, validated[name]), f"{name} came from the replacement sidecar"
