@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import stat
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -31,6 +32,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
+    DeepSeekV4PreparedDecodeInputs,
     accept_mtp_tokens,
     build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
@@ -1194,40 +1196,7 @@ def test_deepseek_prepare_mtp_decode_inputs_feeds_two_real_tokens():
     assert prepared.x_hc is None
 
 
-def test_deepseek_stage_decode_inputs_uses_shared_buffers():
-    runner, model = _runner_for_prepared_inputs()
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[5]], dtype=torch.long),
-            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=_grouped_cache_rows(1),
-            cache_partitions=[0],
-        ),
-    )
-
-    staged = runner._stage_decode_inputs(prepared)
-
-    assert staged.x_hc is None
-    assert runner._decode_buffers is not None
-    for name in (
-        "input_ids",
-        "position_ids",
-        "kv_seq_lens",
-        "block_table",
-        "cmp_block_table",
-        "idx_block_table",
-        "hca_compress_state_block_table",
-        "csa_compress_state_block_table",
-        "csa_inner_compress_state_block_table",
-        "block_counts",
-    ):
-        assert getattr(staged, name).is_shared()
-
-
-def test_deepseek_prepare_decode_inputs_reuses_static_metadata():
+def test_deepseek_prepare_decode_inputs_rebuilds_slot_metadata():
     runner, model = _runner_for_prepared_inputs()
     original_metadata = runner.cache_metadata
 
@@ -1264,14 +1233,162 @@ def test_deepseek_prepare_decode_inputs_reuses_static_metadata():
     assert first.block_table.is_shared()
 
     second = prepare(129, _grouped_cache_rows(1))
-    assert counting_metadata.ring_table_calls == first_ring_table_calls
+    assert counting_metadata.ring_table_calls == 2 * first_ring_table_calls
     assert second.block_table.data_ptr() == first.block_table.data_ptr()
     assert second.position_ids[0, 0].item() == 128
 
     changed_rows = _grouped_cache_rows(1)
     changed_rows[0]["ori"] = [10]
     prepare(130, changed_rows)
-    assert counting_metadata.ring_table_calls == first_ring_table_calls + 3
+    assert counting_metadata.ring_table_calls == 3 * first_ring_table_calls
+
+
+def test_deepseek_early_decode_prepare_uses_isolated_ping_pong_slots():
+    runner, model = _runner_for_prepared_inputs()
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[99]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+        cache_partitions=[0],
+    )
+
+    first = runner.prepare_decode(model, batch, buffer_slot=0)
+    second = runner.prepare_decode(model, batch, buffer_slot=1)
+
+    assert first.buffer_slot == 0
+    assert second.buffer_slot == 1
+    assert first.input_ids.data_ptr() != second.input_ids.data_ptr()
+    assert first.block_table.data_ptr() != second.block_table.data_ptr()
+    # Early preparation must not consume the not-yet-known prior-step token.
+    assert first.input_ids.eq(0).all()
+    assert second.input_ids.eq(0).all()
+    second.input_ids.fill_(7)
+    assert first.input_ids.eq(0).all()
+
+
+@pytest.mark.parametrize("buffer_slot", [-1, 2])
+def test_deepseek_early_decode_prepare_rejects_invalid_buffer_slot(buffer_slot):
+    runner, model = _runner_for_prepared_inputs()
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[99]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+        cache_partitions=[0],
+    )
+
+    with pytest.raises(ValueError, match="decode buffer_slot must be 0 or 1"):
+        runner.prepare_decode(model, batch, buffer_slot=buffer_slot)
+
+
+def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.enable_mtp = True
+    runner._mtp_request_states["req-a"] = SimpleNamespace(
+        tail_rank=0,
+        tail_slot_id=3,
+        generation=7,
+        device_state_initialized=True,
+    )
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[99]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+        cache_partitions=[0],
+        allow_device_greedy_sampling=True,
+    )
+
+    first = runner.prepare_decode(model, batch, buffer_slot=0)
+    second = runner.prepare_decode(model, batch, buffer_slot=1)
+
+    assert first.mtp_tail_slot_ids[0, 0].item() == 3
+    assert first.mtp_state_generations[0, 0].item() == 7
+    assert first.mtp_logit_row_indices[0, 0].item() == 1
+    assert first.mtp_tail_slot_ids.data_ptr() != second.mtp_tail_slot_ids.data_ptr()
+    assert (
+        runner._decode_input_slots[0]["sampled_ids"].data_ptr()
+        != runner._decode_input_slots[1]["sampled_ids"].data_ptr()
+    )
+    assert (
+        runner._decode_input_slots[0]["mtp_accepted_counts"].data_ptr()
+        != runner._decode_input_slots[1]["mtp_accepted_counts"].data_ptr()
+    )
+    second.mtp_tail_slot_ids[0, 0] = 5
+    assert first.mtp_tail_slot_ids[0, 0].item() == 3
+
+
+def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.enable_mtp = True
+    runner._l3_shared_buffers_ready = True
+    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
+        inputs,
+        dispatch_args=("fused",),
+    )
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[99]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+        cache_partitions=[0],
+        allow_device_greedy_sampling=True,
+    )
+
+    prepared = runner.prepare_decode(model, batch, buffer_slot=0)
+
+    state = runner._mtp_request_states["req-a"]
+    assert state.tail_rank == 0
+    assert state.tail_slot_id == 0
+    assert state.generation == 1
+    assert not state.device_state_initialized
+    assert prepared.mtp_tail_slot_ids[0, 0].item() == 0
+    assert prepared.mtp_state_generations[0, 0].item() == 1
+    assert prepared.dispatch_args == ("fused",)
+
+    state.device_state_initialized = True
+    runner._require_decode_callable = lambda: SimpleNamespace(name="decode_mtp_fused")
+    runner._run_l3 = lambda _callable, *args: args == ("fused",) or pytest.fail(
+        "prepared dispatch arguments changed"
+    )
+    pending = runner.dispatch_prepared_decode(model, batch, prepared)
+    assert pending.states == (state,)
+
+
+def test_deepseek_prefill_context_preserves_prepare_reserved_state():
+    runner, _model = _runner_for_prepared_inputs()
+    runner._compiled.enable_mtp = True
+    state = runner._reserve_mtp_request_state("req-a", 0)
+    slot = state.tail_slot_id
+    generation = state.generation
+    layout = runner._compiled.layout
+    tokens = 2
+    hidden = 4
+    inputs = SimpleNamespace(
+        request_ids=("req-a",),
+        ranks=(0,),
+        actual_tokens=(tokens,),
+        x_hc=torch.zeros(layout.ranks, tokens, 1, hidden),
+        input_ids=torch.zeros(layout.ranks, tokens, dtype=torch.long),
+        position_ids=torch.zeros(layout.ranks, tokens, dtype=torch.int32),
+        ori_block_table=torch.zeros(layout.ranks, 1, dtype=torch.int32),
+        ori_slot_mapping=torch.zeros(layout.ranks, tokens, dtype=torch.int32),
+    )
+
+    runner._capture_mtp_prefill_context(
+        inputs,
+        torch.zeros(layout.ranks, tokens, 1, hidden),
+    )
+
+    assert runner._mtp_request_states["req-a"] is state
+    assert state.tail_slot_id == slot
+    assert state.generation == generation
+    assert state.prefill_context is not None
 
 
 def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first_step():
@@ -1333,14 +1450,43 @@ def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first
     assert runner._mtp_buffers.decode_tail_slot_ids[1, 0].item() == -1
 
 
+def test_deepseek_fused_mtp_metadata_carries_stable_slot_generation():
+    runner, _model = _runner_for_prepared_inputs()
+    layout = runner._compiled.layout
+    runner._mtp_buffers = SimpleNamespace(
+        decode_tail_slot_ids=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
+        decode_state_generations=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
+        decode_tail_token_ids=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.long),
+        decode_tail_positions=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
+        decode_logit_row_indices=torch.empty(
+            layout.ranks, layout.decode_tokens, dtype=torch.int32
+        ),
+    )
+    runner._mtp_request_states["req-a"] = SimpleNamespace(
+        tail_rank=0,
+        tail_slot_id=2,
+        tail_token_id=11,
+        tail_position=127,
+        generation=9,
+        device_state_initialized=True,
+    )
+    inputs = SimpleNamespace(
+        request_ids=("req-a",),
+        ranks=(0,),
+        local_rows=(0,),
+        per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
+    )
+
+    assert runner._stage_fused_mtp_metadata(inputs) == layout.decode_seq
+    assert runner._mtp_buffers.decode_tail_slot_ids[0, 0].item() == 2
+    assert runner._mtp_buffers.decode_state_generations[0, 0].item() == 9
+    assert runner._mtp_buffers.decode_state_generations[1:].eq(0).all()
+
+
 def test_deepseek_run_decode_dispatches_active_token_count():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode")
     captured: dict[str, object] = {}
-
-    def fake_stage(inputs):
-        captured["prepared"] = inputs
-        return inputs
 
     def fake_decode_fwd_args(inputs, pre_hc_hidden_out, hidden_out, logits, sampled_ids):
         captured["num_tokens_per_owner"] = inputs.num_tokens_per_owner
@@ -1356,7 +1502,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
         dtype=torch.bfloat16,
     )
     runner._ensure_l3_shared_buffers = lambda _model: None
-    runner._stage_decode_inputs = fake_stage
     runner._require_decode_buffers = lambda: SimpleNamespace(
         sampled_ids=torch.empty(
             runner._compiled.layout.ranks,
@@ -1398,8 +1543,9 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     assert result.logits.shape == (1, model.config.vocab_size)
 
 
-def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
+def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     runner, model = _runner_for_prepared_inputs()
+    runner._compiled.enable_mtp = True
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode_mtp_fused")
     runner._decode_flow = runner._run_mtp_decode
     layout = runner._compiled.layout
@@ -1440,28 +1586,59 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
         proposed_tokens=0,
         accepted_tokens=0,
         committed_count=0,
+        generation=1,
+        device_state_initialized=True,
     )
     runner._mtp_request_states["req-a"] = state
-    staged = SimpleNamespace(
+    placeholder = torch.empty(0)
+    staged = DeepSeekV4PreparedDecodeInputs(
         request_ids=("req-a",),
         ranks=(0,),
         local_rows=(0,),
         actual_batch=1,
         per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
+        x_hc=None,
+        input_ids=placeholder,
+        position_ids=placeholder,
+        kv_seq_lens=placeholder,
+        block_table=placeholder,
+        cmp_block_table=placeholder,
+        idx_block_table=placeholder,
+        hca_compress_state_block_table=placeholder,
+        csa_compress_state_block_table=placeholder,
+        csa_inner_compress_state_block_table=placeholder,
+        block_counts=placeholder,
+        block_ids_by_group=(),
+        num_tokens_per_owner=placeholder,
+        logit_row_indices=placeholder,
+        mtp_tail_slot_ids=torch.zeros(layout.ranks, layout.decode_batch, dtype=torch.int32),
+        buffer_slot=0,
+        dispatch_args=None,
     )
     dispatches = []
 
     runner._ensure_l3_shared_buffers = lambda _model: None
-    runner.prepare_mtp_decode_inputs = lambda _model, _batch: staged
-    runner._stage_decode_inputs = lambda prepared: prepared
-    runner._stage_fused_mtp_metadata = lambda _inputs: layout.decode_seq
+    runner._stage_decode_dynamic_inputs = lambda *_args, **_kwargs: pytest.fail(
+        "prepared MTP decode must bind recurrent inputs from device state"
+    )
     runner._require_decode_buffers = lambda: SimpleNamespace(sampled_ids=main_sampled_ids)
     runner._require_mtp_buffers = lambda: mtp_buffers
     runner._require_decode_output_buffer = lambda _hidden_size: torch.empty(0)
     runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(0)
     runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
     runner._decode_fwd_args = lambda *_args: ()
-    runner._fused_mtp_decode_args = lambda _main_args, _active_tokens: ("fused",)
+    runner._fused_mtp_decode_args = lambda _main_args, _inputs, _active_tokens: ("fused",)
+    runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
+        inputs,
+        dispatch_args=("fused",),
+    )
+    runner._decode_input_slots = [{
+        "sampled_ids": main_sampled_ids,
+        "mtp_accepted_counts": mtp_buffers.decode_accepted_counts,
+        "mtp_sampled_ids": mtp_buffers.decode_sampled_ids,
+        "mtp_committed_input_ids": mtp_buffers.decode_input_ids,
+        "mtp_committed_position_ids": mtp_buffers.decode_position_ids,
+    }]
 
     def fake_run_l3(callable_spec, *args):
         dispatches.append((callable_spec.name, args))
@@ -1474,22 +1651,26 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
 
     runner._run_l3 = fake_run_l3
 
-    result = runner.run_decode(
+    result = runner._run_mtp_decode(
         model,
         DecodeBatch(
             request_ids=["req-a"],
             token_ids=torch.tensor([[3]], dtype=torch.long),
             hidden_states=None,
             seq_lens=torch.tensor([128], dtype=torch.int32),
+            cache_partitions=[0],
             allow_device_greedy_sampling=True,
         ),
+        prepared=staged,
     )
 
     assert dispatches == [("decode_mtp_fused", ("fused",))]
     assert result.accepted_token_ids == [[5, 9]]
-    assert state.draft_token_id == 7
-    assert state.tail_token_id == 9
-    assert state.tail_position == 128
+    # Steady execution consumes the kernel-owned device state.  Host mirrors
+    # remain at their initialization values unless DEBUG diagnostics are on.
+    assert state.draft_token_id == 5
+    assert state.tail_token_id == 3
+    assert state.tail_position == 126
     assert state.proposed_tokens == 1
     assert state.accepted_tokens == 1
     assert state.committed_count == 2

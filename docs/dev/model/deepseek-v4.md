@@ -33,16 +33,28 @@ requests in one global step. MTP decode uses B4S2 on each rank, for a maximum of
 32 global active rows. The scheduler may admit fewer long-context requests when
 a rank's fixed pypto-lib cache pools are full.
 
-For repeated launches, add `--kernel-cache-dir /persistent/path/deepseek-kernels`.
-The first launch populates the directory after executable assembly. Later
-launches reuse all four compiled programs when their source, PyPTO version,
-platform, tensor signatures, and scalar specializations still match.
+For repeated launches, set `PYPTO_PROG_BUILD_DIR` to a persistent directory and
+add `--use-compile-cache`. The first launch populates a device-specific worker
+subdirectory after executable assembly. Later launches reuse the compiled
+programs without fingerprint validation, so use the same model configuration,
+assigned devices, and kernel sources, and clear the directory after any change.
 
 MTP prefill context, draft token, committed tail, and acceptance counters are
 owned by request ID. MTP prefill and decode share one worker-resident cache, but
 each request addresses it with the scheduler-owned rank-local `ori` block IDs.
 The scheduler reserves the extra speculative position before dispatch, including
 when a draft crosses a 128-token page boundary.
+
+Before the first decode is prepared, each request owns a stable rank-local
+device-state slot and reuse generation. Terminal prefill fills that reserved
+slot with the committed tail token, next draft token, tail position, and
+committed count. The fused decode kernel
+uses `(rank, slot, generation)` to build the next `[tail, draft]` input rows and
+sequence metadata before main decode, then updates the same slot after MTP
+verification. Host output processing mirrors the state for scheduling and
+statistics, but is not an input dependency of the next steady-state decode.
+Generation matching prevents a stale queued step from updating a slot after
+preemption and reuse.
 
 The seven main-model KV/state pools are allocated during runner preflight as
 rank-sharded worker-resident tensors. Prefill and decode pass the same device

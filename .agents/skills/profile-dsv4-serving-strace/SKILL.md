@@ -25,7 +25,7 @@ From the repository root:
 ```bash
 bash .agents/skills/profile-dsv4-serving-strace/scripts/run_profile.sh \
   --model-dir /path/to/dsv4-flash-w8a8 \
-  --kernel-cache-dir /persistent/path/deepseek-kernels \
+  --use-compile-cache \
   --devices 0,1,2,3,4,5,6,7
 ```
 
@@ -40,6 +40,10 @@ The defaults are:
   serving worker step 1800 s
 - serving profiling: on-demand `--profile --profile-level verbose`, with output under the
   artifact directory
+
+Pass `--use-compile-cache` to reuse kernels from the serving worker's device-specific
+`pypto_build_dir`. Reuse the same assigned devices, model configuration, and kernel sources;
+the current cache has no fingerprinting and stale binaries are not detected automatically.
 
 Use the current `SIMPLER_SCHEDULER_TIMEOUT_MS`, `SIMPLER_OP_EXECUTE_TIMEOUT_US`,
 and `SIMPLER_STREAM_SYNC_TIMEOUT_MS` names. The former `PTO2_*TIMEOUT*` names are
@@ -56,7 +60,7 @@ bash .agents/skills/profile-dsv4-serving-strace/scripts/run_profile.sh \
 ```
 
 The wrapper also accepts `PYPTO_DSV4_MODEL_DIR`, `PYPTO_PROFILE_PYTHON`,
-`PYPTO_PROFILE_DEVICES`, `PYPTO_PROFILE_RUN_ID`, and `PYPTO_KERNEL_CACHE_DIR`.
+`PYPTO_PROFILE_DEVICES`, `PYPTO_PROFILE_RUN_ID`, and `PYPTO_USE_COMPILE_CACHE=1`.
 Device discovery falls back to `TASK_DEVICE`, then `ASCEND_RT_VISIBLE_DEVICES`. If none
 is set, pass `--devices` explicitly; the runner never assumes a device range.
 

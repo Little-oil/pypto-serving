@@ -11,7 +11,7 @@ Usage: run_profile.sh --model-dir DIR [options]
 
 Options:
   --artifact-dir DIR       Output directory (default: artifacts/<timestamp>)
-  --kernel-cache-dir DIR   Reuse compiled kernels across launches
+  --use-compile-cache      Reuse kernels from the serving worker build directory
   --python PATH            Python interpreter (default: current python3/python)
   --devices IDS            Eight comma-separated device IDs (default: allocation env)
   --max-tokens N           Output-token limit (default: 20)
@@ -34,7 +34,7 @@ PROMPT="Huawei is"
 SERVED_MODEL_NAME=dsv4-flash-w8a8
 RUN_ID=${PYPTO_PROFILE_RUN_ID:-unknown}
 ARTIFACT_DIR=
-KERNEL_CACHE_DIR=${PYPTO_KERNEL_CACHE_DIR:-}
+USE_COMPILE_CACHE=${PYPTO_USE_COMPILE_CACHE:-0}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,9 +42,9 @@ while [[ $# -gt 0 ]]; do
       ARTIFACT_DIR=$2
       shift 2
       ;;
-    --kernel-cache-dir)
-      KERNEL_CACHE_DIR=$2
-      shift 2
+    --use-compile-cache)
+      USE_COMPILE_CACHE=1
+      shift
       ;;
     --python)
       PYTHON_BIN=$2
@@ -102,9 +102,18 @@ fi
 
 ARTIFACT_DIR=$(realpath -m "$ARTIFACT_DIR")
 MODEL_DIR=$(realpath -m "$MODEL_DIR")
-if [[ -n "$KERNEL_CACHE_DIR" ]]; then
-  KERNEL_CACHE_DIR=$(realpath -m "$KERNEL_CACHE_DIR")
-fi
+case "${USE_COMPILE_CACHE,,}" in
+  1|true|yes|on)
+    USE_COMPILE_CACHE=1
+    ;;
+  0|false|no|off|"")
+    USE_COMPILE_CACHE=0
+    ;;
+  *)
+    echo "error: PYPTO_USE_COMPILE_CACHE must be a boolean value" >&2
+    exit 2
+    ;;
+esac
 trap 'printf "Artifacts: %s\n" "$ARTIFACT_DIR"' EXIT
 mkdir -p "$ARTIFACT_DIR"
 
@@ -133,8 +142,8 @@ PROFILE_ARGS=(
   --max-tokens "$MAX_TOKENS"
   --prompt "$PROMPT"
 )
-if [[ -n "$KERNEL_CACHE_DIR" ]]; then
-  PROFILE_ARGS+=(--kernel-cache-dir "$KERNEL_CACHE_DIR")
+if [[ "$USE_COMPILE_CACHE" == 1 ]]; then
+  PROFILE_ARGS+=(--use-compile-cache)
 fi
 "$PYTHON_BIN" "$SCRIPT_DIR/run_profile.py" \
   "${PROFILE_ARGS[@]}" \

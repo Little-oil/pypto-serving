@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
-import math
 import logging
+import math
+import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -490,7 +491,8 @@ _MTP_PREFILL_TENSOR_ORDER = (
 
 _MTP_DECODE_TENSOR_ORDER = (
     "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
-    "accepted_counts", "tail_slot_ids", "position_ids",
+    "accepted_counts", "tail_slot_ids", "state_generations", "state_tokens", "state_meta",
+    "position_ids",
     "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
     "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
@@ -518,21 +520,12 @@ _FUSED_MTP_SHARED_TENSORS = frozenset(
     }
 )
 
-_DECODE_INPUT_TENSOR_FIELDS = (
-    "input_ids",
-    "position_ids",
-    "kv_seq_lens",
-    "block_table",
-    "cmp_block_table",
-    "idx_block_table",
-    "hca_compress_state_block_table",
-    "csa_compress_state_block_table",
-    "csa_inner_compress_state_block_table",
-    "block_counts",
-    "num_tokens_per_owner",
-    "logit_row_indices",
-)
-
+_MTP_DEVICE_STATE_TOKEN_WIDTH = 2
+_MTP_DEVICE_STATE_META_WIDTH = 4
+_MTP_STATE_VALID = 0
+_MTP_STATE_GENERATION = 1
+_MTP_STATE_TAIL_POSITION = 2
+_MTP_STATE_COMMITTED_COUNT = 3
 
 @dataclass(frozen=True)
 class DeepSeekV4CacheLayout:
@@ -1137,8 +1130,8 @@ class DeepSeekV4PreparedPrefillInputs:
 class DeepSeekV4PreparedDecodeInputs:
     """Fixed-shape shared tensors derived from one decode scheduler batch.
 
-    The tensor fields are views over runner-owned reusable buffers and remain
-    valid only until the next decode batch is prepared.
+    The tensor fields are views over one runner-owned execution slot and remain
+    valid until that slot is reused.
     """
 
     request_ids: tuple[str, ...]
@@ -1159,7 +1152,29 @@ class DeepSeekV4PreparedDecodeInputs:
     block_counts: torch.Tensor
     block_ids_by_group: tuple[dict[str, tuple[int, ...]], ...]
     num_tokens_per_owner: torch.Tensor
+    # Main-model LM-head routing.  Each non-negative entry is a flattened
+    # decode hidden-row index whose logits must be computed; -1 disables that
+    # output row.  For MTP S=2, active request k normally contributes rows
+    # 2*k and 2*k+1 so the verifier can compare both main-model predictions.
     logit_row_indices: torch.Tensor
+    buffer_slot: int = 0
+    # Per-batch-row mapping to the request's stable device-state/tail-pool
+    # slot.  Unlike local_row, this slot survives batch reorder and compaction;
+    # -1 marks padding or an inactive row.
+    mtp_tail_slot_ids: torch.Tensor | None = None
+    # Expected allocation generation for mtp_tail_slot_ids.  A kernel may use
+    # a slot only when this value matches state_meta[slot].generation, which
+    # prevents a stale prepared step from touching a slot recycled to another
+    # request (the classic ABA reuse case).
+    mtp_state_generations: torch.Tensor | None = None
+    # MTP-draft LM-head routing.  There is one next-draft prediction per active
+    # request, selected from the last row of its committed S=2 window; unused
+    # entries are -1.
+    mtp_logit_row_indices: torch.Tensor | None = None
+    # Fully bound L3 arguments for the steady fused-MTP path.  Preparing this
+    # tuple on the command lane keeps Python argument binding off the device
+    # lane, including the first decode prepared while terminal prefill runs.
+    dispatch_args: tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1196,19 @@ class _DeepSeekV4MainDecodeOutput:
     pre_hc_hidden: StackedDeviceTensor
     logits: torch.Tensor
     sampled_ids: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4PendingMtpDecode:
+    """Completed device dispatch whose small host outputs await reclaim."""
+
+    inputs: DeepSeekV4PreparedDecodeInputs
+    sampled_ids: torch.Tensor
+    accepted_counts: torch.Tensor
+    mtp_sampled_ids: torch.Tensor
+    committed_input_ids: torch.Tensor
+    committed_position_ids: torch.Tensor
+    states: tuple["_DeepSeekV4MtpRequestState", ...]
 
 
 @dataclass
@@ -1231,6 +1259,9 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_tail_slot_ids: torch.Tensor
     decode_tail_token_ids: torch.Tensor
     decode_tail_positions: torch.Tensor
+    decode_state_generations: torch.Tensor
+    state_init_tokens: torch.Tensor
+    state_init_meta: torch.Tensor
     tail_init_hidden: torch.Tensor
     decode_kv_cache: torch.Tensor
     prefill_hidden_out: torch.Tensor
@@ -1277,6 +1308,8 @@ class _DeepSeekV4MtpRequestState:
     tail_rank: int | None = None
     tail_slot_id: int | None = None
     tail_position: int | None = None
+    generation: int = 0
+    device_state_initialized: bool = False
     proposed_tokens: int = 0
     accepted_tokens: int = 0
     # Running count of committed output tokens (advances by 1 or 2 per decode
@@ -1381,24 +1414,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
         self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
-        self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
-            None
-        ] * compiled.layout.ranks
-        self._decode_assignment_cache_key: tuple[tuple[str, ...], tuple[int, ...]] | None = None
-        self._decode_assignment_cache: _DeepSeekV4DecodeAssignment | None = None
-        self._decode_logit_row_range = torch.arange(
-            DEEPSEEK_V4_MAX_LOGIT_ROWS,
-            dtype=torch.int32,
-        )
-        self._decode_fwd_args_cache: tuple[Any, ...] | None = None
-        self._mtp_decode_args_cache: tuple[Any, ...] | None = None
-        self._fused_mtp_main_args: tuple[Any, ...] | None = None
-        self._fused_mtp_args_cache: dict[int, tuple[Any, ...]] = {}
+        self._decode_input_slots: list[dict[str, torch.Tensor]] = []
         self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._embedding_device_weight: StackedDeviceTensor | None = None
         self._main_pre_hc_device: StackedDeviceTensor | None = None
         self._mtp_tail_pre_hc_pool: StackedDeviceTensor | None = None
+        self._mtp_device_state_tokens: StackedDeviceTensor | None = None
+        self._mtp_device_state_meta: StackedDeviceTensor | None = None
+        self._l3_shared_buffers_ready = False
         self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._prefill_output_buffer: torch.Tensor | None = None
@@ -1410,9 +1434,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
         self._mtp_prefill_device_outputs: _DeepSeekV4MtpPrefillDeviceOutputs | None = None
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
+        self._mtp_state_lock = threading.RLock()
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
             for _ in range(compiled.layout.ranks)
+        ]
+        self._mtp_slot_generations = [
+            [0] * compiled.layout.decode_batch for _ in range(compiled.layout.ranks)
         ]
         self._mtp_proposed_tokens = 0
         self._mtp_accepted_tokens = 0
@@ -1422,6 +1450,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         else:
             self._decode_flow = self._run_autoregressive_decode
             self._prefill_completion = self._ignore_prefill_context
+
+    @property
+    def supports_async_decode_reclaim(self) -> bool:
+        """Fused MTP owns stable device state and ping-ponged host outputs."""
+        return self._compiled.enable_mtp
+
+    @staticmethod
+    def prepared_decode_requires_token(prepared: object) -> bool:
+        """Fused MTP consumes persistent state initialized during prefill."""
+        return not isinstance(prepared, DeepSeekV4PreparedDecodeInputs)
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
         """Allocate heterogeneous cache pools from the post-weight HBM budget.
@@ -1644,11 +1682,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Discard request-local MTP state for finished or preempted requests."""
         request_ids = tuple(request_ids)
         for request_id in request_ids:
-            state = self._mtp_request_states.pop(request_id, None)
+            with self._mtp_state_lock:
+                state = self._mtp_request_states.pop(request_id, None)
+                if state is not None and state.tail_rank is not None and state.tail_slot_id is not None:
+                    # Lifecycle release runs on the FIFO device lane. A future
+                    # owner receives a new generation and overwrites the complete
+                    # meta row before publishing its descriptor. The kernel also
+                    # requires STATE_VALID and an exact generation match.
+                    self._mtp_free_tail_slots[state.tail_rank].append(state.tail_slot_id)
             if state is None:
                 continue
-            if state.tail_rank is not None and state.tail_slot_id is not None:
-                self._mtp_free_tail_slots[state.tail_rank].append(state.tail_slot_id)
             if state.proposed_tokens:
                 logger.info(
                     "DeepSeekV4 MTP acceptance for %s: accepted=%d proposed=%d rate=%.2f%%",
@@ -1925,6 +1968,126 @@ class DeepSeekV4ModelRunner(ModelRunner):
             logit_row_indices=logit_row_indices,
         )
 
+    def prepare_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        buffer_slot: int,
+    ) -> DeepSeekV4PreparedDecodeInputs:
+        """Prepare an isolated decode metadata snapshot while the device is busy.
+
+        Token IDs and exact speculative sequence lengths are placeholders. The
+        fused MTP kernel replaces active rows from stable device-state slots.
+        """
+        assignment = self._decode_assignment(batch)
+        if self._compiled.enable_mtp:
+            if not batch.allow_device_greedy_sampling:
+                raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+            for request_id, rank in zip(batch.request_ids, assignment.ranks, strict=True):
+                self._reserve_mtp_request_state(request_id, rank)
+        actual_batch = len(batch.request_ids)
+        active_seq = self._compiled.layout.decode_seq if self._compiled.enable_mtp else 1
+        if not self._compiled.enable_mtp and max(assignment.per_rank_counts) > 1:
+            raise ValueError(
+                "DeepSeekV4 non-MTP decode supports at most one request per DP rank"
+            )
+        # Exact positions depend on step N acceptance. Use valid filler values;
+        # the fused kernel binds active rows from device state before main decode.
+        positions = tuple((0,) * self._compiled.layout.decode_seq for _ in range(actual_batch))
+        placeholder_rows = torch.zeros(
+            (actual_batch, self._compiled.layout.decode_seq), dtype=torch.long
+        )
+        with profile_span("DeepSeekV4ModelRunner.decode.prepare_early", cat="executor"):
+            prepared = self._prepare_decode_inputs(
+                model,
+                batch,
+                assignment=assignment,
+                active_seq=active_seq,
+                positions=positions,
+                token_rows=placeholder_rows,
+                x_hc=None,
+                buffer_slot=buffer_slot,
+            )
+            prepared = self._prepare_mtp_device_state_descriptors(prepared)
+            if (
+                self._compiled.enable_mtp
+                and prepared.mtp_tail_slot_ids is not None
+                and self._l3_shared_buffers_ready
+            ):
+                prepared = self._bind_prepared_mtp_dispatch(
+                    prepared,
+                    model.config.hidden_size,
+                    model.config.vocab_size,
+                )
+            if self._compiled.enable_mtp and self._l3_shared_buffers_ready:
+                if prepared.mtp_tail_slot_ids is None or prepared.dispatch_args is None:
+                    raise RuntimeError("DeepSeekV4 MTP prepare did not produce a complete dispatch")
+            return prepared
+
+    def run_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> DecodeResult:
+        """Attach stable state descriptors and execute an early-prepared slot."""
+        if not isinstance(prepared, DeepSeekV4PreparedDecodeInputs):
+            raise TypeError("DeepSeekV4 prepared decode has an unexpected type")
+        if tuple(batch.request_ids) != prepared.request_ids:
+            raise ValueError("prepared decode request order changed before execution")
+        if tuple(int(rank) for rank in batch.cache_partitions) != prepared.ranks:
+            raise ValueError("prepared decode cache partitions changed before execution")
+        # Production preflight prepares every shared tensor before the L3
+        # worker forks.  Keep a guarded late fallback for shape-only/unit-test
+        # runners, but do not put the idempotent readiness walk on every steady
+        # decode step.
+        if not self._l3_shared_buffers_ready:
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.ensure_ready_late",
+                cat="executor",
+            ):
+                self._ensure_l3_shared_buffers(model)
+        if self._compiled.enable_mtp:
+            return self.reclaim_prepared_decode(
+                self.dispatch_prepared_decode(model, batch, prepared)
+            )
+        return self._run_autoregressive_decode(model, batch, prepared=prepared)
+
+    def dispatch_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> object:
+        """Run the blocking PyPTO dispatch, leaving host reclaim to another lane."""
+        if not self._compiled.enable_mtp:
+            raise RuntimeError("split decode reclaim requires fused DeepSeekV4 MTP")
+        if not isinstance(prepared, DeepSeekV4PreparedDecodeInputs):
+            raise TypeError("DeepSeekV4 prepared decode has an unexpected type")
+        if prepared.dispatch_args is None:
+            raise RuntimeError("DeepSeekV4 fused decode was not fully bound during prepare")
+        if tuple(batch.request_ids) != prepared.request_ids:
+            raise ValueError("prepared decode request order changed before execution")
+        if tuple(int(rank) for rank in batch.cache_partitions) != prepared.ranks:
+            raise ValueError("prepared decode cache partitions changed before execution")
+        states = tuple(
+            self._require_mtp_request_state(request_id)
+            for request_id in prepared.request_ids
+        )
+        for request_id, state in zip(prepared.request_ids, states, strict=True):
+            if not state.device_state_initialized:
+                raise RuntimeError(
+                    f"DeepSeekV4 MTP device state was not finalized during prefill for {request_id!r}"
+                )
+        return self._launch_prepared_mtp_decode(prepared, states)
+
+    def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
+        """Read ping-ponged sampled outputs after a fused dispatch completes."""
+        if not isinstance(pending, _DeepSeekV4PendingMtpDecode):
+            raise TypeError("DeepSeekV4 pending decode has an unexpected type")
+        return self._reclaim_mtp_decode(pending)
+
     def prepare_decode_inputs(
         self,
         model: RuntimeModel,
@@ -1988,6 +2151,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         positions: tuple[tuple[int, ...], ...],
         token_rows: torch.Tensor,
         x_hc: torch.Tensor | None,
+        buffer_slot: int = 0,
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Build mode-independent cache metadata around explicit token rows."""
         layout = self._compiled.layout
@@ -2004,144 +2168,85 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if max_position >= model.runtime.max_seq_len:
             raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
 
-        buffers = self._ensure_decode_buffers(model.config.hidden_size)
-        staged = buffers.tensors
+        self._ensure_decode_buffers(model.config.hidden_size)
+        if not 0 <= buffer_slot < len(self._decode_input_slots):
+            raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
+        staged = self._decode_input_slots[buffer_slot]
         staged["num_tokens_per_owner"].zero_()
         staged["logit_row_indices"].fill_(-1)
-
-        # Every rank enters the fixed-B program, including ranks with no active
-        # request. Seed the three per-step tensors once from request 0, then
-        # overwrite active ranks below. This replaces eight independent
-        # pad/replicate allocations on the common one-request path.
-        input_rows = staged["input_ids"].view(
-            layout.ranks,
-            layout.decode_batch,
-            layout.decode_seq,
+        self._stage_decode_dynamic_inputs(
+            staged,
+            batch,
+            assignment=assignment,
+            positions=positions,
+            token_rows=token_rows,
         )
-        position_rows = staged["position_ids"].view(
-            layout.ranks,
-            layout.decode_batch,
-            layout.decode_seq,
-        )
-        first_tokens = token_rows[0]
-        first_positions = torch.tensor(positions[0], dtype=torch.int32)
-        input_rows.copy_(
-            first_tokens.view(1, 1, layout.decode_seq).expand(
-                layout.ranks,
-                layout.decode_batch,
-                layout.decode_seq,
-            )
-        )
-        position_rows.copy_(
-            first_positions.view(1, 1, layout.decode_seq).expand(
-                layout.ranks,
-                layout.decode_batch,
-                layout.decode_seq,
-            )
-        )
-        staged["kv_seq_lens"].fill_(int(batch.seq_lens[0].item()))
 
         for rank, request_indices in enumerate(indices_by_rank):
             if request_indices:
                 local_groups = [active_group_ids[index] for index in request_indices]
-                first_request = request_indices[0]
-                first_local_positions = torch.tensor(
-                    positions[first_request],
-                    dtype=torch.int32,
-                )
-                input_rows[rank].copy_(
-                    token_rows[first_request].view(1, layout.decode_seq).expand(
-                        layout.decode_batch,
-                        layout.decode_seq,
-                    )
-                )
-                position_rows[rank].copy_(
-                    first_local_positions.view(1, layout.decode_seq).expand(
-                        layout.decode_batch,
-                        layout.decode_seq,
-                    )
-                )
-                staged["kv_seq_lens"][rank].fill_(
-                    int(batch.seq_lens[first_request].item())
-                )
-                for local_row, request_index in enumerate(request_indices):
-                    input_rows[rank, local_row].copy_(token_rows[request_index])
-                    position_rows[rank, local_row].copy_(
-                        torch.tensor(positions[request_index], dtype=torch.int32)
-                    )
-                    staged["kv_seq_lens"][rank, local_row] = batch.seq_lens[request_index]
-                static_key = tuple(
-                    (
-                        name,
-                        tuple(groups[name] for groups in local_groups),
-                    )
-                    for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-                )
             else:
                 # All ranks must enter the distributed program with the common
                 # scalar num_tokens. This rank contributes filler rows whose
                 # cache mappings cover otherwise-unowned scratch blocks.
                 local_groups = []
-                static_key = (("scratch",),)
 
-            if self._decode_static_metadata_keys[rank] != static_key:
-                padded_group_ids = {}
-                for name in DEEPSEEK_V4_CACHE_GROUP_NAMES:
-                    if local_groups:
-                        padded_group_ids[name] = self._pad_group_block_ids(
-                            [groups[name] for groups in local_groups],
-                            group_name=name,
-                            kernel_rows=layout.decode_batch,
-                        )
-                    else:
-                        padded_group_ids[name] = self._scratch_group_block_ids(
-                            group_name=name,
-                            kernel_rows=layout.decode_batch,
-                        )
-                static_values = {
-                    "block_table": self.cache_metadata.paged_ori_block_table_from_ids(
-                        padded_group_ids["ori"]
-                    ),
-                    "cmp_block_table": self.cache_metadata.block_table_from_ids(
-                        padded_group_ids["cmp"],
-                        max_blocks=layout.cmp_max_blocks,
-                    ),
-                    "idx_block_table": self.cache_metadata.block_table_from_ids(
-                        padded_group_ids["idx"],
-                        max_blocks=layout.idx_max_blocks,
-                    ),
-                    "hca_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
-                        padded_group_ids["hca_state"],
-                        max_blocks=layout.prefill_hca_state_max_blocks,
-                    ),
-                    "csa_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
-                        padded_group_ids["csa_state"],
-                        max_blocks=layout.prefill_csa_state_max_blocks,
-                    ),
-                    "csa_inner_compress_state_block_table": (
-                        self.cache_metadata.ring_block_table_from_ids(
-                            padded_group_ids["csa_inner_state"],
-                            max_blocks=layout.prefill_csa_inner_state_max_blocks,
-                        )
-                    ),
-                    "block_counts": torch.tensor(
-                        [
-                            [
-                                len(padded_group_ids[name][row])
-                                for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-                            ]
-                            for row in range(layout.decode_batch)
-                        ],
-                        dtype=torch.int32,
-                    ),
-                }
-                for name, value in static_values.items():
-                    self._copy_shared(
-                        staged[name][rank],
-                        value,
-                        name=f"decode_{name}_rank{rank}",
+            padded_group_ids = {}
+            for name in DEEPSEEK_V4_CACHE_GROUP_NAMES:
+                if local_groups:
+                    padded_group_ids[name] = self._pad_group_block_ids(
+                        [groups[name] for groups in local_groups],
+                        group_name=name,
+                        kernel_rows=layout.decode_batch,
                     )
-                self._decode_static_metadata_keys[rank] = static_key
+                else:
+                    padded_group_ids[name] = self._scratch_group_block_ids(
+                        group_name=name,
+                        kernel_rows=layout.decode_batch,
+                    )
+            static_values = {
+                "block_table": self.cache_metadata.paged_ori_block_table_from_ids(
+                    padded_group_ids["ori"]
+                ),
+                "cmp_block_table": self.cache_metadata.block_table_from_ids(
+                    padded_group_ids["cmp"],
+                    max_blocks=layout.cmp_max_blocks,
+                ),
+                "idx_block_table": self.cache_metadata.block_table_from_ids(
+                    padded_group_ids["idx"],
+                    max_blocks=layout.idx_max_blocks,
+                ),
+                "hca_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
+                    padded_group_ids["hca_state"],
+                    max_blocks=layout.prefill_hca_state_max_blocks,
+                ),
+                "csa_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
+                    padded_group_ids["csa_state"],
+                    max_blocks=layout.prefill_csa_state_max_blocks,
+                ),
+                "csa_inner_compress_state_block_table": (
+                    self.cache_metadata.ring_block_table_from_ids(
+                        padded_group_ids["csa_inner_state"],
+                        max_blocks=layout.prefill_csa_inner_state_max_blocks,
+                    )
+                ),
+                "block_counts": torch.tensor(
+                    [
+                        [
+                            len(padded_group_ids[name][row])
+                            for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
+                        ]
+                        for row in range(layout.decode_batch)
+                    ],
+                    dtype=torch.int32,
+                ),
+            }
+            for name, value in static_values.items():
+                self._copy_shared(
+                    staged[name][rank],
+                    value,
+                    name=f"decode_{name}_rank{rank}",
+                )
 
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
@@ -2153,7 +2258,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             staged["num_tokens_per_owner"][rank] = row_count
             if row_count:
                 staged["logit_row_indices"][rank, :row_count].copy_(
-                    self._decode_logit_row_range[:row_count]
+                    torch.arange(row_count, dtype=torch.int32)
                 )
 
         return DeepSeekV4PreparedDecodeInputs(
@@ -2178,7 +2283,61 @@ class DeepSeekV4ModelRunner(ModelRunner):
             block_ids_by_group=active_group_ids,
             num_tokens_per_owner=staged["num_tokens_per_owner"],
             logit_row_indices=staged["logit_row_indices"],
+            buffer_slot=buffer_slot,
         )
+
+    def _stage_decode_dynamic_inputs(
+        self,
+        staged: dict[str, torch.Tensor],
+        batch: DecodeBatch,
+        *,
+        assignment: _DeepSeekV4DecodeAssignment,
+        positions: tuple[tuple[int, ...], ...],
+        token_rows: torch.Tensor,
+    ) -> None:
+        """Write only token/position/length fields into one execution slot."""
+        layout = self._compiled.layout
+        input_rows = staged["input_ids"].view(
+            layout.ranks, layout.decode_batch, layout.decode_seq
+        )
+        position_rows = staged["position_ids"].view(
+            layout.ranks, layout.decode_batch, layout.decode_seq
+        )
+        first_tokens = token_rows[0]
+        first_positions = torch.tensor(positions[0], dtype=torch.int32)
+        input_rows.copy_(
+            first_tokens.view(1, 1, layout.decode_seq).expand(
+                layout.ranks, layout.decode_batch, layout.decode_seq
+            )
+        )
+        position_rows.copy_(
+            first_positions.view(1, 1, layout.decode_seq).expand(
+                layout.ranks, layout.decode_batch, layout.decode_seq
+            )
+        )
+        staged["kv_seq_lens"].fill_(int(batch.seq_lens[0].item()))
+        for rank, request_indices in enumerate(assignment.indices_by_rank):
+            if not request_indices:
+                continue
+            first_request = request_indices[0]
+            first_local_positions = torch.tensor(positions[first_request], dtype=torch.int32)
+            input_rows[rank].copy_(
+                token_rows[first_request].view(1, layout.decode_seq).expand(
+                    layout.decode_batch, layout.decode_seq
+                )
+            )
+            position_rows[rank].copy_(
+                first_local_positions.view(1, layout.decode_seq).expand(
+                    layout.decode_batch, layout.decode_seq
+                )
+            )
+            staged["kv_seq_lens"][rank].fill_(int(batch.seq_lens[first_request].item()))
+            for local_row, request_index in enumerate(request_indices):
+                input_rows[rank, local_row].copy_(token_rows[request_index])
+                position_rows[rank, local_row].copy_(
+                    torch.tensor(positions[request_index], dtype=torch.int32)
+                )
+                staged["kv_seq_lens"][rank, local_row] = batch.seq_lens[request_index]
 
     @staticmethod
     def _normalize_group_block_ids(
@@ -2311,6 +2470,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ).float()
         return PrefillResult(last_hidden=None, logits=logits)
 
+    def finalize_prefill(
+        self,
+        model: RuntimeModel,
+        request_ids: Sequence[str],
+        sampled_token_ids: Sequence[int],
+    ) -> None:
+        """Run terminal MTP prefill and publish persistent decode state."""
+        if not self._compiled.enable_mtp:
+            return
+        if len(request_ids) != len(sampled_token_ids):
+            raise ValueError("MTP prefill requires one sampled token per request")
+        with profile_span(
+            "DeepSeekV4ModelRunner.prefill.mtp_initialize",
+            cat="executor",
+            args={"batch_size": len(request_ids)},
+        ):
+            for request_id, token_id in zip(request_ids, sampled_token_ids, strict=True):
+                state = self._require_mtp_request_state(request_id)
+                if state.draft_token_id is None:
+                    self._initialize_mtp_draft(request_id, state, int(token_id))
+
     def run_decode(self, model, batch: DecodeBatch) -> DecodeResult:
         """Dispatch to the decode flow selected when the model was compiled."""
         if self._compiled.decode is None:
@@ -2319,11 +2499,38 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._ensure_l3_shared_buffers(model)
         return self._decode_flow(model, batch)
 
-    def _run_autoregressive_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+    def _run_autoregressive_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        prepared: DeepSeekV4PreparedDecodeInputs | None = None,
+    ) -> DecodeResult:
         """Run the single-token autoregressive decode flow."""
+        if prepared is None:
+            inputs = self.prepare_decode_inputs(model, batch)
+        else:
+            assignment = _DeepSeekV4DecodeAssignment(
+                ranks=prepared.ranks,
+                local_rows=prepared.local_rows,
+                per_rank_counts=prepared.per_rank_counts,
+                indices_by_rank=self._indices_by_rank(prepared.ranks),
+            )
+            positions = self._autoregressive_decode_positions(batch, len(batch.request_ids))
+            token_rows = self._autoregressive_decode_token_rows(
+                batch.token_ids, len(batch.request_ids)
+            )
+            self._stage_decode_dynamic_inputs(
+                self._decode_input_slots[prepared.buffer_slot],
+                batch,
+                assignment=assignment,
+                positions=positions,
+                token_rows=token_rows,
+            )
+            inputs = prepared
         output = self._execute_main_decode(
             model,
-            self.prepare_decode_inputs(model, batch),
+            inputs,
             active_seq=1,
         )
         logits = torch.stack(
@@ -2338,77 +2545,115 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ).float()
         return DecodeResult(hidden_states=None, logits=logits)
 
-    def _run_mtp_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Verify and advance request-local MTP drafts in one L3 dispatch."""
+    def _run_mtp_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        prepared: DeepSeekV4PreparedDecodeInputs | None = None,
+    ) -> DecodeResult:
+        """Compatibility wrapper for callers that still reclaim synchronously."""
+        pending = self._dispatch_mtp_decode(model, batch, prepared=prepared)
+        return self._reclaim_mtp_decode(pending)
+
+    def _dispatch_mtp_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        prepared: DeepSeekV4PreparedDecodeInputs | None = None,
+    ) -> _DeepSeekV4PendingMtpDecode:
+        """Prepare and run fused MTP device work for synchronous callers."""
         if not batch.allow_device_greedy_sampling:
             raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
-        with profile_span("DeepSeekV4ModelRunner.decode.mtp_initialize", cat="executor"):
-            self._initialize_mtp_drafts(batch)
-        with profile_span("DeepSeekV4ModelRunner.decode.mtp_build_speculative_batch", cat="executor"):
-            draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
-            speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
+        if prepared is None:
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.prepare_inputs_fallback",
+                cat="executor",
+            ):
+                speculative_batch = self._device_state_placeholder_batch(batch)
+                inputs = self.prepare_mtp_decode_inputs(model, speculative_batch)
+        else:
+            inputs = prepared
+        if inputs.mtp_tail_slot_ids is None:
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.bind_device_state_late",
+                cat="executor",
+            ):
+                inputs = self._prepare_mtp_device_state_descriptors(inputs, require_ready=True)
+        if getattr(inputs, "dispatch_args", None) is None:
+            with profile_span(
+                "DeepSeekV4ModelRunner.decode.bind_fwd_args_late",
+                cat="executor",
+                args={"actual_tokens": max(inputs.per_rank_counts) * self._compiled.layout.decode_seq},
+            ):
+                inputs = self._bind_prepared_mtp_dispatch(
+                    inputs,
+                    model.config.hidden_size,
+                    model.config.vocab_size,
+                )
+        if getattr(inputs, "dispatch_args", None) is None:
+            raise RuntimeError("DeepSeekV4 fused decode arguments were not bound")
+        return self.dispatch_prepared_decode(model, batch, inputs)
 
-        with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
-            inputs = self.prepare_mtp_decode_inputs(model, speculative_batch)
-            active_tokens = self._stage_fused_mtp_metadata(inputs)
-        layout = self._compiled.layout
-        decode_buffers = self._require_decode_buffers()
-        mtp_buffers = self._require_mtp_buffers()
-        hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
-        pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
-        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
-        with profile_span(
-            "DeepSeekV4ModelRunner.decode.prepare_fwd_args",
-            cat="executor",
-            args={"actual_tokens": active_tokens},
-        ):
-            main_args = self._decode_fwd_args(
-                inputs,
-                pre_hc_hidden_buffer,
-                hidden_buffer,
-                logits_buffer,
-                decode_buffers.sampled_ids,
-            )
-            args = self._fused_mtp_decode_args(main_args, active_tokens)
+    def _launch_prepared_mtp_decode(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        states: tuple[_DeepSeekV4MtpRequestState, ...],
+    ) -> _DeepSeekV4PendingMtpDecode:
+        """Launch a command-lane-complete fused MTP snapshot."""
+        if inputs.dispatch_args is None:
+            raise RuntimeError("DeepSeekV4 fused decode snapshot is not ready to launch")
+        active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.l3_dispatch",
                 cat="executor",
                 args={"actual_tokens": active_tokens, "fused_mtp": True},
             ):
-                self._run_l3(self._require_decode_callable(), *args)
+                self._run_l3(self._require_decode_callable(), *inputs.dispatch_args)
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
+        staged = self._decode_input_slots[inputs.buffer_slot]
+        return _DeepSeekV4PendingMtpDecode(
+            inputs=inputs,
+            sampled_ids=staged["sampled_ids"],
+            accepted_counts=staged["mtp_accepted_counts"],
+            mtp_sampled_ids=staged["mtp_sampled_ids"],
+            committed_input_ids=staged["mtp_committed_input_ids"],
+            committed_position_ids=staged["mtp_committed_position_ids"],
+            states=states,
+        )
 
+    def _reclaim_mtp_decode(self, pending: _DeepSeekV4PendingMtpDecode) -> DecodeResult:
+        """Convert one completed output slot into scheduler-visible tokens."""
+        inputs = pending.inputs
+        layout = self._compiled.layout
         decode_seq = layout.decode_seq
-        with profile_span("DeepSeekV4ModelRunner.decode.mtp_accept", cat="executor"):
+        with profile_span("DeepSeekV4ModelRunner.decode.mtp_reclaim", cat="executor"):
             accepted_counts_list = []
             accepted = []
-            states = []
-            debug_main_ids = [] if logger.isEnabledFor(logging.DEBUG) else None
-            for request_id, rank, local_row in zip(
-                inputs.request_ids,
+            states = pending.states
+            for state, rank, local_row in zip(
+                states,
                 inputs.ranks,
                 inputs.local_rows,
                 strict=True,
             ):
                 row_start = local_row * decode_seq
-                main_tokens = decode_buffers.sampled_ids[
+                main_tokens = pending.sampled_ids[
                     rank,
                     row_start : row_start + decode_seq,
                     0,
                 ].tolist()
                 accepted_count = int(
-                    mtp_buffers.decode_accepted_counts[rank, local_row].item()
+                    pending.accepted_counts[rank, local_row].item()
                 )
                 accepted_counts_list.append(accepted_count)
                 accepted.append([int(token) for token in main_tokens[:accepted_count]])
-                states.append(self._require_mtp_request_state(request_id))
-                if debug_main_ids is not None:
-                    debug_main_ids.append(main_tokens)
             accepted_counts = tuple(accepted_counts_list)
             self._mtp_proposed_tokens += inputs.actual_batch
             self._mtp_accepted_tokens += sum(count == decode_seq for count in accepted_counts)
@@ -2416,23 +2661,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 state.proposed_tokens += 1
                 state.accepted_tokens += int(len(tokens) == decode_seq)
                 state.committed_count += len(tokens)
-            logger.info(
-                "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
-                self._mtp_accepted_tokens,
-                self._mtp_proposed_tokens,
-                100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
-            )
-            if debug_main_ids is not None:
+            if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "DeepSeekV4 MTP step: draft=%s main=%s",
-                    draft_token_ids.detach().cpu().tolist(),
-                    debug_main_ids,
+                    "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
+                    self._mtp_accepted_tokens,
+                    self._mtp_proposed_tokens,
+                    100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
                 )
-        with profile_span(
-            "DeepSeekV4ModelRunner.decode.mtp_update_state",
-            cat="executor",
-            args={"accepted_counts": accepted_counts},
-        ):
+        # The fused kernel has already committed draft/tail/position to the
+        # stable device-state slot.  Host mirrors are diagnostics for the
+        # legacy split-MTP path and must not delay the next steady dispatch.
+        if logger.isEnabledFor(logging.DEBUG):
             for state, rank, local_row in zip(
                 states,
                 inputs.ranks,
@@ -2441,11 +2680,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ):
                 row_end = (local_row + 1) * decode_seq - 1
                 state.draft_token_id = int(
-                    mtp_buffers.decode_sampled_ids[rank, local_row, 0].item()
+                    pending.mtp_sampled_ids[rank, local_row, 0].item()
                 )
-                state.tail_token_id = int(mtp_buffers.decode_input_ids[rank, row_end].item())
+                state.tail_token_id = int(pending.committed_input_ids[rank, row_end].item())
                 state.tail_position = int(
-                    mtp_buffers.decode_position_ids[rank, row_end].item()
+                    pending.committed_position_ids[rank, row_end].item()
                 )
         return DecodeResult(
             hidden_states=None,
@@ -2463,13 +2702,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run the mode-independent packed main-model decode kernel."""
         with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
             inputs = prepared
-        decode_buffers = self._require_decode_buffers()
+        self._require_decode_buffers()
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
 
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
         pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
         logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
-        sampled_ids_buffer = decode_buffers.sampled_ids
+        sampled_ids_buffer = self._decode_input_slots[inputs.buffer_slot]["sampled_ids"]
         # The active hidden/pre-HC rows are pl.Out tensors and the grouped LM
         # head overwrites every logits row, including rows selected with -1.
         # Pre-clearing these reusable buffers only adds host memory bandwidth.
@@ -2531,17 +2770,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
             inputs.actual_tokens,
             strict=True,
         ):
-            self._mtp_request_states[request_id] = _DeepSeekV4MtpRequestState(
-                prefill_context=_DeepSeekV4MtpPrefillContext(
-                    rank=rank,
-                    actual_tokens=actual_tokens,
-                    hidden_states=inputs.x_hc[rank, :, 0].detach().cpu().clone(),
-                    prev_hidden_states=pre_hc_hidden[rank].detach().cpu().clone(),
-                    input_ids=inputs.input_ids[rank].detach().cpu().clone(),
-                    position_ids=inputs.position_ids[rank].detach().cpu().clone(),
-                    block_table=inputs.ori_block_table[rank].detach().cpu().clone(),
-                    slot_mapping=inputs.ori_slot_mapping[rank].detach().cpu().clone(),
-                )
+            state = self._reserve_mtp_request_state(request_id, rank)
+            state.prefill_context = _DeepSeekV4MtpPrefillContext(
+                rank=rank,
+                actual_tokens=actual_tokens,
+                hidden_states=inputs.x_hc[rank, :, 0].detach().cpu().clone(),
+                prev_hidden_states=pre_hc_hidden[rank].detach().cpu().clone(),
+                input_ids=inputs.input_ids[rank].detach().cpu().clone(),
+                position_ids=inputs.position_ids[rank].detach().cpu().clone(),
+                block_table=inputs.ori_block_table[rank].detach().cpu().clone(),
+                slot_mapping=inputs.ori_slot_mapping[rank].detach().cpu().clone(),
             )
 
     def _require_prefill_callable(self) -> DeepSeekV4L3Callable:
@@ -2562,6 +2800,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         weights are registered for fork inheritance. This method prepares both
         groups before the first ``_run_l3`` call.
         """
+        if self._l3_shared_buffers_ready:
+            return
         with profile_span("DeepSeekV4ModelRunner.prepare.load_global_weights", cat="executor"):
             self.load_packed_global_weights()
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_rope_tables", cat="executor"):
@@ -2598,6 +2838,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._assert_l3_shared_buffers_preallocated()
         with profile_span("DeepSeekV4ModelRunner.upload_resident_weights", cat="executor"):
             self._materialize_resident_weights()
+        self._l3_shared_buffers_ready = True
 
     def _assert_l3_shared_buffers_preallocated(self) -> None:
         missing = self._missing_l3_shared_buffers()
@@ -2679,9 +2920,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         sampled_ids: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
-        cached = self._decode_fwd_args_cache
-        if cached is not None:
-            return cached
         cache = self._materialize_decode_device_cache()
         stacked = self._require_stacked_weights()
         hc_head = self._hc_head_tensors()
@@ -2722,9 +2960,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             }
         )
         values = self._mark_resident_args(values, _DECODE_RESIDENT_POLICY)
-        args = self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
-        self._decode_fwd_args_cache = args
-        return args
+        return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
 
     def _device_cache_values(self) -> dict[str, StackedDeviceTensor]:
         """Return the unified worker-resident cache pools by kernel argument name."""
@@ -2769,11 +3005,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
         values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _MTP_PREFILL_TENSOR_ORDER)
 
-    def _mtp_decode_args(self) -> tuple[Any, ...]:
-        cached = self._mtp_decode_args_cache
-        if cached is not None:
-            return cached
+    def _mtp_decode_args(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs | None = None,
+    ) -> tuple[Any, ...]:
+        buffer_slot = inputs.buffer_slot if inputs is not None else -1
         buffers = self._require_mtp_buffers()
+        staged = self._decode_input_slots[buffer_slot] if inputs is not None else None
+        tail_slot_ids = (
+            inputs.mtp_tail_slot_ids
+            if inputs is not None and inputs.mtp_tail_slot_ids is not None
+            else buffers.decode_tail_slot_ids
+        )
+        state_generations = (
+            inputs.mtp_state_generations
+            if inputs is not None and inputs.mtp_state_generations is not None
+            else buffers.decode_state_generations
+        )
+        logit_row_indices = (
+            inputs.mtp_logit_row_indices
+            if inputs is not None and inputs.mtp_logit_row_indices is not None
+            else buffers.decode_logit_row_indices
+        )
         kv_cache = self._materialize_mtp_device_kv_cache()
         if kv_cache is None:
             raise RuntimeError("DeepSeekV4 MTP KV cache is unavailable")
@@ -2787,55 +3040,89 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "tail_pre_hc_pool": self._materialize_mtp_tail_pre_hc_pool(
                     int(self.load_packed_global_weights().embed_weight.shape[1])
                 ),
-                "accepted_counts": buffers.decode_accepted_counts,
-                "tail_slot_ids": buffers.decode_tail_slot_ids,
-                "position_ids": buffers.decode_position_ids,
+                "accepted_counts": (
+                    staged["mtp_accepted_counts"] if staged is not None else buffers.decode_accepted_counts
+                ),
+                "tail_slot_ids": tail_slot_ids,
+                "state_generations": state_generations,
+                "state_tokens": self._materialize_mtp_device_state_tokens(),
+                "state_meta": self._materialize_mtp_device_state_meta(),
+                "position_ids": (
+                    staged["mtp_committed_position_ids"]
+                    if staged is not None
+                    else buffers.decode_position_ids
+                ),
                 "freqs_cos": self._static_freqs_cos_tensor(),
                 "freqs_sin": self._static_freqs_sin_tensor(),
                 "kv_cache": kv_cache,
-                "ori_block_table": self._require_decode_buffers().tensors["block_table"],
-                "input_ids": buffers.decode_input_ids,
+                "ori_block_table": (
+                    inputs.block_table
+                    if inputs is not None
+                    else self._require_decode_buffers().tensors["block_table"]
+                ),
+                "input_ids": (
+                    staged["mtp_committed_input_ids"]
+                    if staged is not None
+                    else buffers.decode_input_ids
+                ),
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
                 "hidden_out": buffers.decode_hidden_out,
                 "next_pre_hc_hidden": buffers.decode_pre_hc_out,
                 "logits": buffers.decode_logits,
-                "sampled_ids": buffers.decode_sampled_ids,
-                "logit_row_indices": buffers.decode_logit_row_indices,
+                "sampled_ids": (
+                    staged["mtp_sampled_ids"] if staged is not None else buffers.decode_sampled_ids
+                ),
+                "logit_row_indices": logit_row_indices,
             }
         )
         values = self._mark_resident_args(values, _MTP_DECODE_RESIDENT_POLICY)
-        args = self._ordered_layer_args(values, _MTP_DECODE_TENSOR_ORDER)
-        self._mtp_decode_args_cache = args
-        return args
+        return self._ordered_layer_args(values, _MTP_DECODE_TENSOR_ORDER)
 
     def _fused_mtp_decode_args(
         self,
         main_args: tuple[Any, ...],
+        inputs: DeepSeekV4PreparedDecodeInputs,
         active_tokens: int,
     ) -> tuple[Any, ...]:
         """Append the non-shared MTP arguments to the main decode arguments."""
-        if self._fused_mtp_main_args is not main_args:
-            self._fused_mtp_main_args = main_args
-            self._fused_mtp_args_cache.clear()
-        cached = self._fused_mtp_args_cache.get(active_tokens)
-        if cached is not None:
-            return cached
         buffers = self._require_mtp_buffers()
-        mtp_args = self._mtp_decode_args()
+        mtp_args = self._mtp_decode_args(inputs)
         fused_mtp_args = tuple(
             arg
             for name, arg in zip(_MTP_DECODE_TENSOR_ORDER, mtp_args, strict=True)
             if name not in _FUSED_MTP_SHARED_TENSORS
         )
-        args = (
+        return (
             *main_args,
-            buffers.decode_tail_token_ids,
-            buffers.decode_tail_positions,
+            self._decode_input_slots[inputs.buffer_slot]["mtp_tail_token_ids"],
+            self._decode_input_slots[inputs.buffer_slot]["mtp_tail_positions"],
             *fused_mtp_args,
             self._int32_scalar(active_tokens),
         )
-        self._fused_mtp_args_cache[active_tokens] = args
-        return args
+
+    def _bind_prepared_mtp_dispatch(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        hidden_size: int,
+        vocab_size: int,
+    ) -> DeepSeekV4PreparedDecodeInputs:
+        """Bind all steady L3 arguments on the prepare lane."""
+        staged = self._decode_input_slots[inputs.buffer_slot]
+        hidden_buffer = self._require_decode_output_buffer(hidden_size)
+        pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(hidden_size)
+        logits_buffer = self._require_decode_logits_buffer(vocab_size)
+        main_args = self._decode_fwd_args(
+            inputs,
+            pre_hc_hidden_buffer,
+            hidden_buffer,
+            logits_buffer,
+            staged["sampled_ids"],
+        )
+        active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
+        return replace(
+            inputs,
+            dispatch_args=self._fused_mtp_decode_args(main_args, inputs, active_tokens),
+        )
 
     def _require_mtp_buffers(self) -> _DeepSeekV4MtpSharedBuffers:
         if self._mtp_buffers is None:
@@ -2892,11 +3179,73 @@ class DeepSeekV4ModelRunner(ModelRunner):
             seq_lens=corrected_seq_lens + 1,
         )
 
+    def _device_state_placeholder_batch(self, batch: DecodeBatch) -> DecodeBatch:
+        """Build valid fallback rows; the fused kernel replaces every active row."""
+        actual_batch = len(batch.request_ids)
+        current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
+        for request_id in batch.request_ids:
+            state = self._require_mtp_request_state(request_id)
+            if not state.device_state_initialized:
+                raise RuntimeError(f"DeepSeekV4 MTP device state is missing for {request_id!r}")
+        return replace(
+            batch,
+            token_ids=current.reshape(actual_batch, 1),
+            hidden_states=None,
+            prev_token_ids=current,
+            prev_hidden_states=None,
+            seq_lens=torch.clamp(batch.seq_lens.detach().cpu().to(torch.int32), min=2),
+        )
+
     def _require_mtp_request_state(self, request_id: str) -> _DeepSeekV4MtpRequestState:
-        state = self._mtp_request_states.get(request_id)
+        with self._mtp_state_lock:
+            state = self._mtp_request_states.get(request_id)
         if state is None:
             raise RuntimeError(f"DeepSeekV4 MTP state is missing for request {request_id!r}")
         return state
+
+    def _reserve_mtp_request_state(
+        self,
+        request_id: str,
+        rank: int,
+    ) -> _DeepSeekV4MtpRequestState:
+        """Publish a stable slot identity before terminal prefill completes."""
+        rank = int(rank)
+        with self._mtp_state_lock:
+            state = self._mtp_request_states.get(request_id)
+            if state is None:
+                state = _DeepSeekV4MtpRequestState()
+                self._mtp_request_states[request_id] = state
+            self._reserve_mtp_state_slot(state, rank, request_id=request_id)
+            return state
+
+    def _reserve_mtp_state_slot(
+        self,
+        state: _DeepSeekV4MtpRequestState,
+        rank: int,
+        *,
+        request_id: str,
+    ) -> None:
+        """Assign one host-visible slot identity without initializing its device contents."""
+        rank = int(rank)
+        with self._mtp_state_lock:
+            if state.tail_rank is not None:
+                if state.tail_rank != rank:
+                    raise RuntimeError(
+                        f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
+                        f"slot rank={state.tail_rank}, decode rank={rank}"
+                    )
+                return
+            free_slots = self._mtp_free_tail_slots[rank]
+            if not free_slots:
+                raise RuntimeError(f"DeepSeekV4 MTP tail slots are exhausted on rank {rank}")
+            slot = free_slots.pop()
+            generation = self._mtp_slot_generations[rank][slot] + 1
+            if generation >= 2**31:
+                generation = 1
+            self._mtp_slot_generations[rank][slot] = generation
+            state.tail_rank = rank
+            state.tail_slot_id = slot
+            state.generation = generation
 
     def _mtp_drafts_for_requests(self, request_ids: Sequence[str]) -> torch.Tensor:
         draft_ids = []
@@ -2907,19 +3256,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             draft_ids.append(draft_token_id)
         return torch.tensor(draft_ids, dtype=torch.long)
 
-    def _initialize_mtp_drafts(self, batch: DecodeBatch) -> None:
-        """Initialize every request's first draft without sharing mutable state."""
-        for batch_index, request_id in enumerate(batch.request_ids):
-            state = self._require_mtp_request_state(request_id)
-            if state.draft_token_id is None:
-                self._initialize_mtp_draft(request_id, state, batch, batch_index)
-
     def _initialize_mtp_draft(
         self,
         request_id: str,
         state: _DeepSeekV4MtpRequestState,
-        batch: DecodeBatch,
-        batch_index: int,
+        first_token_id: int,
     ) -> None:
         context = state.prefill_context
         if context is None:
@@ -2928,7 +3269,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         layout = self._compiled.layout
         n = context.actual_tokens
         owner_rank = context.rank
-        first_token = batch.token_ids[batch_index].detach().cpu().to(torch.long).reshape(1)
+        first_token = torch.tensor([first_token_id], dtype=torch.long)
         first_hidden = self._embedding_rows(first_token, torch.bfloat16)[0]
 
         shifted_hidden = torch.zeros_like(context.hidden_states, dtype=torch.bfloat16)
@@ -2979,6 +3320,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             context.prev_hidden_states[n - 1],
         )
         state.tail_position = int(context.position_ids[n - 1].item())
+        self._initialize_mtp_device_state(state)
         state.prompt_len = n
         state.prefill_context = None
 
@@ -2988,32 +3330,65 @@ class DeepSeekV4ModelRunner(ModelRunner):
         rank: int,
         hidden: torch.Tensor,
     ) -> None:
-        """Allocate and initialize one persistent device tail slot."""
-        if state.tail_slot_id is not None:
+        """Initialize the preallocated persistent tail slot contents."""
+        self._reserve_mtp_state_slot(state, rank, request_id="<prefill>")
+        if state.tail_rank != rank or state.tail_slot_id is None:
+            raise RuntimeError("DeepSeekV4 MTP tail slot reservation is inconsistent")
+        slot = state.tail_slot_id
+        buffers = self._require_mtp_buffers()
+        staged = buffers.tail_init_hidden[rank, slot]
+        staged.copy_(hidden.to(dtype=torch.float32, device="cpu"))
+        pool = self._materialize_mtp_tail_pre_hc_pool(int(staged.shape[-1]))
+        shard = pool.shards[rank]
+        row_nbytes = staged.numel() * staged.element_size()
+        dst = shard.data_ptr + slot * row_nbytes
+        self._shared_l3_worker().copy_to(
+            dst,
+            staged.data_ptr(),
+            row_nbytes,
+            worker_id=rank,
+        )
+
+    def _initialize_mtp_device_state(self, state: _DeepSeekV4MtpRequestState) -> None:
+        """Seed one stable device slot after the first MTP draft is available."""
+        if state.device_state_initialized:
             return
-        free_slots = self._mtp_free_tail_slots[rank]
-        if not free_slots:
-            raise RuntimeError(f"DeepSeekV4 MTP tail slots are exhausted on rank {rank}")
-        slot = free_slots.pop()
-        try:
-            buffers = self._require_mtp_buffers()
-            staged = buffers.tail_init_hidden[rank, slot]
-            staged.copy_(hidden.to(dtype=torch.float32, device="cpu"))
-            pool = self._materialize_mtp_tail_pre_hc_pool(int(staged.shape[-1]))
-            shard = pool.shards[rank]
-            row_nbytes = staged.numel() * staged.element_size()
-            dst = shard.data_ptr + slot * row_nbytes
-            self._shared_l3_worker().copy_to(
-                dst,
-                staged.data_ptr(),
+        if (
+            state.tail_rank is None
+            or state.tail_slot_id is None
+            or state.tail_token_id is None
+            or state.draft_token_id is None
+            or state.tail_position is None
+        ):
+            raise RuntimeError("DeepSeekV4 MTP device state cannot be initialized from partial state")
+        buffers = self._require_mtp_buffers()
+        rank = state.tail_rank
+        slot = state.tail_slot_id
+        token_row = buffers.state_init_tokens[rank, slot]
+        token_row[0] = state.tail_token_id
+        token_row[1] = state.draft_token_id
+        meta_row = buffers.state_init_meta[rank, slot]
+        meta_row.zero_()
+        # Publish a completely initialized payload.  STATE_VALID is an
+        # initialization guard; slot reuse safety comes from generation.
+        meta_row[_MTP_STATE_VALID] = 1
+        meta_row[_MTP_STATE_GENERATION] = state.generation
+        meta_row[_MTP_STATE_TAIL_POSITION] = state.tail_position
+        meta_row[_MTP_STATE_COMMITTED_COUNT] = state.committed_count
+        worker = self._shared_l3_worker()
+        for device_tensor, source in (
+            (self._materialize_mtp_device_state_tokens(), token_row),
+            (self._materialize_mtp_device_state_meta(), meta_row),
+        ):
+            shard = device_tensor.shards[rank]
+            row_nbytes = source.numel() * source.element_size()
+            worker.copy_to(
+                shard.data_ptr + slot * row_nbytes,
+                source.data_ptr(),
                 row_nbytes,
                 worker_id=rank,
             )
-        except Exception:
-            free_slots.append(slot)
-            raise
-        state.tail_rank = rank
-        state.tail_slot_id = slot
+        state.device_state_initialized = True
 
     def _mtp_committed_window(
         self,
@@ -3160,12 +3535,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return active_tokens
 
     def _stage_fused_mtp_metadata(self, inputs: DeepSeekV4PreparedDecodeInputs) -> int:
-        """Stage request tails consumed by the device-side verifier."""
+        """Bind active rows to stable device-state generations."""
         buffers = self._require_mtp_buffers()
         layout = self._compiled.layout
         buffers.decode_tail_slot_ids.fill_(-1)
-        buffers.decode_tail_token_ids.zero_()
-        buffers.decode_tail_positions.zero_()
+        buffers.decode_state_generations.zero_()
         buffers.decode_logit_row_indices.fill_(-1)
         for request_id, rank, local_row in zip(
             inputs.request_ids,
@@ -3175,20 +3549,92 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ):
             state = self._require_mtp_request_state(request_id)
             if (
-                state.tail_token_id is None
-                or state.tail_slot_id is None
-                or state.tail_position is None
+                state.tail_slot_id is None
+                or not state.device_state_initialized
             ):
                 raise RuntimeError(
                     f"DeepSeekV4 MTP committed tail is not initialized for {request_id!r}"
                 )
-            buffers.decode_tail_token_ids[rank, local_row] = state.tail_token_id
-            buffers.decode_tail_positions[rank, local_row] = state.tail_position
+            if state.tail_rank != rank:
+                raise RuntimeError(
+                    f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
+                    f"slot rank={state.tail_rank}, decode rank={rank}"
+                )
             buffers.decode_tail_slot_ids[rank, local_row] = state.tail_slot_id
+            buffers.decode_state_generations[rank, local_row] = state.generation
             buffers.decode_logit_row_indices[rank, local_row] = (
                 local_row * layout.decode_seq + layout.decode_seq - 1
             )
         return max(inputs.per_rank_counts) * layout.decode_seq
+
+    def _prepare_mtp_device_state_descriptors(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        *,
+        require_ready: bool = False,
+    ) -> DeepSeekV4PreparedDecodeInputs:
+        """Bind batch rows to stable state slots in the input ping-pong slot.
+
+        Stable slot ids and generations do not depend on step-N acceptance, so
+        steady-state N+1 preparation can write them while N executes.  The
+        first MTP decode still uses the guarded late path because it creates the
+        device state itself.
+
+        ``tail_slot_ids[rank, local_row]`` maps the transient scheduler row to
+        the persistent request slot.  ``state_generations`` carries the slot's
+        allocation tag, while ``logit_row_indices`` selects the final row of
+        each S-token committed window for the next-draft LM head.
+        """
+        if not self._compiled.enable_mtp:
+            return inputs
+        staged = self._decode_input_slots[inputs.buffer_slot]
+        tail_slot_ids = staged["mtp_tail_slot_ids"]
+        state_generations = staged["mtp_state_generations"]
+        logit_row_indices = staged["mtp_logit_row_indices"]
+        tail_slot_ids.fill_(-1)
+        state_generations.zero_()
+        logit_row_indices.fill_(-1)
+        for request_id, rank, local_row in zip(
+            inputs.request_ids,
+            inputs.ranks,
+            inputs.local_rows,
+            strict=True,
+        ):
+            with self._mtp_state_lock:
+                state = self._mtp_request_states.get(request_id)
+                if state is None:
+                    if require_ready:
+                        raise RuntimeError(
+                            f"DeepSeekV4 MTP state is missing for request {request_id!r}"
+                        )
+                    return inputs
+                if state.tail_slot_id is None:
+                    if require_ready:
+                        raise RuntimeError(
+                            f"DeepSeekV4 MTP tail slot is not reserved for {request_id!r}"
+                        )
+                    return inputs
+                if state.tail_rank != rank:
+                    raise RuntimeError(
+                        f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
+                        f"slot rank={state.tail_rank}, decode rank={rank}"
+                    )
+                tail_slot_ids[rank, local_row] = state.tail_slot_id
+                state_generations[rank, local_row] = state.generation
+            # The MTP model emits one next draft per request.  It must consume
+            # the hidden state at the end of that request's committed window,
+            # not every main-model verifier row.
+            logit_row_indices[rank, local_row] = (
+                local_row * self._compiled.layout.decode_seq
+                + self._compiled.layout.decode_seq
+                - 1
+            )
+        return replace(
+            inputs,
+            mtp_tail_slot_ids=tail_slot_ids,
+            mtp_state_generations=state_generations,
+            mtp_logit_row_indices=logit_row_indices,
+        )
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
         tensors = self._stacked_device_weights or self._stacked_host_weights
@@ -3210,70 +3656,131 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ranks = layout.ranks
             batch = layout.decode_batch
             tokens = layout.decode_tokens
+
+            def allocate_input_slot(slot: int) -> dict[str, torch.Tensor]:
+                prefix = f"decode_slot{slot}"
+                return {
+                    "input_ids": self._shared_empty(
+                        (ranks, tokens), torch.long, name=f"{prefix}_input_ids"
+                    ),
+                    "position_ids": self._shared_empty(
+                        (ranks, tokens), torch.int32, name=f"{prefix}_position_ids"
+                    ),
+                    "kv_seq_lens": self._shared_empty(
+                        (ranks, batch), torch.int32, name=f"{prefix}_kv_seq_lens"
+                    ),
+                    "block_table": self._shared_empty(
+                        (ranks, batch, layout.ori_table_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_block_table",
+                    ),
+                    "cmp_block_table": self._shared_empty(
+                        (ranks, batch, layout.cmp_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_cmp_block_table",
+                    ),
+                    "idx_block_table": self._shared_empty(
+                        (ranks, batch, layout.idx_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_idx_block_table",
+                    ),
+                    "hca_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.prefill_hca_state_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_hca_compress_state_block_table",
+                    ),
+                    "csa_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.prefill_csa_state_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_csa_compress_state_block_table",
+                    ),
+                    "csa_inner_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.prefill_csa_inner_state_max_blocks),
+                        torch.int32,
+                        name=f"{prefix}_csa_inner_compress_state_block_table",
+                    ),
+                    "block_counts": self._shared_empty(
+                        (ranks, batch, len(DEEPSEEK_V4_CACHE_GROUP_NAMES)),
+                        torch.int32,
+                        name=f"{prefix}_block_counts",
+                    ),
+                    "num_tokens_per_owner": self._shared_empty(
+                        (ranks,), torch.int32, name=f"{prefix}_num_tokens_per_owner"
+                    ),
+                    "logit_row_indices": self._shared_empty(
+                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                        torch.int32,
+                        name=f"{prefix}_logit_row_indices",
+                    ),
+                    "mtp_tail_slot_ids": self._shared_empty(
+                        (ranks, batch),
+                        torch.int32,
+                        name=f"{prefix}_mtp_tail_slot_ids",
+                    ),
+                    "mtp_state_generations": self._shared_empty(
+                        (ranks, batch),
+                        torch.int32,
+                        name=f"{prefix}_mtp_state_generations",
+                    ),
+                    "mtp_logit_row_indices": self._shared_empty(
+                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                        torch.int32,
+                        name=f"{prefix}_mtp_logit_row_indices",
+                    ),
+                    # Host-reclaimed outputs must follow the same ping-pong
+                    # lifetime as inputs.  Step N+1 may write slot 1 while the
+                    # output lane is still reading step N from slot 0.
+                    "sampled_ids": self._shared_empty(
+                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                        torch.int32,
+                        name=f"{prefix}_sampled_ids",
+                    ),
+                    "mtp_accepted_counts": self._shared_empty(
+                        (ranks, batch),
+                        torch.int32,
+                        name=f"{prefix}_mtp_accepted_counts",
+                    ),
+                    "mtp_sampled_ids": self._shared_empty(
+                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                        torch.int32,
+                        name=f"{prefix}_mtp_sampled_ids",
+                    ),
+                    "mtp_committed_input_ids": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name=f"{prefix}_mtp_committed_input_ids",
+                    ),
+                    "mtp_committed_position_ids": self._shared_empty(
+                        (ranks, tokens),
+                        torch.int32,
+                        name=f"{prefix}_mtp_committed_position_ids",
+                    ),
+                    "mtp_tail_token_ids": self._shared_empty(
+                        (ranks, batch),
+                        torch.long,
+                        name=f"{prefix}_mtp_tail_token_ids",
+                    ),
+                    "mtp_tail_positions": self._shared_empty(
+                        (ranks, batch),
+                        torch.int32,
+                        name=f"{prefix}_mtp_tail_positions",
+                    ),
+                }
+
+            # Two execution snapshots let the command thread prepare step N+1
+            # while the device thread consumes step N. Worker slot ownership is
+            # released only after output reclaim has finished reading the slot.
+            self._decode_input_slots = [allocate_input_slot(0), allocate_input_slot(1)]
             buffers = _DeepSeekV4DecodeSharedBuffers(
                 x_out=self._shared_empty(
                     (ranks, tokens, int(hidden_size)),
                     torch.bfloat16,
                     name="decode_x_out",
                 ),
-                sampled_ids=self._shared_empty(
-                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
-                    torch.int32,
-                    name="decode_sampled_ids",
-                ),
-                tensors={
-                    "input_ids": self._shared_empty((ranks, tokens), torch.long, name="decode_input_ids"),
-                    "position_ids": self._shared_empty((ranks, tokens), torch.int32, name="decode_position_ids"),
-                    "kv_seq_lens": self._shared_empty((ranks, batch), torch.int32, name="decode_kv_seq_lens"),
-                    "block_table": self._shared_empty(
-                        (ranks, batch, layout.ori_table_max_blocks),
-                        torch.int32,
-                        name="decode_block_table",
-                    ),
-                    "cmp_block_table": self._shared_empty(
-                        (ranks, batch, layout.cmp_max_blocks),
-                        torch.int32,
-                        name="decode_cmp_block_table",
-                    ),
-                    "idx_block_table": self._shared_empty(
-                        (ranks, batch, layout.idx_max_blocks),
-                        torch.int32,
-                        name="decode_idx_block_table",
-                    ),
-                    "hca_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_hca_state_max_blocks),
-                        torch.int32,
-                        name="decode_hca_compress_state_block_table",
-                    ),
-                    "csa_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_csa_state_max_blocks),
-                        torch.int32,
-                        name="decode_csa_compress_state_block_table",
-                    ),
-                    "csa_inner_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_csa_inner_state_max_blocks),
-                        torch.int32,
-                        name="decode_csa_inner_compress_state_block_table",
-                    ),
-                    "block_counts": self._shared_empty(
-                        (ranks, batch, len(DEEPSEEK_V4_CACHE_GROUP_NAMES)),
-                        torch.int32,
-                        name="decode_block_counts",
-                    ),
-                    "num_tokens_per_owner": self._shared_empty(
-                        (ranks,),
-                        torch.int32,
-                        name="decode_num_tokens_per_owner",
-                    ),
-                    "logit_row_indices": self._shared_empty(
-                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
-                        torch.int32,
-                        name="decode_logit_row_indices",
-                    ),
-                },
+                sampled_ids=self._decode_input_slots[0]["sampled_ids"],
+                tensors=self._decode_input_slots[0],
             )
             self._decode_buffers = buffers
-            self._decode_static_metadata_keys = [None] * layout.ranks
         return buffers
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
@@ -3342,6 +3849,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
             decode_tail_positions=self._shared_empty(
                 (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_positions"
             ),
+            decode_state_generations=self._shared_empty(
+                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_state_generations"
+            ),
+            state_init_tokens=self._shared_empty(
+                (ranks, layout.decode_batch, _MTP_DEVICE_STATE_TOKEN_WIDTH),
+                torch.long,
+                name="mtp_state_init_tokens",
+            ),
+            state_init_meta=self._shared_empty(
+                (ranks, layout.decode_batch, _MTP_DEVICE_STATE_META_WIDTH),
+                torch.int32,
+                name="mtp_state_init_meta",
+            ),
             tail_init_hidden=self._shared_empty(
                 (ranks, layout.decode_batch, layout.hc_mult, hidden),
                 torch.float32,
@@ -3389,16 +3909,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_buffers.prefill_kv_cache.zero_()
         self._mtp_decode_inputs_initialized = False
         return self._mtp_buffers
-
-    def _stage_decode_inputs(self, inputs: DeepSeekV4PreparedDecodeInputs) -> DeepSeekV4PreparedDecodeInputs:
-        buffers = self._require_decode_buffers()
-        staged_values: dict[str, torch.Tensor] = {}
-        with profile_span("DeepSeekV4ModelRunner.decode.stage_metadata", cat="executor"):
-            for name in _DECODE_INPUT_TENSOR_FIELDS:
-                dst = buffers.tensors[name]
-                self._copy_shared(dst, getattr(inputs, name), name=f"decode_{name}")
-                staged_values[name] = dst
-        return replace(inputs, **staged_values)
 
     def _ensure_prefill_fwd_buffers(self, hidden_size: int) -> _DeepSeekV4PrefillFwdSharedBuffers:
         """Allocate the layer-stacked shared buffers for the packed prefill dispatch."""
@@ -3826,6 +4336,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if self._compiled.enable_mtp:
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
                 self._materialize_mtp_prefill_device_outputs(hidden_size)
+                self._materialize_mtp_device_state_tokens()
+                self._materialize_mtp_device_state_meta()
         if self._stacked_device_weights is None:
             host_weights = self._stacked_host_weights
             if not host_weights:
@@ -4028,6 +4540,30 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         return host_row
 
+    def _materialize_mtp_device_state_tokens(self) -> StackedDeviceTensor:
+        """Allocate persistent tail/draft token slots on every rank."""
+        stacked = self._mtp_device_state_tokens
+        if stacked is None:
+            layout = self._compiled.layout
+            stacked = self._alloc_empty_stacked_tensor(
+                (layout.ranks, layout.decode_batch, _MTP_DEVICE_STATE_TOKEN_WIDTH),
+                torch.long,
+            )
+            self._mtp_device_state_tokens = stacked
+        return stacked
+
+    def _materialize_mtp_device_state_meta(self) -> StackedDeviceTensor:
+        """Allocate persistent generation, position, and commit metadata."""
+        stacked = self._mtp_device_state_meta
+        if stacked is None:
+            layout = self._compiled.layout
+            stacked = self._alloc_empty_stacked_tensor(
+                (layout.ranks, layout.decode_batch, _MTP_DEVICE_STATE_META_WIDTH),
+                torch.int32,
+            )
+            self._mtp_device_state_meta = stacked
+        return stacked
+
     def _materialize_decode_device_cache(self) -> DeepSeekV4DeviceCache:
         """Allocate dynamically sized cache shards directly on each NPU."""
         cache = self._decode_device_cache
@@ -4143,11 +4679,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return cache
 
     def _free_device_caches(self) -> None:
-        self._decode_static_metadata_keys = [None] * self._compiled.layout.ranks
-        self._decode_fwd_args_cache = None
-        self._mtp_decode_args_cache = None
-        self._fused_mtp_main_args = None
-        self._fused_mtp_args_cache.clear()
         worker = self._l3_worker
         if worker is None:
             self._decode_device_cache = None
@@ -4191,6 +4722,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._embedding_device_weight = None
             self._main_pre_hc_device = None
             self._mtp_tail_pre_hc_pool = None
+            self._mtp_device_state_tokens = None
+            self._mtp_device_state_meta = None
+            self._l3_shared_buffers_ready = False
             self._mtp_device_weights = None
             self._mtp_prefill_device_outputs = None
             self._mtp_buffers = None
@@ -4199,13 +4733,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
             self._mtp_request_states.clear()
-            self._decode_static_metadata_keys = [None] * self._compiled.layout.ranks
             self._l3_static_tensors.clear()
             self._l3_cache_tensor_keys.clear()
-            self._decode_fwd_args_cache = None
-            self._mtp_decode_args_cache = None
-            self._fused_mtp_main_args = None
-            self._fused_mtp_args_cache.clear()
 
     def _require_input_builder(self) -> DeepSeekV4InputBuilder:
         if self.input_builder is None:
@@ -4335,10 +4864,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if len(batch.cache_partitions) != actual_batch:
             raise ValueError("DeepSeekV4 decode requires one cache partition per request")
         ranks = tuple(int(rank) for rank in batch.cache_partitions)
-        cache_key = (tuple(batch.request_ids), ranks)
-        if self._decode_assignment_cache_key == cache_key:
-            assert self._decode_assignment_cache is not None
-            return self._decode_assignment_cache
         if min(ranks) < 0 or max(ranks) >= layout.ranks:
             raise ValueError(f"DeepSeekV4 decode cache partitions must be in [0, {layout.ranks - 1}]")
         indices_by_rank: list[list[int]] = [[] for _ in range(layout.ranks)]
@@ -4351,15 +4876,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 )
             local_rows[request_index] = local_row
             indices_by_rank[rank].append(request_index)
-        assignment = _DeepSeekV4DecodeAssignment(
+        return _DeepSeekV4DecodeAssignment(
             ranks=ranks,
             local_rows=tuple(local_rows),
             per_rank_counts=tuple(len(indices) for indices in indices_by_rank),
             indices_by_rank=tuple(tuple(indices) for indices in indices_by_rank),
         )
-        self._decode_assignment_cache_key = cache_key
-        self._decode_assignment_cache = assignment
-        return assignment
+
+    def _indices_by_rank(self, ranks: Sequence[int]) -> tuple[tuple[int, ...], ...]:
+        """Reconstruct scheduler-row ownership for an immutable prepared slot."""
+        indices: list[list[int]] = [[] for _ in range(self._compiled.layout.ranks)]
+        for request_index, rank in enumerate(ranks):
+            indices[int(rank)].append(request_index)
+        return tuple(tuple(rows) for rows in indices)
 
     def _autoregressive_decode_positions(
         self,
@@ -4421,39 +4950,3 @@ class DeepSeekV4ModelRunner(ModelRunner):
         current = token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
         previous = prev_token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
         return torch.stack((previous, current), dim=1)
-
-    def _pad_decode_token_rows(
-        self,
-        active: torch.Tensor,
-        actual_batch: int,
-        *,
-        vocab_size: int,
-    ) -> torch.Tensor:
-        """Pad explicit token rows to the fixed local decode batch."""
-        layout = self._compiled.layout
-        if active.ndim != 2 or active.shape[1] != layout.decode_seq:
-            raise ValueError("decode token rows must have shape [requests, decode_seq]")
-        if actual_batch <= 0 or active.shape[0] < actual_batch:
-            raise ValueError("decode token rows must cover every active request")
-        if vocab_size <= 0:
-            raise ValueError("vocab_size must be positive")
-        rows = torch.empty(layout.decode_tokens, dtype=torch.long).reshape(
-            layout.decode_batch,
-            layout.decode_seq,
-        )
-        rows.copy_(active[0].expand(layout.decode_batch, layout.decode_seq))
-        rows[:actual_batch].copy_(active[:actual_batch])
-        return rows.reshape(layout.decode_tokens)
-
-    def _decode_kv_seq_lens(self, seq_lens: torch.Tensor, actual_batch: int) -> torch.Tensor:
-        layout = self._compiled.layout
-        # The last written KV position is ``seq_len-1``, so the valid KV history
-        # is exactly ``seq_len`` entries. (yangyaodong's "seq_len+1" was relative
-        # to a seq_len = prompt length, which does not count the prefill token;
-        # our seq_len already does.)
-        active = seq_lens[:actual_batch].detach().cpu().to(torch.int32)
-        return DeepSeekV4CacheMetadataBuilder.replicate_first_row(
-            active.reshape(actual_batch, 1),
-            actual_rows=actual_batch,
-            kernel_rows=layout.decode_batch,
-        ).reshape(layout.decode_batch)

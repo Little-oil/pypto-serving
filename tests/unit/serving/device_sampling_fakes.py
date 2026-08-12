@@ -85,6 +85,7 @@ class _ImmediateEosExecutor(ModelExecutor):
     def __init__(self, kv_cache_manager: KvCacheManager) -> None:
         super().__init__(kv_cache_manager)
         self.prefill_batches: list[PrefillBatch] = []
+        self.finalized_prefills: list[tuple[list[str], list[int]]] = []
         self.embedding_lookup_shapes: list[tuple[int, ...]] = []
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
@@ -97,6 +98,14 @@ class _ImmediateEosExecutor(ModelExecutor):
         logits[:, 0] = 1.0
         hidden = torch.zeros(len(batch.request_ids), model.config.hidden_size)
         return PrefillResult(last_hidden=hidden, logits=logits)
+
+    def finalize_prefill(
+        self,
+        model: RuntimeModel,
+        request_ids: list[str],
+        sampled_token_ids: list[int],
+    ) -> None:
+        self.finalized_prefills.append((list(request_ids), list(sampled_token_ids)))
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         logits = torch.full((len(batch.request_ids), model.config.vocab_size), -1.0)

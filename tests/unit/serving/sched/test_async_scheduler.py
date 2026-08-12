@@ -237,6 +237,59 @@ def test_async_completing_prefill_keeps_its_computed_tokens():
             assert not again.scheduled_requests[0].is_prefill
 
 
+def test_async_terminal_prefill_blocks_first_decode_until_confirmed():
+    manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            enable_prefix_cache=False,
+            async_scheduling=True,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    request = Request(
+        request_id="r",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=4,
+    )
+    scheduler.add_request(request)
+
+    terminal_prefill = scheduler.schedule()
+    assert terminal_prefill.scheduled_requests[0].is_prefill
+    scheduler.advance_after_schedule(terminal_prefill)
+
+    assert request.terminal_prefill_in_flight
+    assert scheduler.schedule().is_empty
+
+    scheduler.update_from_output(terminal_prefill, {request.request_id: [10]})
+
+    assert not request.terminal_prefill_in_flight
+    first_decode = scheduler.schedule()
+    assert len(first_decode.scheduled_requests) == 1
+    assert not first_decode.scheduled_requests[0].is_prefill
+
+
+def test_async_terminal_prefill_barrier_does_not_block_ready_requests():
+    manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            enable_prefix_cache=False,
+            async_scheduling=True,
+            num_speculative_tokens=1,
+        ),
+        manager,
+    )
+    pending = _running_decode_request(req_id="pending")
+    pending.terminal_prefill_in_flight = True
+    ready = _running_decode_request(req_id="ready")
+    scheduler.running.extend((pending, ready))
+    scheduler.requests.update({request.request_id: request for request in scheduler.running})
+
+    output = scheduler.schedule()
+
+    assert [scheduled.request.request_id for scheduled in output.scheduled_requests] == ["ready"]
+
+
 def test_async_mtp_shortfall_on_eos_mid_pair():
     """EOS in the first of two returned tokens: the second is dropped (as in the
     sync path) and its optimistic position reclaimed."""

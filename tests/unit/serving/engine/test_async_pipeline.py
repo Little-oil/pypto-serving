@@ -50,13 +50,20 @@ def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
     )
 
 
-def _async_pipeline_core():
+def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     """A ReplicaEngineCore wired for async pipelining with a fake in-process
     worker: input_queue records dispatched commands, output_queue synthesises a
     deterministic StepResult (each scheduled decode samples last_token+1)."""
 
     manager = KvCacheManager(num_blocks=32, block_size=2, enable_prefix_cache=False)
-    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False, async_scheduling=True), manager)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            enable_prefix_cache=False,
+            async_scheduling=True,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        manager,
+    )
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.scheduler = scheduler
     core.kv_cache_manager = manager
@@ -135,6 +142,33 @@ def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
     assert req.num_output_placeholders == 0
 
 
+def test_async_pipeline_waits_for_terminal_prefill_before_first_decode(monkeypatch):
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=1)
+    request = Request(
+        request_id="r",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=4,
+    )
+    core.scheduler.add_request(request)
+
+    assert core._try_dispatch_step() is True
+    assert dispatched[0].prefill_requests
+    assert request.terminal_prefill_in_flight
+
+    # Filling pipeline slot N+1 must stop at the terminal-prefill boundary.
+    assert core._try_dispatch_step() is False
+    assert len(dispatched) == 1
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert not request.terminal_prefill_in_flight
+    assert core._try_dispatch_step() is True
+    assert dispatched[1].decode_requests
+
+
 def test_async_decode_seq_len_excludes_inflight_placeholders():
     """seq_len must be the context length for THIS step, not req.num_tokens.
 
@@ -164,6 +198,35 @@ def test_async_decode_seq_len_excludes_inflight_placeholders():
     # in-flight placeholders, so seq_len must differ from it.
     assert req.num_output_placeholders == 2
     assert second.seq_len < req.num_tokens
+
+
+def test_eos_from_step_n_keeps_n_plus_1_but_prevents_n_plus_2(monkeypatch):
+    """EOS is discovered from N output: N+1 is stale, N+2 is not scheduled."""
+
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, dispatched = _async_pipeline_core()
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    req.eos_token_id = 51
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+
+    assert core._try_dispatch_step() is True  # N
+    assert core._try_dispatch_step() is True  # N+1, prepared optimistically
+    assert len(dispatched) == 2
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert req.status is RequestStatus.FINISHED_EOS
+    # Processing N output affects the next schedule decision, not the already
+    # dispatched N+1 snapshot.
+    assert core._try_dispatch_step() is False
+    assert len(dispatched) == 2
+
+    # N+1 still drains in FIFO order, but its token is discarded for finished A.
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert req.output_token_ids == [50, 51]
 
 
 def test_async_pipeline_drains_stale_result_after_error(monkeypatch):

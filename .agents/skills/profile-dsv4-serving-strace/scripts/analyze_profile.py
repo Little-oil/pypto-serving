@@ -100,7 +100,10 @@ def main() -> None:
             and event.get("cat") == "kernel"
             and not event.get("name", "").endswith(".worker_run")
         ):
-            kernel_durations_ms[event["args"]["kernel"]].append(event["dur"] / 1000.0)
+            # Current serving profile spans use the event name as the kernel
+            # identifier; older traces also duplicated it in args.kernel.
+            kernel_name = event.get("args", {}).get("kernel") or event["name"]
+            kernel_durations_ms[kernel_name].append(event["dur"] / 1000.0)
     missing_kernels = REQUIRED_KERNELS - kernel_durations_ms.keys()
     if missing_kernels:
         raise RuntimeError(f"missing one-L2 serving kernel spans: {sorted(missing_kernels)}")

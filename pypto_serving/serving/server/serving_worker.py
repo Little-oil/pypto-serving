@@ -12,7 +12,10 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import queue
 import sys
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +23,7 @@ import torch
 
 from pypto_serving.config.types import (
     DecodeBatch,
+    DecodeResult,
     SamplingParams,
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
@@ -44,6 +48,52 @@ if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
 logger = logging.getLogger(__name__)
+
+_DECODE_PIPELINE_SLOTS = 2
+_MISSING_REQUEST = object()
+
+
+@dataclass(frozen=True)
+class _PreparedDecodeWork:
+    """Backend snapshot prepared without resolving prior-step output tokens."""
+
+    prepared: object | None
+    buffer_slot: int
+    batch: DecodeBatch | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _PendingDecodeOutput:
+    """Device-complete decode ticket consumed by the output lane."""
+
+    cmd: StepCommand
+    scheduled: tuple[DecodeRequest, ...]
+    pending: object
+    buffer_slot: int
+
+
+@dataclass(frozen=True)
+class _CompletedStepOutput:
+    """Already materialized fallback-path result."""
+
+    result: StepResult
+    buffer_slot: int | None = None
+
+
+@dataclass(frozen=True)
+class _DecodeCommandFailure:
+    """Malformed input forwarded through the ordered device/output lanes."""
+
+    result: StepResult
+
+
+@dataclass(frozen=True)
+class _ProfileBarrier:
+    """FIFO barrier that keeps profiler control ordered with output reclaim."""
+
+    command: ProfileCommand
+    completed: threading.Event
 
 
 class WorkerProcess:
@@ -166,6 +216,17 @@ class WorkerProcess:
 
     def busy_loop(self) -> None:
         logger.info("Worker entering busy loop")
+        config = getattr(self, "config", None)
+        executor = getattr(self, "executor", None)
+        async_enabled = bool(config is not None and config.resolve_async_scheduling())
+        if async_enabled and executor is not None and executor.supports_async_decode_prepare:
+            self._pipelined_busy_loop()
+        else:
+            self._serial_busy_loop()
+        logger.info("Worker exiting")
+
+    def _serial_busy_loop(self) -> None:
+        """Original one-command-at-a-time worker path."""
         while True:
             try:
                 raw: bytes = self.input_queue.get()
@@ -189,7 +250,257 @@ class WorkerProcess:
 
             self._handle_step_command(cmd)
 
-        logger.info("Worker exiting")
+    def _pipelined_busy_loop(self) -> None:
+        """Run prepare, device dispatch, and host reclaim as three FIFO stages.
+
+        The device lane contains only the unavoidable synchronous PyPTO runtime
+        call on the steady fused-MTP path.  It hands a ping-ponged output ticket
+        to the reclaim lane and immediately consumes the next prepared command.
+        Prefill and lifecycle-heavy restart commands retain the serial fallback.
+        """
+        work_queue: queue.Queue[
+            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+        ] = queue.Queue(maxsize=_DECODE_PIPELINE_SLOTS)
+        output_work_queue: queue.Queue[object] = queue.Queue()
+        slot_ownership = [threading.Semaphore(1) for _ in range(_DECODE_PIPELINE_SLOTS)]
+        output_thread = threading.Thread(
+            target=self._output_reclaim_loop,
+            args=(output_work_queue, slot_ownership),
+            name="pypto-output",
+        )
+        device_thread = threading.Thread(
+            target=self._device_execution_loop,
+            args=(work_queue, output_work_queue),
+            name="pypto-device",
+        )
+        output_thread.start()
+        device_thread.start()
+        try:
+            while True:
+                try:
+                    raw: bytes = self.input_queue.get()
+                except Exception:
+                    work_queue.put((ShutdownCommand(), None, {}))
+                    break
+                try:
+                    cmd = decode_command(raw)
+                except Exception as exc:
+                    logger.error("Worker failed to decode command: %s", exc, exc_info=True)
+                    work_queue.put(
+                        (
+                            _DecodeCommandFailure(
+                                StepResult(new_tokens={}, error=str(exc))
+                            ),
+                            None,
+                            {},
+                        )
+                    )
+                    continue
+                release_cache_entries: dict[str, object] = {}
+                if isinstance(cmd, StepCommand):
+                    # Snapshot the entries this command intends to release before
+                    # publishing newer registrations. Lifecycle release remains
+                    # on the FIFO device lane; the snapshots prevent it from
+                    # deleting a later registration that reused the same ID.
+                    release_cache_entries = {
+                        request_id: self._req_cache.get(request_id, _MISSING_REQUEST)
+                        for request_id in cmd.finished_request_ids
+                    }
+                    for new_request in cmd.new_requests:
+                        self._req_cache[new_request.request_id] = new_request
+                owned_slot = None
+                if (
+                    isinstance(cmd, StepCommand)
+                    and cmd.decode_requests
+                    and not cmd.prefill_requests
+                    and self.executor.supports_device_decode_embedding
+                ):
+                    owned_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
+                    slot_ownership[owned_slot].acquire()
+                try:
+                    prepared = (
+                        self._prepare_step_command(cmd, buffer_slot=owned_slot)
+                        if isinstance(cmd, StepCommand)
+                        else None
+                    )
+                except Exception as exc:
+                    logger.error("Worker decode preparation failed: %s", exc, exc_info=True)
+                    prepared = _PreparedDecodeWork(
+                        prepared=None,
+                        buffer_slot=owned_slot if owned_slot is not None else 0,
+                        batch=None,
+                        error=str(exc),
+                    )
+                work_queue.put((cmd, prepared, release_cache_entries))
+                if isinstance(cmd, ShutdownCommand):
+                    break
+        finally:
+            device_thread.join()
+            output_thread.join()
+
+    def _device_execution_loop(
+        self,
+        work_queue: queue.Queue[
+            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+        ],
+        output_work_queue: queue.Queue[object],
+    ) -> None:
+        """Dispatch FIFO device work without reclaiming host outputs."""
+        while True:
+            cmd, prepared, release_cache_entries = work_queue.get()
+            if isinstance(cmd, ShutdownCommand):
+                output_work_queue.put(cmd)
+                return
+            if isinstance(cmd, _DecodeCommandFailure):
+                output_work_queue.put(_CompletedStepOutput(cmd.result))
+                continue
+            if isinstance(cmd, ProfileCommand):
+                barrier = _ProfileBarrier(command=cmd, completed=threading.Event())
+                output_work_queue.put(barrier)
+                barrier.completed.wait()
+                continue
+            assert isinstance(cmd, StepCommand)
+            try:
+                self._apply_command_lifecycle(cmd, release_cache_entries)
+            except Exception as exc:
+                logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
+                output_work_queue.put(
+                    _CompletedStepOutput(
+                        StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                        buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                    )
+                )
+                continue
+            if self._can_split_decode_output(cmd, prepared):
+                assert prepared is not None and prepared.batch is not None
+                try:
+                    with profile_span(
+                        "WorkerProcess.dispatch_decode",
+                        cat="worker",
+                        args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot},
+                    ):
+                        dispatch_batch = self._late_bind_prepared_decode_batch(
+                            prepared,
+                            tuple(cmd.decode_requests),
+                        )
+                        pending = self.executor.dispatch_prepared_decode(
+                            self.model_record.runtime_model,
+                            dispatch_batch,
+                            prepared.prepared,
+                        )
+                    output_work_queue.put(
+                        _PendingDecodeOutput(
+                            cmd=cmd,
+                            scheduled=tuple(cmd.decode_requests),
+                            pending=pending,
+                            buffer_slot=prepared.buffer_slot,
+                        )
+                    )
+                except Exception as exc:
+                    logger.error("Worker decode dispatch failed: %s", exc, exc_info=True)
+                    output_work_queue.put(
+                        _CompletedStepOutput(
+                            StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                            buffer_slot=prepared.buffer_slot,
+                        )
+                    )
+                continue
+            try:
+                result = self._execute_step(cmd, prepared_decode=prepared)
+            except Exception as exc:
+                logger.error("Worker step failed: %s", exc, exc_info=True)
+                result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
+            output_work_queue.put(
+                _CompletedStepOutput(
+                    result,
+                    buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                )
+            )
+
+    def _output_reclaim_loop(
+        self,
+        output_work_queue: queue.Queue[object],
+        slot_ownership: list[threading.Semaphore],
+    ) -> None:
+        """Reclaim completed outputs and publish StepResults in dispatch order."""
+        while True:
+            work = output_work_queue.get()
+            if isinstance(work, ShutdownCommand):
+                return
+            if isinstance(work, _ProfileBarrier):
+                try:
+                    self._handle_profile_command(work.command)
+                finally:
+                    work.completed.set()
+                continue
+            if isinstance(work, _CompletedStepOutput):
+                result = work.result
+                buffer_slot = work.buffer_slot
+            elif isinstance(work, _PendingDecodeOutput):
+                result = self._reclaim_pending_decode(work)
+                buffer_slot = work.buffer_slot
+            else:
+                raise TypeError(f"unexpected output work item: {type(work).__name__}")
+            if buffer_slot is not None:
+                slot_ownership[buffer_slot].release()
+            self.output_queue.put(encode_result(result))
+
+    def _can_split_decode_output(
+        self,
+        cmd: StepCommand,
+        prepared: _PreparedDecodeWork | None,
+    ) -> bool:
+        """Return whether a command is safe for independent host reclaim."""
+        return bool(
+            prepared is not None
+            and prepared.error is None
+            and prepared.prepared is not None
+            and prepared.batch is not None
+            and cmd.decode_requests
+            and not cmd.prefill_requests
+            and not cmd.new_requests
+            and bool(getattr(self.executor, "supports_async_decode_reclaim", False))
+        )
+
+    def _reclaim_pending_decode(self, work: _PendingDecodeOutput) -> StepResult:
+        """Materialize tokens and lifecycle updates off the device lane."""
+        try:
+            with profile_span(
+                "WorkerProcess.reclaim_decode",
+                cat="worker",
+                args={"step_id": work.cmd.step_id},
+            ):
+                decode_result = self.executor.reclaim_prepared_decode(work.pending)
+                new_tokens: dict[str, list[int]] = {}
+                self._consume_decode_result(work.scheduled, decode_result, new_tokens)
+                for req_id, tokens in new_tokens.items():
+                    if tokens:
+                        self._record_last_tokens(req_id, tokens)
+            return StepResult(new_tokens=new_tokens, step_id=work.cmd.step_id)
+        except Exception as exc:
+            logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
+            return StepResult(new_tokens={}, error=str(exc), step_id=work.cmd.step_id)
+
+    def _late_bind_prepared_decode_batch(
+        self,
+        prepared: _PreparedDecodeWork,
+        scheduled: tuple[DecodeRequest, ...],
+    ) -> DecodeBatch:
+        """Patch a prior token only when the active executor requests it.
+
+        DeepSeek fused MTP finalizes persistent state during prefill, so both
+        cold and steady descriptors return the early-prepared batch unchanged.
+        """
+        assert prepared.batch is not None
+        if not self.executor.prepared_decode_requires_token(prepared.prepared):
+            return prepared.batch
+        tokens = [self._resolve_decode_token(request) for request in scheduled]
+        token_ids = torch.tensor(
+            tokens,
+            dtype=torch.long,
+            device=self.model_record.runtime_model.runtime.device,
+        ).unsqueeze(1)
+        return replace(prepared.batch, token_ids=token_ids)
 
     def _handle_profile_command(self, cmd: ProfileCommand) -> None:
         """Apply a profile command and acknowledge it after the file is flushed."""
@@ -219,32 +530,60 @@ class WorkerProcess:
         busy loop and crash the worker. Any failure is reported back to the
         engine as an error result so the loop keeps serving.
         """
+        self.output_queue.put(encode_result(self._run_step_command(cmd, None)))
+
+    def _run_step_command(
+        self,
+        cmd: StepCommand,
+        prepared: _PreparedDecodeWork | None,
+    ) -> StepResult:
+        """Apply lifecycle deltas and execute one FIFO command."""
         try:
-            # 1. Release finished or preempted requests. Release precedes
-            # registration because a preempted request can restart in this
-            # same command with fresh NewRequestData.
-            if cmd.finished_request_ids:
-                release_finished = getattr(self.executor, "release_finished_requests", None)
-                if callable(release_finished):
-                    release_finished(cmd.finished_request_ids)
-                for req_id in cmd.finished_request_ids:
-                    self._req_cache.pop(req_id, None)
-                    self._last_tokens.pop(req_id, None)
-
-            # 2. Register new and restarted requests into the cache.
-            for nr in cmd.new_requests:
-                self._req_cache[nr.request_id] = nr
-
-            # 3. Execute the step and return the encoded result.
-            result = self._execute_step(cmd)
-            self.output_queue.put(encode_result(result))
+            self._apply_command_lifecycle(cmd)
+            return self._execute_step(cmd, prepared_decode=prepared)
         except Exception as e:
             logger.error(f"Worker step failed: {e}", exc_info=True)
-            self.output_queue.put(
-                encode_result(StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id))
-            )
+            return StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id)
 
-    def _execute_step(self, cmd: StepCommand) -> StepResult:
+    def _apply_command_lifecycle(
+        self,
+        cmd: StepCommand,
+        expected_cache_entries: dict[str, object] | None = None,
+    ) -> None:
+        """Apply request release and registration on the FIFO device lane."""
+        self._release_finished_request_state(
+            cmd.finished_request_ids,
+            expected_cache_entries=expected_cache_entries,
+        )
+        for new_request in cmd.new_requests:
+            self._req_cache[new_request.request_id] = new_request
+
+    def _release_finished_request_state(
+        self,
+        request_ids: list[str],
+        *,
+        expected_cache_entries: dict[str, object] | None = None,
+    ) -> None:
+        """Release executor and worker mirrors after older device work is safe."""
+        if not request_ids:
+            return
+        release_finished = getattr(self.executor, "release_finished_requests", None)
+        if callable(release_finished):
+            release_finished(request_ids)
+        for req_id in request_ids:
+            if expected_cache_entries is not None:
+                expected = expected_cache_entries.get(req_id, _MISSING_REQUEST)
+                current = self._req_cache.get(req_id, _MISSING_REQUEST)
+                if current is not expected:
+                    continue
+            self._req_cache.pop(req_id, None)
+            self._last_tokens.pop(req_id, None)
+
+    def _execute_step(
+        self,
+        cmd: StepCommand,
+        prepared_decode: _PreparedDecodeWork | None = None,
+    ) -> StepResult:
         """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
@@ -267,7 +606,12 @@ class WorkerProcess:
                     ):
                         self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
-                self._batch_decode(cmd.decode_requests, runtime_model, new_tokens)
+                self._batch_decode(
+                    cmd.decode_requests,
+                    runtime_model,
+                    new_tokens,
+                    prepared_decode=prepared_decode,
+                )
 
         # Retain the tokens just sampled so a following pipelined decode step can
         # resolve its PLACEHOLDER_TOKEN input from the worker cache.
@@ -363,6 +707,8 @@ class WorkerProcess:
             )
 
             # Sample only for requests whose prefill chunk completes the prompt.
+            completed_request_ids: list[str] = []
+            completed_token_ids: list[int] = []
             for i, pr in enumerate(scheduled):
                 cached = self._req_cache[pr.request_id]
                 # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
@@ -387,6 +733,18 @@ class WorkerProcess:
                         allow_device_topk_sampling=allow_device_topk_sampling,
                     )
                     new_tokens[pr.request_id] = [token_id]
+                    completed_request_ids.append(pr.request_id)
+                    completed_token_ids.append(token_id)
+
+            # MTP prefill needs the first sampled output token to build its
+            # shifted input. Keep that work in the terminal-prefill command so
+            # the first decode only consumes already-initialized device state.
+            if completed_request_ids:
+                self.executor.finalize_prefill(
+                    runtime_model,
+                    completed_request_ids,
+                    completed_token_ids,
+                )
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
@@ -404,78 +762,160 @@ class WorkerProcess:
             )
         return recent[-1]
 
+    def _prepare_step_command(
+        self,
+        cmd: StepCommand,
+        *,
+        buffer_slot: int | None = None,
+    ) -> _PreparedDecodeWork | None:
+        """Prepare decode-only metadata without touching request output state."""
+        if cmd.prefill_requests or not cmd.decode_requests:
+            return None
+        if not self.executor.supports_device_decode_embedding:
+            # Placeholder tokens cannot be embedded correctly until the prior
+            # device result is available. Keep this executor on the serial path.
+            return None
+        runtime_model = self.model_record.runtime_model
+        if buffer_slot is None:
+            buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
+        allow_device_greedy_sampling = (
+            self.executor.supports_device_sampling
+            and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in cmd.decode_requests)
+        )
+        allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests)
+        # Tokens remain placeholders during early preparation. Executors with a
+        # host-token dependency may patch them on the device lane; fused MTP
+        # consumes persistent state finalized by the terminal-prefill command.
+        batch = self._make_decode_batch(
+            cmd.decode_requests,
+            runtime_model,
+            resolve_tokens=False,
+            allow_device_greedy_sampling=allow_device_greedy_sampling,
+            allow_device_topk_sampling=allow_device_topk_sampling,
+        )
+        with profile_span(
+            "WorkerProcess.prepare_decode",
+            cat="worker",
+            args={"step_id": cmd.step_id, "buffer_slot": buffer_slot},
+        ):
+            prepared = self.executor.prepare_decode(
+                runtime_model,
+                batch,
+                buffer_slot=buffer_slot,
+            )
+        return _PreparedDecodeWork(prepared=prepared, buffer_slot=buffer_slot, batch=batch)
+
+    def _make_decode_batch(
+        self,
+        scheduled: list[DecodeRequest],
+        runtime_model,
+        *,
+        resolve_tokens: bool,
+        allow_device_greedy_sampling: bool,
+        allow_device_topk_sampling: bool,
+    ) -> DecodeBatch:
+        """Build a decode batch snapshot, optionally resolving prior output tokens."""
+        device = runtime_model.runtime.device
+        decode_tokens = (
+            [self._resolve_decode_token(dr) for dr in scheduled]
+            if resolve_tokens
+            else [0] * len(scheduled)
+        )
+        decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
+        if self.executor.supports_device_decode_embedding:
+            decode_embeddings = None
+        else:
+            decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
+        return DecodeBatch(
+            request_ids=[dr.request_id for dr in scheduled],
+            token_ids=decode_token_tensor.unsqueeze(1),
+            hidden_states=decode_embeddings,
+            seq_lens=torch.tensor(
+                [dr.seq_len for dr in scheduled], dtype=torch.int32, device=device
+            ),
+            allow_device_greedy_sampling=allow_device_greedy_sampling,
+            allow_device_topk_sampling=allow_device_topk_sampling,
+            block_ids=[dr.block_ids for dr in scheduled],
+            block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
+            cache_partitions=[dr.cache_partition for dr in scheduled],
+        )
+
     def _batch_decode(
         self,
         scheduled: list[DecodeRequest],
         runtime_model,
         new_tokens: dict[str, list[int]],
+        prepared_decode: _PreparedDecodeWork | None = None,
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
             args={"batch_size": len(scheduled), "request_ids": [dr.request_id for dr in scheduled]},
         ):
-            device = runtime_model.runtime.device
-
             allow_device_greedy_sampling = (
                 self.executor.supports_device_sampling
                 and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
             )
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
-            decode_tokens = [self._resolve_decode_token(dr) for dr in scheduled]
-            block_ids_list = [dr.block_ids for dr in scheduled]
-            seq_lens = [dr.seq_len for dr in scheduled]
-
-            decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
-            if self.executor.supports_device_decode_embedding:
-                # Device kernel embeds directly from token ids — do not build
-                # host-side embedding tensors.
-                decode_embeddings = None
-            else:
-                decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
-
-            decode_result = self.executor.run_decode(
+            batch = self._make_decode_batch(
+                scheduled,
                 runtime_model,
-                DecodeBatch(
-                    request_ids=[dr.request_id for dr in scheduled],
-                    token_ids=decode_token_tensor.unsqueeze(1),
-                    hidden_states=decode_embeddings,
-                    seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                    allow_device_greedy_sampling=allow_device_greedy_sampling,
-                    allow_device_topk_sampling=allow_device_topk_sampling,
-                    block_ids=block_ids_list,
-                    block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
-                    cache_partitions=[dr.cache_partition for dr in scheduled],
-                ),
+                resolve_tokens=True,
+                allow_device_greedy_sampling=allow_device_greedy_sampling,
+                allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            if prepared_decode is None:
+                decode_result = self.executor.run_decode(runtime_model, batch)
+            else:
+                if prepared_decode.error is not None:
+                    raise RuntimeError(prepared_decode.error)
+                decode_result = self.executor.run_prepared_decode(
+                    runtime_model,
+                    batch,
+                    prepared_decode.prepared,
+                )
+            self._consume_decode_result(scheduled, decode_result, new_tokens)
 
+    def _consume_decode_result(
+        self,
+        scheduled: tuple[DecodeRequest, ...] | list[DecodeRequest],
+        decode_result: DecodeResult,
+        new_tokens: dict[str, list[int]],
+    ) -> None:
+        """Convert a runner result to tokens on either serial or reclaim lane."""
+        if decode_result.accepted_token_ids is not None:
             for i, dr in enumerate(scheduled):
-                cached = self._req_cache[dr.request_id]
-                if decode_result.accepted_token_ids is not None:
-                    new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
-                    continue
-                logits = None
-                if decode_result.logits is not None:
-                    logits = (
-                        decode_result.logits[i]
-                        if decode_result.logits.dim() > 1
-                        else decode_result.logits
-                    )
-                params = SamplingParams(
-                    temperature=cached.temperature,
-                    top_p=cached.top_p,
-                    top_k=cached.top_k,
+                new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
+            return
+        allow_device_greedy_sampling = (
+            self.executor.supports_device_sampling
+            and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
+        )
+        allow_device_topk_sampling = self._allow_device_topk_sampling(list(scheduled))
+        for i, dr in enumerate(scheduled):
+            cached = self._req_cache[dr.request_id]
+            logits = None
+            if decode_result.logits is not None:
+                logits = (
+                    decode_result.logits[i]
+                    if decode_result.logits.dim() > 1
+                    else decode_result.logits
                 )
-                token_id = self._sample_result_row(
-                    decode_result,
-                    logits,
-                    params,
-                    i,
-                    allow_device_greedy_sampling,
-                    allow_device_topk_sampling=allow_device_topk_sampling,
-                )
-                new_tokens[dr.request_id] = [token_id]
+            params = SamplingParams(
+                temperature=cached.temperature,
+                top_p=cached.top_p,
+                top_k=cached.top_k,
+            )
+            token_id = self._sample_result_row(
+                decode_result,
+                logits,
+                params,
+                i,
+                allow_device_greedy_sampling,
+                allow_device_topk_sampling=allow_device_topk_sampling,
+            )
+            new_tokens[dr.request_id] = [token_id]
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""

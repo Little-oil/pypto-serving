@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from .executor import ModelExecutor
 from pypto_serving.config.types import (
@@ -28,6 +29,14 @@ from pypto_serving.tools.profile import profile_span
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PendingRunnerDecode:
+    """Route an async reclaim ticket back to the runner that dispatched it."""
+
+    model_id: str
+    pending: object
 
 
 class PyptoExecutor(ModelExecutor, ABC):
@@ -90,6 +99,23 @@ class PyptoExecutor(ModelExecutor, ABC):
         ):
             return self._runners[model.config.model_id].run_prefill(model, batch)
 
+    def finalize_prefill(
+        self,
+        model: RuntimeModel,
+        request_ids: list[str],
+        sampled_token_ids: list[int],
+    ) -> None:
+        """Let a runner seed decode state while still in the prefill stage."""
+        runner = self._runners[model.config.model_id]
+        finalize = getattr(runner, "finalize_prefill", None)
+        if callable(finalize):
+            with profile_span(
+                "PyptoExecutor.finalize_prefill",
+                cat="executor",
+                args={"model_id": model.config.model_id, "batch_size": len(request_ids)},
+            ):
+                finalize(model, request_ids, sampled_token_ids)
+
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""
         with profile_span(
@@ -98,6 +124,106 @@ class PyptoExecutor(ModelExecutor, ABC):
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
             return self._runners[model.config.model_id].run_decode(model, batch)
+
+    @property
+    def supports_async_decode_prepare(self) -> bool:
+        """Return whether every registered runner exposes split decode execution."""
+        return bool(self._runners) and all(
+            callable(getattr(runner, "prepare_decode", None))
+            and callable(getattr(runner, "run_prepared_decode", None))
+            for runner in self._runners.values()
+        )
+
+    def prepare_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        *,
+        buffer_slot: int,
+    ) -> object:
+        """Build runner-owned metadata for a future decode dispatch."""
+        runner = self._runners[model.config.model_id]
+        prepare = getattr(runner, "prepare_decode", None)
+        if not callable(prepare):
+            return super().prepare_decode(model, batch, buffer_slot=buffer_slot)
+        with profile_span(
+            "PyptoExecutor.prepare_decode",
+            cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
+            return prepare(model, batch, buffer_slot=buffer_slot)
+
+    def run_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> DecodeResult:
+        """Execute one previously prepared runner snapshot."""
+        runner = self._runners[model.config.model_id]
+        execute = getattr(runner, "run_prepared_decode", None)
+        if not callable(execute):
+            return super().run_prepared_decode(model, batch, prepared)
+        with profile_span(
+            "PyptoExecutor.run_prepared_decode",
+            cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
+            return execute(model, batch, prepared)
+
+    @property
+    def supports_async_decode_reclaim(self) -> bool:
+        """Return whether every runner exposes independent dispatch/reclaim."""
+        return bool(self._runners) and all(
+            bool(getattr(runner, "supports_async_decode_reclaim", False))
+            and callable(getattr(runner, "dispatch_prepared_decode", None))
+            and callable(getattr(runner, "reclaim_prepared_decode", None))
+            for runner in self._runners.values()
+        )
+
+    def dispatch_prepared_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        prepared: object,
+    ) -> object:
+        """Run only the device phase of a prepared decode."""
+        runner = self._runners[model.config.model_id]
+        dispatch = getattr(runner, "dispatch_prepared_decode", None)
+        if not callable(dispatch):
+            return super().dispatch_prepared_decode(model, batch, prepared)
+        with profile_span(
+            "PyptoExecutor.dispatch_prepared_decode",
+            cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
+            return _PendingRunnerDecode(
+                model_id=model.config.model_id,
+                pending=dispatch(model, batch, prepared),
+            )
+
+    def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
+        """Run host output processing for a completed decode dispatch."""
+        if not isinstance(pending, _PendingRunnerDecode):
+            return super().reclaim_prepared_decode(pending)
+        runner = self._runners[pending.model_id]
+        reclaim = getattr(runner, "reclaim_prepared_decode", None)
+        if not callable(reclaim):
+            return super().reclaim_prepared_decode(pending)
+        with profile_span(
+            "PyptoExecutor.reclaim_prepared_decode",
+            cat="executor",
+            args={"model_id": pending.model_id},
+        ):
+            return reclaim(pending.pending)
+
+    def prepared_decode_requires_token(self, prepared: object) -> bool:
+        """Delegate cold-token dependency detection to the active runner."""
+        for runner in self._runners.values():
+            requires = getattr(runner, "prepared_decode_requires_token", None)
+            if callable(requires):
+                return bool(requires(prepared))
+        return super().prepared_decode_requires_token(prepared)
 
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""
