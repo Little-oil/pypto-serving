@@ -65,7 +65,7 @@ class _PreparedDecodeWork:
 
 @dataclass(frozen=True)
 class _PendingDecodeOutput:
-    """Device-complete decode ticket consumed by the output lane."""
+    """Submitted decode ticket completed and consumed by the output lane."""
 
     cmd: StepCommand
     scheduled: tuple[DecodeRequest, ...]
@@ -252,9 +252,9 @@ class WorkerProcess:
     def _pipelined_busy_loop(self) -> None:
         """Run prepare, device dispatch, and host reclaim as three FIFO stages.
 
-        The device lane contains only the unavoidable synchronous PyPTO runtime
-        call on the steady fused-MTP path.  It hands a ping-ponged output ticket
-        to the reclaim lane and immediately consumes the next prepared command.
+        The device lane submits steady fused-MTP work to PyPTO. It hands the
+        asynchronous handle and ping-ponged output ticket to the reclaim lane,
+        then immediately consumes the next prepared command.
         Prefill and lifecycle-heavy restart commands retain the serial fallback.
         """
         work_queue: queue.Queue[

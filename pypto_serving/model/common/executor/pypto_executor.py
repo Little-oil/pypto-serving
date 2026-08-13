@@ -187,7 +187,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         batch: DecodeBatch,
         prepared: object,
     ) -> object:
-        """Run only the device phase of a prepared decode."""
+        """Submit only the device phase of a prepared decode."""
         runner = self._runners[model.config.model_id]
         dispatch = getattr(runner, "dispatch_prepared_decode", None)
         if not callable(dispatch):

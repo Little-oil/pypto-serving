@@ -97,9 +97,10 @@ class ModelExecutor(ABC):
     def supports_async_decode_reclaim(self) -> bool:
         """Return whether dispatch and host output reclaim can run independently.
 
-        The device lane calls :meth:`dispatch_prepared_decode`; after the runtime
-        call returns, a separate output lane calls :meth:`reclaim_prepared_decode`.
-        Implementations must keep every host-visible output alive until reclaim.
+        The device lane calls :meth:`dispatch_prepared_decode`; a separate output
+        lane waits for completion through :meth:`reclaim_prepared_decode`.
+        Implementations must keep every mutable binding alive until completion
+        and every host-visible output alive until reclaim.
         """
         return False
 
@@ -109,7 +110,7 @@ class ModelExecutor(ABC):
         batch: DecodeBatch,
         prepared: object,
     ) -> object:
-        """Execute device work and return an executor-owned reclaim ticket."""
+        """Submit device work and return an executor-owned completion/reclaim ticket."""
         raise NotImplementedError(f"{type(self).__name__} does not support split decode dispatch")
 
     def reclaim_prepared_decode(self, pending: object) -> DecodeResult:

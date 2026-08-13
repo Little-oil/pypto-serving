@@ -28,9 +28,9 @@ jobs:
 
   unit-tests:
     runs-on: [self-hosted, linux, arm64, npu]
-    # The DeepSeek matrix alone is bounded at --timeout 1200 queue + --max-time
-    # 3600 run, and the venv no longer inherits a base env's torch, so a cold
-    # pip cache is paid here too. 90 left no headroom for both at once.
+    # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
+    # the task at 3600 seconds. The venv no longer inherits a base env's torch,
+    # so a cold pip cache is paid here too. 90 left no headroom for both at once.
     timeout-minutes: 120
     env:
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
@@ -171,7 +171,7 @@ jobs:
           run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --timeout 1200 --max-time 3600 \
+            --timeout 2400 --max-time 3600 \
             --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
