@@ -63,14 +63,21 @@ DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
 DEEPSEEK_V4_PREFILL_BATCH = 1
 DEEPSEEK_V4_PREFILL_SEQ = 128
+# Async serving pipelines at most two device steps. Rolling caches must retain
+# the history needed by the next token plus every token that can be in flight;
+# otherwise scheduling the second prefill chunk can recycle state pages before
+# the first chunk has consumed them. This is the same admission-cap principle
+# used by vLLM's SlidingWindowSpec.
+DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS = 2 * DEEPSEEK_V4_PREFILL_SEQ
+DEEPSEEK_V4_MAX_SEQ_LEN = 16384
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
 # block IDs are local to each DP rank and address worker-resident cache shards.
 DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
 DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS = 128
 DEEPSEEK_V4_ORI_TABLE_MAX_BLOCKS = 128
 DEEPSEEK_V4_SLIDING_WINDOW = 128
-DEEPSEEK_V4_CMP_MAX_BLOCKS = 32
-DEEPSEEK_V4_IDX_MAX_BLOCKS = 64
+DEEPSEEK_V4_CMP_MAX_BLOCKS = 128
+DEEPSEEK_V4_IDX_MAX_BLOCKS = 128
 DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS = 64
 DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS = 65
 DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS = 65
@@ -103,6 +110,8 @@ def build_deepseek_v4_cache_group_specs(
     compress_ratios: Sequence[int] | None = None,
     *,
     decode_batch: int = DEEPSEEK_V4_DECODE_TOKENS,
+    enable_mtp: bool = False,
+    max_seq_len: int = DEEPSEEK_V4_MAX_SEQ_LEN,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe cache namespaces independently from their runtime pool sizes.
 
@@ -115,10 +124,63 @@ def build_deepseek_v4_cache_group_specs(
     decode_batch = int(decode_batch)
     if decode_batch <= 0:
         raise ValueError("decode_batch must be positive")
+    max_seq_len = int(max_seq_len)
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
     all_layers = tuple(range(int(num_hidden_layers)))
+    ori_layers = all_layers + ((int(num_hidden_layers),) if enable_mtp else ())
     ratios = tuple(int(ratio) for ratio in (compress_ratios or ()))[:num_hidden_layers]
     csa_layers = tuple(index for index, ratio in enumerate(ratios) if ratio == 4) or all_layers
     hca_layers = tuple(index for index, ratio in enumerate(ratios) if ratio == 128) or all_layers
+    full_history_blocks = math.ceil(max_seq_len / DEEPSEEK_V4_BLOCK_SIZE)
+    if full_history_blocks > min(DEEPSEEK_V4_CMP_MAX_BLOCKS, DEEPSEEK_V4_IDX_MAX_BLOCKS):
+        raise ValueError(
+            f"DeepSeekV4 max_seq_len={max_seq_len} needs {full_history_blocks} source-token "
+            f"blocks, but the compiled block tables support {DEEPSEEK_V4_CMP_MAX_BLOCKS}"
+        )
+
+    # SWA can start at an arbitrary offset inside a source-token block, so it
+    # needs vLLM's extra boundary page. Compressor states are emitted on their
+    # block boundary and therefore need exactly history + in-flight rows.
+    ori_blocks_per_request = (
+        math.ceil(
+            (
+                DEEPSEEK_V4_SLIDING_WINDOW
+                - 1
+                + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+            )
+            / DEEPSEEK_V4_BLOCK_SIZE
+        )
+        + 1
+    )
+    hca_state_blocks_per_request = math.ceil(
+        (
+            DEEPSEEK_V4_SLIDING_WINDOW
+            + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+        )
+        / DEEPSEEK_V4_C128_STATE_BLOCK_SIZE
+    )
+    csa_state_blocks_per_request = math.ceil(
+        (4 + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS)
+        / DEEPSEEK_V4_C4_STATE_BLOCK_SIZE
+    )
+    rolling_capacities = (
+        ("ori", ori_blocks_per_request, DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS),
+        ("hca_state", hca_state_blocks_per_request, DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS),
+        ("csa_state", csa_state_blocks_per_request, DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS),
+        (
+            "csa_inner_state",
+            csa_state_blocks_per_request,
+            DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
+        ),
+    )
+    for name, required, compiled_limit in rolling_capacities:
+        if required > compiled_limit:
+            raise ValueError(
+                f"DeepSeekV4 {name} cache needs {required} blocks per request to cover "
+                f"the rolling history and in-flight prefill tokens, but the compiled "
+                f"block table supports {compiled_limit}"
+            )
 
     def group(
         name: str,
@@ -128,14 +190,22 @@ def build_deepseek_v4_cache_group_specs(
         element_bytes: int,
         row_width: int,
         max_blocks: int,
+        max_blocks_per_seq: int | None = None,
         compress_ratio: int = 1,
         extra_row_bytes: int = 0,
+        sliding_window: int | None = None,
+        is_eagle_group: bool = False,
     ) -> KVCacheGroupSpec:
         if max_blocks <= decode_batch:
             raise ValueError(
                 f"DeepSeekV4 {name} cache needs more than {decode_batch} physical blocks"
             )
-        blocks_per_request = max(1, max_blocks // DEEPSEEK_V4_DECODE_BATCH)
+        blocks_per_request = (
+            max(1, int(max_blocks_per_seq))
+            if max_blocks_per_seq is not None
+            else max(1, max_blocks // decode_batch)
+        )
+        storage_rows = block_size // compress_ratio
         return KVCacheGroupSpec(
             name=name,
             layer_indices=layers,
@@ -146,7 +216,7 @@ def build_deepseek_v4_cache_group_specs(
                 # so all heterogeneous pools share one accurate HBM budget.
                 page_size_bytes=(
                     len(layers)
-                    * block_size
+                    * storage_rows
                     * (row_width * element_bytes + extra_row_bytes)
                 ),
                 compress_ratio=compress_ratio,
@@ -155,26 +225,41 @@ def build_deepseek_v4_cache_group_specs(
             # physical capacity across concurrent requests is runtime-sized.
             max_blocks_per_seq=blocks_per_request,
             num_partitions=DEEPSEEK_V4_RANKS,
+            sliding_window=sliding_window,
+            is_eagle_group=is_eagle_group,
         )
 
     return (
         group(
             "ori",
-            all_layers,
+            ori_layers,
             block_size=DEEPSEEK_V4_BLOCK_SIZE,
             element_bytes=2,
             row_width=DEEPSEEK_V4_HEAD_DIM,
             max_blocks=DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS,
+            max_blocks_per_seq=ori_blocks_per_request,
+            sliding_window=DEEPSEEK_V4_SLIDING_WINDOW,
+            is_eagle_group=enable_mtp,
         ),
         group(
-            "cmp",
-            all_layers,
+            "cmp_c128",
+            hca_layers,
             block_size=DEEPSEEK_V4_BLOCK_SIZE,
             element_bytes=2,
             row_width=DEEPSEEK_V4_HEAD_DIM,
             max_blocks=DEEPSEEK_V4_CMP_MAX_BLOCKS,
-            # CSA is the least-compressed consumer of this shared family.
+            compress_ratio=128,
+            max_blocks_per_seq=full_history_blocks,
+        ),
+        group(
+            "cmp_c4",
+            csa_layers,
+            block_size=DEEPSEEK_V4_BLOCK_SIZE,
+            element_bytes=2,
+            row_width=DEEPSEEK_V4_HEAD_DIM,
+            max_blocks=DEEPSEEK_V4_CMP_MAX_BLOCKS,
             compress_ratio=4,
+            max_blocks_per_seq=full_history_blocks,
         ),
         group(
             "idx",
@@ -184,6 +269,7 @@ def build_deepseek_v4_cache_group_specs(
             row_width=DEEPSEEK_V4_IDX_HEAD_DIM,
             max_blocks=DEEPSEEK_V4_IDX_MAX_BLOCKS,
             compress_ratio=4,
+            max_blocks_per_seq=full_history_blocks,
             # One float32 scale accompanies every int8 index-cache row.
             extra_row_bytes=4,
         ),
@@ -194,6 +280,8 @@ def build_deepseek_v4_cache_group_specs(
             element_bytes=4,
             row_width=DEEPSEEK_V4_HCA_STATE_DIM,
             max_blocks=DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS,
+            max_blocks_per_seq=hca_state_blocks_per_request,
+            sliding_window=DEEPSEEK_V4_SLIDING_WINDOW,
         ),
         group(
             "csa_state",
@@ -202,6 +290,8 @@ def build_deepseek_v4_cache_group_specs(
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_STATE_DIM,
             max_blocks=DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS,
+            max_blocks_per_seq=csa_state_blocks_per_request,
+            sliding_window=4,
         ),
         group(
             "csa_inner_state",
@@ -210,13 +300,16 @@ def build_deepseek_v4_cache_group_specs(
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_INNER_STATE_DIM,
             max_blocks=DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
+            max_blocks_per_seq=csa_state_blocks_per_request,
+            sliding_window=4,
         ),
     )
 
 
 DEEPSEEK_V4_CACHE_GROUP_NAMES = (
     "ori",
-    "cmp",
+    "cmp_c128",
+    "cmp_c4",
     "idx",
     "hca_state",
     "csa_state",
@@ -422,11 +515,14 @@ class DeepSeekV4CacheMetadataBuilder:
             zip(per_request_block_ids, positions, strict=True)
         ):
             for col, position in enumerate(row_positions):
-                logical = int(position) // compress_ratio
-                block_index, offset = divmod(logical, block_size)
+                source_block, source_offset = divmod(int(position), block_size)
+                offset = source_offset // compress_ratio
                 if not block_ids:
                     raise ValueError(f"slot-mapping row {row} has no allocated blocks")
-                mapping[row, col] = int(block_ids[block_index % len(block_ids)]) * block_size + offset
+                storage_block_size = block_size // compress_ratio
+                mapping[row, col] = (
+                    int(block_ids[source_block % len(block_ids)]) * storage_block_size + offset
+                )
         return mapping
 
     def paged_ori_block_table_from_ids(
@@ -494,11 +590,14 @@ class DeepSeekV4CacheMetadataBuilder:
                 position = int(position)
                 if (position + 1) % compress_ratio != 0:
                     continue
-                logical = position // compress_ratio
-                block_index, offset = divmod(logical, block_size)
+                source_block, source_offset = divmod(position, block_size)
+                offset = source_offset // compress_ratio
                 if not block_ids:
                     raise ValueError(f"compressed slot-mapping row {row} has no allocated blocks")
-                mapping[row, col] = int(block_ids[block_index % len(block_ids)]) * block_size + offset
+                storage_block_size = block_size // compress_ratio
+                mapping[row, col] = (
+                    int(block_ids[source_block % len(block_ids)]) * storage_block_size + offset
+                )
         return mapping
 
     @staticmethod
@@ -590,7 +689,8 @@ class DeepSeekV4DeviceCache:
     """Worker-resident rank shards shared by packed prefill and decode."""
 
     kv_cache: StackedDeviceTensor
-    cmp_kv: StackedDeviceTensor
+    hca_cmp_kv: StackedDeviceTensor
+    csa_cmp_kv: StackedDeviceTensor
     idx_kv_cache: StackedDeviceTensor
     idx_kv_scale: StackedDeviceTensor
     hca_compress_state: StackedDeviceTensor
@@ -651,7 +751,8 @@ class DeepSeekV4PreparedPrefillInputs:
     position_ids: torch.Tensor
     ori_block_table: torch.Tensor
     ori_slot_mapping: torch.Tensor
-    cmp_block_table: torch.Tensor
+    hca_cmp_block_table: torch.Tensor
+    csa_cmp_block_table: torch.Tensor
     idx_block_table: torch.Tensor
     hca_compress_state_block_table: torch.Tensor
     csa_compress_state_block_table: torch.Tensor
@@ -684,7 +785,8 @@ class DeepSeekV4PreparedDecodeInputs:
     position_ids: torch.Tensor
     kv_seq_lens: torch.Tensor
     block_table: torch.Tensor
-    cmp_block_table: torch.Tensor
+    hca_cmp_block_table: torch.Tensor
+    csa_cmp_block_table: torch.Tensor
     idx_block_table: torch.Tensor
     hca_compress_state_block_table: torch.Tensor
     csa_compress_state_block_table: torch.Tensor
@@ -787,16 +889,14 @@ class _DeepSeekV4MtpSharedBuffers:
 
 @dataclass(frozen=True)
 class _DeepSeekV4MtpPrefillContext:
-    """Request-local inputs retained until the first sampled token is known."""
+    """One pending main-model row retained until its next token is known."""
 
     rank: int
-    actual_tokens: int
-    hidden_states: torch.Tensor
-    prev_hidden_states: torch.Tensor
-    input_ids: torch.Tensor
-    position_ids: torch.Tensor
+    prev_hidden_state: torch.Tensor
+    position_id: int
     block_table: torch.Tensor
-    slot_mapping: torch.Tensor
+    slot_mapping: int
+    prompt_len: int
 
 
 @dataclass
@@ -1005,6 +1105,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             config.num_hidden_layers,
             self._compiled.compress_ratios,
             decode_batch=self._compiled.layout.decode_batch,
+            enable_mtp=self._compiled.num_speculative_tokens == 1,
+            max_seq_len=runtime.max_seq_len,
         )
         names = tuple(spec.name for spec in specs)
         if names != DEEPSEEK_V4_CACHE_GROUP_NAMES:
@@ -1020,30 +1122,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         return tuple(specs)
 
     def _fallback_cache_group_num_blocks(self) -> dict[str, int]:
-        """Return aligned fixed capacities for shape-only/non-runtime callers."""
-        layout = self._compiled.layout
-        physical_limits = {
-            "ori": layout.decode_ori_max_blocks,
-            "cmp": layout.cmp_max_blocks,
-            "idx": layout.idx_max_blocks,
-            "hca_state": layout.hca_state_max_blocks,
-            "csa_state": layout.csa_state_max_blocks,
-            "csa_inner_state": layout.csa_inner_state_max_blocks,
-        }
-        specs = {spec.name: spec for spec in self._cache_group_specs}
-        capacity_slots = min(
-            (physical_limits[name] - layout.decode_batch)
-            // specs[name].max_blocks_per_seq
-            for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-        )
-        if capacity_slots <= 0:
-            raise RuntimeError(
-                "DeepSeekV4 fixed fallback cache cannot hold one maximum-length "
-                "sequence after reserving decode scratch blocks"
-            )
+        """Return one scheduler slot for shape-only/non-runtime callers.
+
+        The compiled table depths limit one request's logical addressing, not
+        the physical pool size.  Decode scratch pages are added separately by
+        ``_physical_cache_num_blocks`` and must therefore not be subtracted
+        from those logical limits here.
+        """
         return deepseek_v4_cache_blocks_for_slots(
             self._cache_group_specs,
-            capacity_slots,
+            1,
         )
 
     def _compute_kv_cache_capacity_slots(self, runtime: RuntimeConfig) -> int:
@@ -1077,16 +1165,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._compiled.layout.decode_batch * spec.spec.page_size_bytes
             for spec in self._cache_group_specs
         )
-        # The optional MTP layer addresses the same ori IDs but owns a separate
-        # one-layer BF16 pool.
-        mtp_page_bytes = (
-            self._compiled.layout.block_size * DEEPSEEK_V4_HEAD_DIM * torch.bfloat16.itemsize
-            if self._compiled.num_speculative_tokens
+        # The mtp=1 prefix-cache path accounts for its extra KV layer in the
+        # EAGLE ``ori`` group.  Arbitrary-depth MTP is intentionally not adapted
+        # to grouped prefix caching yet and still owns a separate one-layer pool,
+        # so retain the latest serving baseline's explicit capacity charge.
+        multi_mtp_page_bytes = (
+            self._compiled.layout.block_size
+            * DEEPSEEK_V4_HEAD_DIM
+            * torch.bfloat16.itemsize
+            if self._compiled.num_speculative_tokens > 1
             else 0
         )
-        bytes_per_slot += ori_spec.max_blocks_per_seq * mtp_page_bytes
-        scratch_bytes += self._compiled.layout.decode_batch * mtp_page_bytes
-
+        bytes_per_slot += ori_spec.max_blocks_per_seq * multi_mtp_page_bytes
+        scratch_bytes += self._compiled.layout.decode_batch * multi_mtp_page_bytes
         kv_budget = min(budgets)
         minimum_bytes = scratch_bytes + bytes_per_slot
         if kv_budget < minimum_bytes:
@@ -1160,9 +1251,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._physical_cache_num_blocks(spec.name) * spec.spec.page_size_bytes
             for spec in self._cache_group_specs
         )
-        mtp_bytes = 0
-        if self._compiled.num_speculative_tokens:
-            mtp_bytes = (
+        multi_mtp_bytes = 0
+        if self._compiled.num_speculative_tokens > 1:
+            multi_mtp_bytes = (
                 self._physical_cache_num_blocks("ori")
                 * self._compiled.layout.block_size
                 * DEEPSEEK_V4_HEAD_DIM
@@ -1173,7 +1264,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             "per-rank=%.2f GB, ori_blocks=%d, max_seq_len=%d",
             allocated_slots,
             requested_slots,
-            (main_bytes + mtp_bytes) / 1e9,
+            (main_bytes + multi_mtp_bytes) / 1e9,
             self._cache_group_num_blocks["ori"],
             runtime.max_seq_len,
         )
@@ -1279,7 +1370,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         input_ids_by_request = []
         position_ids_by_request = []
         ori_block_tables = []
-        cmp_block_tables = []
+        hca_cmp_block_tables = []
+        csa_cmp_block_tables = []
         idx_block_tables = []
         hca_state_block_tables = []
         csa_state_block_tables = []
@@ -1330,9 +1422,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     max_blocks=layout.prefill_ori_max_blocks,
                 )[0]
             )
-            cmp_block_tables.append(
+            hca_cmp_block_tables.append(
                 self.cache_metadata.ring_block_table_from_ids(
-                    (groups["cmp"],),
+                    (groups["cmp_c128"],),
+                    max_blocks=layout.prefill_cmp_max_blocks,
+                )[0]
+            )
+            csa_cmp_block_tables.append(
+                self.cache_metadata.ring_block_table_from_ids(
+                    (groups["cmp_c4"],),
                     max_blocks=layout.prefill_cmp_max_blocks,
                 )[0]
             )
@@ -1372,7 +1470,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             hca_cmp_slot_mappings.append(
                 self._pad_prefill_mapping(
                     self.cache_metadata.compressed_slot_mapping_from_ids(
-                        (groups["cmp"],),
+                        (groups["cmp_c128"],),
                         (positions,),
                         block_size=layout.block_size,
                         compress_ratio=128,
@@ -1393,7 +1491,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             csa_cmp_slot_mappings.append(
                 self._pad_prefill_mapping(
                     self.cache_metadata.compressed_slot_mapping_from_ids(
-                        (groups["cmp"],),
+                        (groups["cmp_c4"],),
                         (positions,),
                         block_size=layout.block_size,
                         compress_ratio=4,
@@ -1456,7 +1554,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             position_ids=self._rank_scatter(position_ids_by_request, ranks),
             ori_block_table=self._rank_scatter(ori_block_tables, ranks),
             ori_slot_mapping=self._rank_scatter_mappings(ori_slot_mappings, ranks),
-            cmp_block_table=self._rank_scatter(cmp_block_tables, ranks),
+            hca_cmp_block_table=self._rank_scatter(hca_cmp_block_tables, ranks),
+            csa_cmp_block_table=self._rank_scatter(csa_cmp_block_tables, ranks),
             idx_block_table=self._rank_scatter(idx_block_tables, ranks),
             hca_compress_state_block_table=self._rank_scatter(hca_state_block_tables, ranks),
             csa_compress_state_block_table=self._rank_scatter(csa_state_block_tables, ranks),
@@ -1732,8 +1831,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "block_table": self.cache_metadata.paged_ori_block_table_from_ids(
                     padded_group_ids["ori"]
                 ),
-                "cmp_block_table": self.cache_metadata.block_table_from_ids(
-                    padded_group_ids["cmp"],
+                "hca_cmp_block_table": self.cache_metadata.block_table_from_ids(
+                    padded_group_ids["cmp_c128"],
+                    max_blocks=layout.cmp_max_blocks,
+                ),
+                "csa_cmp_block_table": self.cache_metadata.block_table_from_ids(
+                    padded_group_ids["cmp_c4"],
                     max_blocks=layout.cmp_max_blocks,
                 ),
                 "idx_block_table": self.cache_metadata.block_table_from_ids(
@@ -1796,7 +1899,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             position_ids=staged["position_ids"],
             kv_seq_lens=staged["kv_seq_lens"],
             block_table=staged["block_table"],
-            cmp_block_table=staged["cmp_block_table"],
+            hca_cmp_block_table=staged["hca_cmp_block_table"],
+            csa_cmp_block_table=staged["csa_cmp_block_table"],
             idx_block_table=staged["idx_block_table"],
             hca_compress_state_block_table=staged["hca_compress_state_block_table"],
             csa_compress_state_block_table=staged["csa_compress_state_block_table"],
@@ -1875,7 +1979,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise ValueError(
                 f"grouped KV metadata has {len(rows)} rows, expected decode batch {actual_batch}"
             )
-        required = ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
+        required = DEEPSEEK_V4_CACHE_GROUP_NAMES
         normalized = []
         for row_index, row in enumerate(rows):
             missing = [name for name in required if not row.get(name)]
@@ -1901,9 +2005,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         normalized = [tuple(int(block_id) for block_id in row) for row in active_rows]
         if any(not row for row in normalized):
             raise ValueError("active grouped KV rows must not be empty")
+        if any(len(row) != len(set(row)) for row in normalized):
+            raise ValueError("a grouped KV row must not repeat physical blocks")
         used = [block_id for row in normalized for block_id in row]
-        if len(used) != len(set(used)):
-            raise ValueError("active grouped KV rows must not share physical blocks")
+        # Different requests may legitimately share immutable prefix-cache
+        # pages. The cache manager detaches a request with copy-on-write before
+        # any shared rolling page is overwritten, so only duplicates within one
+        # request's own table are invalid here.
         scratch = self._scratch_group_block_ids(
             group_name=group_name,
             kernel_rows=kernel_rows,
@@ -2554,24 +2662,175 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         inputs: DeepSeekV4PreparedPrefillInputs,
         pre_hc_hidden: torch.Tensor,
     ) -> None:
-        """Retain request-local main-prefill inputs needed to seed MTP."""
+        """Advance MTP on every row whose shifted input token is known.
+
+        MTP row ``p`` consumes the main hidden state at ``p`` and token
+        ``p + 1``. During chunked prefill, all rows except the chunk tail can
+        therefore be computed immediately. The prior chunk tail is prepended
+        when the next chunk arrives, leaving exactly one pending row per
+        request. This keeps MTP KV resident before the scheduler publishes the
+        corresponding prefix pages and avoids retaining whole-prompt hidden
+        tensors on the host.
+        """
         for request_id, rank, actual_tokens in zip(
             inputs.request_ids,
             inputs.ranks,
             inputs.actual_tokens,
             strict=True,
         ):
+            n = int(actual_tokens)
+            if n <= 0:
+                raise ValueError("DeepSeekV4 MTP prefill chunks must not be empty")
             state = self._reserve_mtp_request_state(request_id, rank)
+            pending = state.prefill_context
+            current_hidden = inputs.x_hc[rank, :n, 0].detach().cpu()
+            current_prev_hidden = pre_hc_hidden[rank, :n].detach().cpu()
+            current_ids = inputs.input_ids[rank, :n].detach().cpu()
+            current_positions = inputs.position_ids[rank, :n].detach().cpu()
+            current_slots = inputs.ori_slot_mapping[rank, :n].detach().cpu()
+
+            hidden_parts: list[torch.Tensor] = []
+            prev_hidden_parts: list[torch.Tensor] = []
+            id_parts: list[torch.Tensor] = []
+            position_parts: list[torch.Tensor] = []
+            slot_parts: list[torch.Tensor] = []
+            if pending is not None:
+                if pending.rank != rank:
+                    raise RuntimeError(
+                        f"DeepSeekV4 MTP request {request_id!r} moved cache partitions "
+                        f"from {pending.rank} to {rank} during prefill"
+                    )
+                first_position = int(current_positions[0].item())
+                if first_position != pending.position_id + 1:
+                    raise RuntimeError(
+                        f"DeepSeekV4 MTP prefill for {request_id!r} is not contiguous: "
+                        f"pending={pending.position_id}, next={first_position}"
+                    )
+                hidden_parts.append(current_hidden[:1])
+                prev_hidden_parts.append(pending.prev_hidden_state.unsqueeze(0))
+                id_parts.append(current_ids[:1])
+                position_parts.append(torch.tensor((pending.position_id,), dtype=torch.int32))
+                slot_parts.append(torch.tensor((pending.slot_mapping,), dtype=torch.long))
+
+            if n > 1:
+                hidden_parts.append(current_hidden[1:n])
+                prev_hidden_parts.append(current_prev_hidden[: n - 1])
+                id_parts.append(current_ids[1:n])
+                position_parts.append(current_positions[: n - 1])
+                slot_parts.append(current_slots[: n - 1])
+
+            if hidden_parts:
+                self._run_mtp_prefill_rows(
+                    rank=rank,
+                    hidden_states=torch.cat(hidden_parts),
+                    prev_hidden_states=torch.cat(prev_hidden_parts),
+                    input_ids=torch.cat(id_parts),
+                    position_ids=torch.cat(position_parts),
+                    block_table=inputs.ori_block_table[rank].detach().cpu(),
+                    slot_mapping=torch.cat(slot_parts),
+                    produce_draft=False,
+                )
+
+            last_position = int(current_positions[n - 1].item())
             state.prefill_context = _DeepSeekV4MtpPrefillContext(
                 rank=rank,
-                actual_tokens=actual_tokens,
-                hidden_states=inputs.x_hc[rank, :, 0].detach().cpu().clone(),
-                prev_hidden_states=pre_hc_hidden[rank].detach().cpu().clone(),
-                input_ids=inputs.input_ids[rank].detach().cpu().clone(),
-                position_ids=inputs.position_ids[rank].detach().cpu().clone(),
+                prev_hidden_state=current_prev_hidden[n - 1].clone(),
+                position_id=last_position,
                 block_table=inputs.ori_block_table[rank].detach().cpu().clone(),
-                slot_mapping=inputs.ori_slot_mapping[rank].detach().cpu().clone(),
+                slot_mapping=int(current_slots[n - 1].item()),
+                prompt_len=last_position + 1,
             )
+
+    def _run_mtp_prefill_rows(
+        self,
+        *,
+        rank: int,
+        hidden_states: torch.Tensor,
+        prev_hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        produce_draft: bool,
+    ) -> int | None:
+        """Run one contiguous shifted-token MTP prefill segment."""
+        self._require_mtp_buffers()
+        ta = self._mtp_prefill_task_args
+        layout = self._compiled.layout
+        n = int(input_ids.numel())
+        if n <= 0 or n > layout.prefill_seq:
+            raise ValueError(
+                f"DeepSeekV4 MTP prefill rows must be in [1, {layout.prefill_seq}], got {n}"
+            )
+        if (
+            hidden_states.shape != (n, ta.tensors["hidden_states"].shape[-1])
+            or prev_hidden_states.shape
+            != (n, *ta.tensors["prev_hidden_states"].shape[-2:])
+            or position_ids.numel() != n
+            or slot_mapping.numel() != n
+        ):
+            raise ValueError("DeepSeekV4 MTP prefill row tensors are not aligned")
+
+        def pad_rows(values: torch.Tensor) -> torch.Tensor:
+            padded = torch.empty(
+                (layout.prefill_seq, *values.shape[1:]),
+                dtype=values.dtype,
+                device="cpu",
+            )
+            padded[:n].copy_(values.detach().cpu())
+            if n < layout.prefill_seq:
+                indices = torch.arange(layout.prefill_seq - n) % n
+                padded[n:].copy_(values.detach().cpu().index_select(0, indices))
+            return padded
+
+        hidden = pad_rows(hidden_states.to(torch.bfloat16))
+        previous = pad_rows(prev_hidden_states.to(torch.float32))
+        ids = self._padded_vector(input_ids, layout.prefill_seq, dtype=torch.long)
+        positions = self._prefill_position_ids(
+            position_ids.detach().cpu().tolist(),
+            layout.prefill_seq,
+        )
+        ta.tensors["hidden_states"].copy_(
+            hidden.unsqueeze(0).expand(layout.ranks, -1, -1)
+        )
+        ta.tensors["prev_hidden_states"].copy_(
+            previous.unsqueeze(0).expand(layout.ranks, -1, -1, -1)
+        )
+        ta.tensors["input_ids"].copy_(ids.unsqueeze(0).expand(layout.ranks, -1))
+        ta.tensors["position_ids"].copy_(
+            positions.unsqueeze(0).expand(layout.ranks, -1)
+        )
+        ta.tensors["ori_block_table"].copy_(
+            block_table.detach().cpu().unsqueeze(0).expand(layout.ranks, -1)
+        )
+        ori_slot_mapping = ta.tensors["ori_slot_mapping"]
+        ori_slot_mapping.fill_(-1)
+        ori_slot_mapping[rank, :n].copy_(slot_mapping.detach().cpu().to(torch.long))
+        # These are pl.Out tensors for every active row. Reusing them avoids
+        # clearing several large host buffers on every chunk.
+        logit_row_indices = ta.tensors["logit_row_indices"]
+        logit_row_indices.fill_(-1)
+        if produce_draft:
+            logit_row_indices[rank, 0] = n - 1
+        with profile_span(
+            "DeepSeekV4ModelRunner.mtp.prefill.l3_dispatch",
+            cat="executor",
+            args={"actual_tokens": n, "produce_draft": produce_draft},
+        ):
+            self._run_l3(
+                self._require_mtp_prefill_callable(),
+                *self._mtp_prefill_args(),
+                self._int32_scalar(n),
+            )
+        if not produce_draft:
+            return None
+        with profile_span(
+            "DeepSeekV4ModelRunner.mtp.prefill.read_logits",
+            cat="executor",
+            args={"bytes": DEEPSEEK_V4_VOCAB_SIZE * torch.float32.itemsize},
+        ):
+            logits = self._read_mtp_prefill_logits(rank)
+        return int(logits.argmax().item())
 
     def _require_prefill_callable(self) -> DeepSeekV4L3Callable:
         if self._compiled.prefill is None:
@@ -2655,7 +2914,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         cache = self._materialize_decode_device_cache()
         return {
             "kv_cache": cache.kv_cache,
-            "cmp_kv": cache.cmp_kv,
+            "hca_cmp_kv": cache.hca_cmp_kv,
+            "csa_cmp_kv": cache.csa_cmp_kv,
             "idx_kv_cache": cache.idx_kv_cache,
             "idx_kv_scale": cache.idx_kv_scale,
             "hca_compress_state": cache.hca_compress_state,
@@ -3096,77 +3356,32 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         context = state.prefill_context
         if context is None:
             raise RuntimeError(f"DeepSeekV4 MTP prefill context is missing for {request_id!r}")
-        buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
-        n = context.actual_tokens
         owner_rank = context.rank
         first_token = torch.tensor([first_token_id], dtype=torch.long)
-        first_hidden = self._embedding_rows(first_token, torch.bfloat16)[0]
+        first_hidden = self._embedding_rows(first_token, torch.bfloat16)
 
-        shifted_hidden = torch.zeros_like(context.hidden_states, dtype=torch.bfloat16)
-        shifted_hidden[: n - 1].copy_(context.hidden_states[1:n].to(torch.bfloat16))
-        shifted_hidden[n - 1].copy_(first_hidden)
-        ta = self._mtp_prefill_task_args
-        ta.tensors["hidden_states"].copy_(
-            shifted_hidden.unsqueeze(0).expand(layout.ranks, -1, -1)
+        draft_token_id = self._run_mtp_prefill_rows(
+            rank=owner_rank,
+            hidden_states=first_hidden,
+            prev_hidden_states=context.prev_hidden_state.unsqueeze(0),
+            input_ids=first_token,
+            position_ids=torch.tensor((context.position_id,), dtype=torch.int32),
+            block_table=context.block_table,
+            slot_mapping=torch.tensor((context.slot_mapping,), dtype=torch.long),
+            produce_draft=True,
         )
-        ta.tensors["prev_hidden_states"].copy_(
-            context.prev_hidden_states.unsqueeze(0).expand(layout.ranks, -1, -1, -1)
-        )
-
-        shifted_ids = context.input_ids.clone()
-        shifted_ids[: n - 1].copy_(context.input_ids[1:n])
-        shifted_ids[n - 1].copy_(first_token[0])
-        ta.tensors["input_ids"].copy_(shifted_ids.unsqueeze(0).expand(layout.ranks, -1))
-        ta.tensors["position_ids"].copy_(
-            context.position_ids.unsqueeze(0).expand(layout.ranks, -1)
-        )
-        ta.tensors["ori_block_table"].copy_(
-            context.block_table.unsqueeze(0).expand(layout.ranks, -1)
-        )
-        ori_slot_mapping = ta.tensors["ori_slot_mapping"]
-        ori_slot_mapping.fill_(-1)
-        ori_slot_mapping[owner_rank].copy_(context.slot_mapping)
-        logit_row_indices = ta.tensors["logit_row_indices"]
-        logit_row_indices.fill_(-1)
-        logit_row_indices[owner_rank, 0] = n - 1
-        with profile_span(
-            "DeepSeekV4ModelRunner.mtp.prefill.l3_dispatch",
-            cat="executor",
-            args={"actual_tokens": n},
-        ):
-            self._run_l3(
-                self._require_mtp_prefill_callable(),
-                *self._mtp_prefill_args(),
-                self._int32_scalar(n),
-            )
-            with profile_span(
-                "DeepSeekV4ModelRunner.mtp.prefill.read_logits",
-                cat="executor",
-                args={"bytes": DEEPSEEK_V4_VOCAB_SIZE * torch.float32.itemsize},
-            ):
-                logits = self._read_mtp_prefill_logits(owner_rank)
-        state.draft_token_id = int(logits.argmax().item())
+        if draft_token_id is None:
+            raise RuntimeError("DeepSeekV4 MTP draft prefill did not produce a token")
+        state.draft_token_id = draft_token_id
         state.tail_token_id = int(first_token[0].item())
         self._write_mtp_tail_hidden(
             state,
             owner_rank,
-            context.prev_hidden_states[n - 1],
+            context.prev_hidden_state,
         )
-        state.tail_position = int(context.position_ids[n - 1].item())
+        state.tail_position = context.position_id
+        state.prompt_len = context.prompt_len
         self._initialize_mtp_device_state(state)
-        state.prompt_len = n
-        # The MTP prefill pre-HC output is a device-resident TaskArgs slot; read
-        # the whole owner shard back into the host mirror (a raw D2H copy from an
-        # offset device pointer is unsupported) and select the seed row.
-        self._shared_l3_worker().copy_stacked_from(
-            self._mtp_prefill_task_args.tensors["pre_hc_hidden_out"],
-            buffers.prefill_pre_hc_mirror,
-        )
-        state.draft_pre_hc_hidden = (
-            buffers.prefill_pre_hc_mirror[owner_rank, n - 1].detach().cpu().clone()
-        )
-        state.draft_position = int(context.position_ids[n - 1].item()) + 1
         state.prefill_context = None
 
     def _write_mtp_tail_hidden(
@@ -3468,7 +3683,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "x_hc": inputs.x_hc,
                 "ori_block_table": inputs.ori_block_table,
                 "ori_slot_mapping": inputs.ori_slot_mapping,
-                "cmp_block_table": inputs.cmp_block_table,
+                "hca_cmp_block_table": inputs.hca_cmp_block_table,
+                "csa_cmp_block_table": inputs.csa_cmp_block_table,
                 "idx_block_table": inputs.idx_block_table,
                 "position_ids": inputs.position_ids,
                 "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
@@ -3815,11 +4031,23 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     ),
                     torch.bfloat16,
                 ),
-                cmp_kv=resident(
+                hca_cmp_kv=resident(
                     (
                         layout.ranks,
-                        DEEPSEEK_V4_FWD_NUM_LAYERS * self._physical_cache_num_blocks("cmp"),
-                        layout.block_size,
+                        DEEPSEEK_V4_HCA_NUM_LAYERS
+                        * self._physical_cache_num_blocks("cmp_c128"),
+                        layout.block_size // 128,
+                        1,
+                        DEEPSEEK_V4_HEAD_DIM,
+                    ),
+                    torch.bfloat16,
+                ),
+                csa_cmp_kv=resident(
+                    (
+                        layout.ranks,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS
+                        * self._physical_cache_num_blocks("cmp_c4"),
+                        layout.block_size // 4,
                         1,
                         DEEPSEEK_V4_HEAD_DIM,
                     ),
@@ -3828,8 +4056,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 idx_kv_cache=resident(
                     (
                         layout.ranks,
-                        DEEPSEEK_V4_CSA_NUM_LAYERS * self._physical_cache_num_blocks("idx"),
-                        layout.block_size,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS
+                        * self._physical_cache_num_blocks("idx"),
+                        layout.block_size // 4,
                         1,
                         DEEPSEEK_V4_IDX_HEAD_DIM,
                     ),
@@ -3838,8 +4067,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 idx_kv_scale=resident(
                     (
                         layout.ranks,
-                        DEEPSEEK_V4_CSA_NUM_LAYERS * self._physical_cache_num_blocks("idx"),
-                        layout.block_size,
+                        DEEPSEEK_V4_CSA_NUM_LAYERS
+                        * self._physical_cache_num_blocks("idx"),
+                        layout.block_size // 4,
                         1,
                         1,
                     ),
@@ -3913,7 +4143,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if cache is not None:
             for tensor in (
                 cache.kv_cache,
-                cache.cmp_kv,
+                cache.hca_cmp_kv,
+                cache.csa_cmp_kv,
                 cache.idx_kv_cache,
                 cache.idx_kv_scale,
                 cache.hca_compress_state,

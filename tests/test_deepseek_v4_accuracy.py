@@ -15,6 +15,7 @@ import io
 import json
 import os
 import queue
+import re
 import signal
 import socket
 import subprocess
@@ -37,15 +38,21 @@ MODEL_ID = "dsv4-flash-w8a8"
 class MtpAccuracyCase:
     num_speculative_tokens: int
     prompt: str
-    prompt_tokens: int
+    prompt_tokens: int | None
     max_new_tokens: int
-    expected_text: str
+    expected_text: str | None
+    enable_prefix_caching: bool = False
 
 
-# Keep the fused K=1 baseline and one standalone DeepSeek MTP decode shape.
-# K=3 selects the S=4/B=4 standalone tile. Multi-request state and other MTP
-# depths are covered by focused unit guards without expanding this hardware
-# feature gate.
+# K=1 uses EAGLE look-ahead, so a reusable 128-token prefix needs another
+# complete page after it. Repeating a common single-token fragment keeps the
+# prompt comfortably above that boundary and below the 1024-token test limit.
+PREFIX_PROMPT = " and" * 300 + " Huawei is"
+
+# Keep the fused K=1 baseline, one standalone DeepSeek MTP decode shape, and
+# one NPU prefix-cache case. K=3 selects the S=4/B=4 standalone tile.
+# Multi-request state and other MTP depths are covered by focused unit guards
+# without expanding this hardware feature gate.
 MTP_CASES = (
     MtpAccuracyCase(
         num_speculative_tokens=1,
@@ -90,8 +97,16 @@ MTP_CASES = (
         max_new_tokens=10,
         expected_text=" a leading global information and communications technology (ICT)",
     ),
+    MtpAccuracyCase(
+        num_speculative_tokens=1,
+        prompt=PREFIX_PROMPT,
+        prompt_tokens=None,
+        max_new_tokens=10,
+        expected_text=None,
+        enable_prefix_caching=True,
+    ),
 )
-MTP_CASE_IDS = ("k1-fused", "k3-s4-b4")
+MTP_CASE_IDS = ("k1-fused", "k3-s4-b4", "k1-prefix-cache")
 
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
 OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "2400"))
@@ -121,6 +136,7 @@ def _server_command(
     devices: tuple[int, ...],
     port: int,
     num_speculative_tokens: int,
+    enable_prefix_caching: bool = False,
 ) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
@@ -145,16 +161,16 @@ def _server_command(
         "--block-size",
         "128",
         "--max-model-len",
-        "260",
+        "1024" if enable_prefix_caching else "260",
         "--max-num-seqs",
         "8",
         "--max-num-batched-tokens",
         "512",
         "--long-prefill-token-threshold",
-        "2048",
+        "128",
         "--num-speculative-tokens",
         str(num_speculative_tokens),
-        "--no-enable-prefix-caching",
+        "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
         "--port",
         str(port),
         "--show-startup-logs",
@@ -339,13 +355,21 @@ def test_deepseek_v4_http_completion_matches_expected_text(
         pytest.fail(f"PYPTO_DSV4_MODEL_DIR not set or not a directory: {model_dir}")
     devices = _task_devices()
     port = _unused_local_port()
-    log_path = tmp_path / f"deepseek-v4-k{case.num_speculative_tokens}-server.log"
+    enable_prefix_caching = case.enable_prefix_caching
+    cache_suffix = "-prefix-cache" if enable_prefix_caching else ""
+    log_path = tmp_path / f"deepseek-v4-k{case.num_speculative_tokens}{cache_suffix}-server.log"
     deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
 
     try:
         with log_path.open("w", encoding="utf-8") as server_log:
             process = subprocess.Popen(
-                _server_command(model_dir, devices, port, case.num_speculative_tokens),
+                _server_command(
+                    model_dir,
+                    devices,
+                    port,
+                    case.num_speculative_tokens,
+                    enable_prefix_caching,
+                ),
                 cwd=ROOT,
                 stdout=server_log,
                 stderr=subprocess.STDOUT,
@@ -354,26 +378,52 @@ def test_deepseek_v4_http_completion_matches_expected_text(
             )
             try:
                 _wait_for_health(process, port, deadline)
-                response = _request_completion(
-                    process,
-                    port,
-                    deadline,
-                    prompt=case.prompt,
-                    max_new_tokens=case.max_new_tokens,
-                )
-                print(
-                    f"DeepSeek K={case.num_speculative_tokens} completion: {response}", flush=True
-                )
-                assert response.get("model") == MODEL_ID
-                choices = response.get("choices")
-                assert isinstance(choices, list) and len(choices) == 1
-                assert choices[0].get("text") == case.expected_text
-                assert choices[0].get("finish_reason") == "length"
-                usage = response.get("usage", {})
-                assert usage.get("prompt_tokens") == case.prompt_tokens
-                assert usage.get("completion_tokens") == case.max_new_tokens
+                run_count = 2 if enable_prefix_caching else 1
+                responses = []
+                for run_index in range(run_count):
+                    response = _request_completion(
+                        process,
+                        port,
+                        deadline,
+                        prompt=case.prompt,
+                        max_new_tokens=case.max_new_tokens,
+                    )
+                    responses.append(response)
+                    print(
+                        f"DeepSeek K={case.num_speculative_tokens} "
+                        f"prefix_cache={enable_prefix_caching} run={run_index} "
+                        f"completion: {response}",
+                        flush=True,
+                    )
+                    assert response.get("model") == MODEL_ID
+                    choices = response.get("choices")
+                    assert isinstance(choices, list) and len(choices) == 1
+                    assert choices[0].get("finish_reason") == "length"
+                    usage = response.get("usage", {})
+                    assert usage.get("completion_tokens") == case.max_new_tokens
+                    if case.prompt_tokens is not None:
+                        assert usage.get("prompt_tokens") == case.prompt_tokens
+                    if case.expected_text is not None:
+                        assert choices[0].get("text") == case.expected_text
+
+                if enable_prefix_caching:
+                    prompt_tokens = responses[0].get("usage", {}).get("prompt_tokens", 0)
+                    assert prompt_tokens > 2 * 128
+                    assert (
+                        responses[1]["choices"][0]["text"]
+                        == responses[0]["choices"][0]["text"]
+                    )
             finally:
                 _stop_process_group(process)
+        if enable_prefix_caching:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            hits = [
+                int(value)
+                for value in re.findall(r"prefix_cache_hit_tokens=(\d+)", log_text)
+            ]
+            assert hits and max(hits) >= 128, (
+                "Repeated long prompt produced no observable grouped prefix-cache hit"
+            )
     except BaseException:
         _print_server_log(log_path)
         raise
@@ -417,7 +467,14 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
 
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
-    assert tuple(case.num_speculative_tokens for case in MTP_CASES) == (1, 3)
+    non_prefix_depths = tuple(
+        case.num_speculative_tokens for case in MTP_CASES if not case.enable_prefix_caching
+    )
+    prefix_cases = tuple(case for case in MTP_CASES if case.enable_prefix_caching)
+
+    assert non_prefix_depths == (1, 3)
+    assert len(prefix_cases) == 1
+    assert prefix_cases[0].num_speculative_tokens == 1
     assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 128)
 
 

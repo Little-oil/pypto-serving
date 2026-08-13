@@ -102,6 +102,26 @@ def test_deepseek_mtp_decode_abi_keeps_device_state_fused_only():
     assert fused == (*standalone[:5], *device_state, *standalone[5:])
 
 
+def test_deepseek_decode_metadata_allows_shared_prefix_pages_across_requests():
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(decode_batch=4))
+    runner._cache_group_num_blocks = {"ori": 8}
+
+    padded = runner._pad_group_block_ids(
+        ((0, 1), (0, 2)),
+        group_name="ori",
+        kernel_rows=4,
+    )
+
+    assert padded == ((0, 1), (0, 2), (8,), (9,))
+    with pytest.raises(ValueError, match="row must not repeat"):
+        runner._pad_group_block_ids(
+            ((0, 0),),
+            group_name="ori",
+            kernel_rows=4,
+        )
+
+
 def test_deepseek_rope_profiles_keep_swa_and_compressed_layers_distinct():
     class Utils:
         @staticmethod
@@ -1451,22 +1471,22 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
     table = metadata.block_table_from_ids([[64, 65]], max_blocks=4)
     assert table.tolist() == [[64, 65, 0, 0]]
 
-    cmp_mapping = metadata.slot_mapping_from_ids(
+    cmp_mapping = metadata.compressed_slot_mapping_from_ids(
         [[64]],
-        [[0, 4, 256]],
+        [[3, 7, 255]],
         block_size=128,
         compress_ratio=4,
     )
-    base = 64 * 128
-    assert cmp_mapping.tolist() == [[base, base + 1, base + 64]]
+    cmp_base = 64 * (128 // 4)
+    assert cmp_mapping.tolist() == [[cmp_base, cmp_base + 1, cmp_base + 31]]
 
-    hca_state_mapping = metadata.slot_mapping_from_ids(
-        [[64]],
-        [[0, 128, 256]],
-        block_size=8,
-        compress_ratio=128,
+    hca_state_mapping = metadata.state_slot_mapping_from_ids(
+        [[64, 65]],
+        [[0, 7, 8]],
+        state_block_size=8,
     )
-    assert hca_state_mapping.tolist() == [[64 * 8, 64 * 8 + 1, 64 * 8 + 2]]
+    state_base = 64 * 8
+    assert hca_state_mapping.tolist() == [[state_base, state_base + 7, state_base + 8]]
 
 
 def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing():
@@ -1476,15 +1496,18 @@ def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing()
 
     assert all(spec.num_blocks is None for spec in specs)
     assert by_name["ori"].spec.page_size_bytes == 43 * 128 * 512 * 2
-    assert by_name["idx"].spec.page_size_bytes == 21 * 128 * (128 + 4)
+    assert by_name["cmp_c128"].spec.page_size_bytes == 20 * (128 // 128) * 512 * 2
+    assert by_name["cmp_c4"].spec.page_size_bytes == 21 * (128 // 4) * 512 * 2
+    assert by_name["idx"].spec.page_size_bytes == 21 * (128 // 4) * (128 + 4)
     assert by_name["hca_state"].spec.page_size_bytes == 20 * 8 * 1024 * 4
     assert deepseek_v4_cache_blocks_for_slots(specs, 3) == {
-        "ori": 96,
-        "cmp": 24,
-        "idx": 48,
-        "hca_state": 48,
-        "csa_state": 48,
-        "csa_inner_state": 48,
+        "ori": 12,
+        "cmp_c128": 384,
+        "cmp_c4": 384,
+        "idx": 384,
+        "hca_state": 144,
+        "csa_state": 195,
+        "csa_inner_state": 195,
     }
 
 
@@ -1543,9 +1566,10 @@ def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch
         decode_batch=layout.decode_batch,
     )
     attempts = []
+    ori_blocks_per_slot = runner._cache_group_specs[0].max_blocks_per_seq
 
     def allocate_main_cache():
-        slots = runner._cache_group_num_blocks["ori"] // 32
+        slots = runner._cache_group_num_blocks["ori"] // ori_blocks_per_slot
         attempts.append(slots)
         if slots > 2:
             raise MemoryError("synthetic OOM")
@@ -1565,7 +1589,7 @@ def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch
 def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
     layout = DeepSeekV4CacheLayout(
         ranks=2,
-        block_size=1,
+        block_size=128,
         decode_batch=1,
         decode_seq=1,
         decode_tokens=1,
@@ -1582,7 +1606,16 @@ def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
         )
     )
     runner._cache_group_num_blocks = {
-        name: 2 for name in ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
+        name: 2
+        for name in (
+            "ori",
+            "cmp_c128",
+            "cmp_c4",
+            "idx",
+            "hca_state",
+            "csa_state",
+            "csa_inner_state",
+        )
     }
 
     class FakeWorker:
@@ -1615,21 +1648,30 @@ def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
 
     cache = runner._materialize_decode_device_cache()
 
-    assert cache.kv_cache.full_shape == (2, 43 * 3, 1, 1, 512)
-    assert cache.cmp_kv.full_shape == (2, 43 * 3, 1, 1, 512)
-    assert cache.idx_kv_cache.full_shape == (2, 21 * 3, 1, 1, 128)
+    assert cache.kv_cache.full_shape == (2, 43 * 3, 128, 1, 512)
+    assert cache.hca_cmp_kv.full_shape == (2, 20 * 3, 1, 1, 512)
+    assert cache.csa_cmp_kv.full_shape == (2, 21 * 3, 32, 1, 512)
+    assert cache.idx_kv_cache.full_shape == (2, 21 * 3, 32, 1, 128)
     assert cache.hca_compress_state.full_shape == (2, 20 * 3, 8, 1024)
-    assert len(worker.allocations) == 14
+    assert len(worker.allocations) == 16
     assert {worker_id for worker_id, _tensor in worker.allocations} == {0, 1}
 
     runner._free_device_caches()
-    assert len(worker.frees) == 14
+    assert len(worker.frees) == 16
 
 
 def _grouped_cache_rows(count: int) -> list[dict[str, list[int]]]:
-    names = ("ori", "cmp", "idx", "hca_state", "csa_state", "csa_inner_state")
+    base_ids = {
+        "ori": 0,
+        "cmp_c128": 1,
+        "cmp_c4": 1,
+        "idx": 2,
+        "hca_state": 3,
+        "csa_state": 4,
+        "csa_inner_state": 5,
+    }
     return [
-        {name: [request_index * len(names) + group_index] for group_index, name in enumerate(names)}
+        {name: [base_id + request_index] for name, base_id in base_ids.items()}
         for request_index in range(count)
     ]
 
@@ -1661,21 +1703,22 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.x_hc.dtype == torch.float32
     assert prepared.ori_block_table.shape == (8, 128)
     assert prepared.ori_block_table[0, :4].tolist() == [0, 0, 0, 0]
-    assert prepared.cmp_block_table.shape == (8, 32)
-    assert prepared.idx_block_table.shape == (8, 64)
+    assert prepared.hca_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
+    assert prepared.csa_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
+    assert prepared.idx_block_table.shape == (layout.ranks, layout.prefill_idx_max_blocks)
     assert prepared.position_ids.shape == (8, 128)
     assert prepared.position_ids[0, :4].tolist() == [126, 127, 128, 129]
     assert prepared.input_ids[0, :4].tolist() == [10, 11, 12, 10]
     assert prepared.ori_slot_mapping.shape == (8, 128)
     assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 0, -1]
     assert prepared.hca_cmp_slot_mapping.shape == (8, 128)
-    assert prepared.hca_cmp_slot_mapping[0, :3].tolist() == [-1, 128, -1]
+    assert prepared.hca_cmp_slot_mapping[0, :3].tolist() == [-1, 1, -1]
     assert prepared.hca_cmp_slot_mapping[0, 3].item() == -1
     assert prepared.csa_cmp_slot_mapping.shape == (8, 128)
-    assert prepared.csa_cmp_slot_mapping[0, :3].tolist() == [-1, 159, -1]
+    assert prepared.csa_cmp_slot_mapping[0, :3].tolist() == [-1, 63, -1]
     assert prepared.csa_cmp_slot_mapping[0, 3].item() == -1
     assert prepared.csa_idx_slot_mapping.shape == (8, 128)
-    assert prepared.csa_idx_slot_mapping[0, :3].tolist() == [-1, 287, -1]
+    assert prepared.csa_idx_slot_mapping[0, :3].tolist() == [-1, 95, -1]
     assert prepared.csa_idx_slot_mapping[0, 3].item() == -1
     assert prepared.hca_state_slot_mapping.shape == (8, 128)
     assert prepared.hca_state_slot_mapping[0, :4].tolist() == [
@@ -1786,7 +1829,7 @@ def test_deepseek_prepare_decode_inputs_rebuilds_slot_metadata():
     assert second.position_ids[0, 0].item() == 128
 
     changed_rows = _grouped_cache_rows(1)
-    changed_rows[0]["ori"] = [10]
+    changed_rows[0]["ori"] = [1]
     prepare(130, changed_rows)
     assert counting_metadata.ring_table_calls == 3 * first_ring_table_calls
 
@@ -1910,7 +1953,7 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     assert pending.states == (state,)
 
 
-def test_deepseek_prefill_context_preserves_prepare_reserved_state():
+def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
     runner, _model = _runner_for_prepared_inputs()
     runner._compiled.num_speculative_tokens = 1
     state = runner._reserve_mtp_request_state("req-a", 0)
@@ -1929,6 +1972,7 @@ def test_deepseek_prefill_context_preserves_prepare_reserved_state():
         ori_block_table=torch.zeros(layout.ranks, 1, dtype=torch.int32),
         ori_slot_mapping=torch.zeros(layout.ranks, tokens, dtype=torch.int32),
     )
+    monkeypatch.setattr(runner, "_run_mtp_prefill_rows", lambda **_kwargs: None)
 
     runner._capture_mtp_prefill_context(
         inputs,
@@ -2103,7 +2147,8 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
         position_ids=placeholder,
         kv_seq_lens=placeholder,
         block_table=placeholder,
-        cmp_block_table=placeholder,
+        hca_cmp_block_table=placeholder,
+        csa_cmp_block_table=placeholder,
         idx_block_table=placeholder,
         hca_compress_state_block_table=placeholder,
         csa_compress_state_block_table=placeholder,

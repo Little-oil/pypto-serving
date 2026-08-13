@@ -45,9 +45,18 @@ def test_offline_config_uses_one_overlapped_eight_rank_worker(tmp_path):
     assert config.worker_device_ids() == tuple(range(8))
     assert config.runtime_config.max_batch_size == 64
     assert config.runtime_config.num_speculative_tokens == 0
-    assert len(config.runtime_config.kv_cache_groups) == 6
+    assert {group.name for group in config.runtime_config.kv_cache_groups} == {
+        "ori",
+        "cmp_c128",
+        "cmp_c4",
+        "idx",
+        "hca_state",
+        "csa_state",
+        "csa_inner_state",
+    }
     assert all(group.num_partitions == 8 for group in config.runtime_config.kv_cache_groups)
-    assert config.enable_prefix_cache is False
+    assert config.enable_prefix_cache is True
+    assert config.enable_chunk_prefill is True
     assert config.executor_kwargs == {
         "compile_kernels": True,
         "enable_mtp": False,
