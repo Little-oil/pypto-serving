@@ -34,6 +34,14 @@ PROMPT = "Huawei is"
 MAX_NEW_TOKENS = 10
 EXPECTED_TEXT = " a leading global information and communications technology (ICT)"
 
+# Keep one case for each compiled DeepSeek MTP decode shape. K=1 exercises the
+# fused path; K=3 selects the S=4/B=4 standalone tile; and K=9 selects the
+# S=8/B=2 tile while forcing verification to span more than one eight-draft
+# chunk. Multi-request state is covered by the focused unit guards below this
+# hardware matrix, without coupling this feature guard to serving concurrency.
+MTP_CASES = (1, 3, 9)
+MTP_CASE_IDS = ("k1-fused", "k3-s4-b4", "k9-s8-b2-chunked")
+
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
 OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "2400"))
 HEARTBEAT_SECONDS = 30
@@ -57,7 +65,12 @@ def _unused_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> list[str]:
+def _server_command(
+    model_dir: Path,
+    devices: tuple[int, ...],
+    port: int,
+    num_speculative_tokens: int,
+) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
     return [
@@ -83,12 +96,13 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
         "--max-model-len",
         "260",
         "--max-num-seqs",
-        "1",
+        "8",
         "--max-num-batched-tokens",
         "512",
         "--long-prefill-token-threshold",
         "2048",
-        "--enable-mtp",
+        "--num-speculative-tokens",
+        str(num_speculative_tokens),
         "--no-enable-prefix-caching",
         "--port",
         str(port),
@@ -252,20 +266,28 @@ def _print_server_log(log_path: Path) -> None:
     print(content, flush=True)
 
 
-def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "num_speculative_tokens",
+    MTP_CASES,
+    ids=MTP_CASE_IDS,
+)
+def test_deepseek_v4_http_completion_matches_expected_text(
+    tmp_path: Path,
+    num_speculative_tokens: int,
+) -> None:
     model_dir_env = os.environ.get("PYPTO_DSV4_MODEL_DIR")
     model_dir = Path(model_dir_env) if model_dir_env else None
     if model_dir is None or not model_dir.is_dir():
         pytest.fail(f"PYPTO_DSV4_MODEL_DIR not set or not a directory: {model_dir}")
     devices = _task_devices()
     port = _unused_local_port()
-    log_path = tmp_path / "deepseek-v4-server.log"
+    log_path = tmp_path / f"deepseek-v4-k{num_speculative_tokens}-server.log"
     deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
 
     try:
         with log_path.open("w", encoding="utf-8") as server_log:
             process = subprocess.Popen(
-                _server_command(model_dir, devices, port),
+                _server_command(model_dir, devices, port, num_speculative_tokens),
                 cwd=ROOT,
                 stdout=server_log,
                 stderr=subprocess.STDOUT,
@@ -275,13 +297,13 @@ def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> No
             try:
                 _wait_for_health(process, port, deadline)
                 response = _request_completion(process, port, deadline)
-                print(f"DeepSeek completion response: {response}", flush=True)
-
+                print(f"DeepSeek K={num_speculative_tokens} completion: {response}", flush=True)
                 assert response.get("model") == MODEL_ID
                 choices = response.get("choices")
                 assert isinstance(choices, list) and len(choices) == 1
                 assert choices[0].get("text") == EXPECTED_TEXT
                 assert choices[0].get("finish_reason") == "length"
+                assert response.get("usage", {}).get("completion_tokens") == MAX_NEW_TOKENS
             finally:
                 _stop_process_group(process)
     except BaseException:
@@ -310,6 +332,18 @@ def test_completion_http_error_includes_response_body(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="HTTP 500: device allocation failed"):
         _request_completion(RunningProcess(), 1, time.monotonic() + 1)
+
+
+def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -> None:
+    command = _server_command(tmp_path, tuple(range(8)), 12345, 9)
+
+    assert "--enable-mtp" not in command
+    assert command[command.index("--num-speculative-tokens") + 1] == "9"
+    assert command[command.index("--max-num-seqs") + 1] == "8"
+
+
+def test_mtp_matrix_covers_fused_standalone_and_chunked_shapes() -> None:
+    assert MTP_CASES == (1, 3, 9)
 
 
 def test_stop_process_group_suppresses_final_wait_timeout(monkeypatch, capsys) -> None:
