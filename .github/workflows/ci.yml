@@ -28,8 +28,8 @@ jobs:
 
   unit-tests:
     runs-on: [self-hosted, linux, arm64, npu]
-    # The DeepSeek step alone is bounded at --timeout 1200 queue + --max-time
-    # 2700 run, and the venv no longer inherits a base env's torch, so a cold
+    # The DeepSeek matrix alone is bounded at --timeout 1200 queue + --max-time
+    # 3600 run, and the venv no longer inherits a base env's torch, so a cold
     # pip cache is paid here too. 90 left no headroom for both at once.
     timeout-minutes: 120
     env:
@@ -132,7 +132,19 @@ jobs:
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
-      - name: Run DeepSeek V4 HTTP generation accuracy guard
+      - name: Run DeepSeek V4 MTP unit guards
+        env:
+          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          python -m pytest \
+            tests/unit/model/deepseek/test_model_components.py \
+            tests/unit/serving/server/test_worker_sampling.py \
+            tests/unit/serving/sched/test_async_scheduler.py \
+            -q
+
+      - name: Run DeepSeek V4 MTP HTTP matrix
         env:
           PYPTO_RUNTIME_LOG: error
           PTO2_RING_DEP_POOL: 131072
@@ -159,7 +171,7 @@ jobs:
           run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --timeout 1200 --max-time 2700 \
+            --timeout 1200 --max-time 3600 \
             --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
