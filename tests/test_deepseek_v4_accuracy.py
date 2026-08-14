@@ -34,13 +34,12 @@ PROMPT = "Huawei is"
 MAX_NEW_TOKENS = 10
 EXPECTED_TEXT = " a leading global information and communications technology (ICT)"
 
-# Keep one case for each compiled DeepSeek MTP decode shape. K=1 exercises the
-# fused path; K=3 selects the S=4/B=4 standalone tile; and K=9 selects the
-# S=8/B=2 tile while forcing verification to span more than one eight-draft
-# chunk. Multi-request state is covered by the focused unit guards below this
-# hardware matrix, without coupling this feature guard to serving concurrency.
-MTP_CASES = (1, 3, 9)
-MTP_CASE_IDS = ("k1-fused", "k3-s4-b4", "k9-s8-b2-chunked")
+# Keep the fused K=1 baseline and one standalone DeepSeek MTP decode shape.
+# K=3 selects the S=4/B=4 standalone tile. Multi-request state and other MTP
+# depths are covered by focused unit guards without expanding this hardware
+# feature gate.
+MTP_CASES = (1, 3)
+MTP_CASE_IDS = ("k1-fused", "k3-s4-b4")
 
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
 OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "2400"))
@@ -335,15 +334,15 @@ def test_completion_http_error_includes_response_body(monkeypatch) -> None:
 
 
 def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -> None:
-    command = _server_command(tmp_path, tuple(range(8)), 12345, 9)
+    command = _server_command(tmp_path, tuple(range(8)), 12345, 3)
 
     assert "--enable-mtp" not in command
-    assert command[command.index("--num-speculative-tokens") + 1] == "9"
+    assert command[command.index("--num-speculative-tokens") + 1] == "3"
     assert command[command.index("--max-num-seqs") + 1] == "8"
 
 
-def test_mtp_matrix_covers_fused_standalone_and_chunked_shapes() -> None:
-    assert MTP_CASES == (1, 3, 9)
+def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
+    assert MTP_CASES == (1, 3)
 
 
 def test_stop_process_group_suppresses_final_wait_timeout(monkeypatch, capsys) -> None:
