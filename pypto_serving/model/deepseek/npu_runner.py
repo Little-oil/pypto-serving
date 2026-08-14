@@ -4522,8 +4522,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ranks = layout.ranks
         seq = layout.prefill_seq
         hidden = int(hidden_size)
+        rope_profiles = self._compiled.freqs_cos.shape[0] if self._compiled.freqs_cos is not None else 0
+        max_seq_len = self._compiled.freqs_cos.shape[1] if self._compiled.freqs_cos is not None else 0
         rope_dim = self._compiled.freqs_cos.shape[-1] if self._compiled.freqs_cos is not None else 0
-        max_seq_len = self._compiled.freqs_cos.shape[0] if self._compiled.freqs_cos is not None else 0
 
         def shared(shape, dtype, name):
             return self._shared_empty(shape, dtype, name=name)
@@ -4565,8 +4566,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         }
         buffers = _DeepSeekV4PrefillFwdSharedBuffers(
             x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.float32, "prefill_fwd_x_hc"),
-            freqs_cos=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_cos"),
-            freqs_sin=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_sin"),
+            freqs_cos=shared(
+                (ranks, rope_profiles, max_seq_len, rope_dim),
+                torch.bfloat16,
+                "prefill_fwd_freqs_cos",
+            ),
+            freqs_sin=shared(
+                (ranks, rope_profiles, max_seq_len, rope_dim),
+                torch.bfloat16,
+                "prefill_fwd_freqs_sin",
+            ),
             tensors=tensors,
         )
         self._prefill_fwd_buffers = buffers
@@ -4625,12 +4634,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _static_freqs_cos_table(self) -> torch.Tensor:
         if self._compiled.freqs_cos is None:
-            raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
+            raise RuntimeError("DeepSeekV4 packed RoPE cosine table is not initialized")
         return self._rank_stack(self._compiled.freqs_cos)
 
     def _static_freqs_sin_table(self) -> torch.Tensor:
         if self._compiled.freqs_sin is None:
-            raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
+            raise RuntimeError("DeepSeekV4 packed RoPE sine table is not initialized")
         return self._rank_stack(self._compiled.freqs_sin)
 
     def _retain_stacked_host_weights(
@@ -4758,18 +4767,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _static_freqs_cos_tensor(self) -> torch.Tensor:
         if self._static_freqs_cos is None:
-            if self._compiled.freqs_cos is None:
-                raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
             self._ensure_shared_host_allocation_before_worker("freqs_cos")
-            self._static_freqs_cos = self._static_device_tensor(self._rank_stack(self._compiled.freqs_cos))
+            self._static_freqs_cos = self._static_device_tensor(self._static_freqs_cos_table())
         return self._static_freqs_cos
 
     def _static_freqs_sin_tensor(self) -> torch.Tensor:
         if self._static_freqs_sin is None:
-            if self._compiled.freqs_sin is None:
-                raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
             self._ensure_shared_host_allocation_before_worker("freqs_sin")
-            self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
+            self._static_freqs_sin = self._static_device_tensor(self._static_freqs_sin_table())
         return self._static_freqs_sin
 
     def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> None:
