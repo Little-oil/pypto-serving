@@ -478,11 +478,24 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 name, jit_fn, use_cache=self._use_compile_cache, **runtime_scalars
             )
 
-    def _build_rope_tables(self, utils_module: object, config_module: object) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build full-sequence DeepSeekV4 RoPE tables using pypto-lib's helper."""
-        freqs_cos, freqs_sin = utils_module.build_rope_tables(
-            config_module.FLASH,
-            0,
-            dtype=torch.bfloat16,
+    def _build_rope_tables(
+        self,
+        utils_module: object,
+        config_module: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build packed SWA and compressed DeepSeek-V4 RoPE profiles.
+
+        The profile is a property of each attention layer: SWA layers (including
+        the MTP draft layer) use ratio zero, while CSA/HCA layers use the YaRN
+        compressed profile shared by ratios four and 128.
+        """
+        swa_cos, swa_sin = utils_module.build_rope_tables(
+            config_module.FLASH, 0, dtype=torch.bfloat16
         )
-        return freqs_cos.contiguous().cpu(), freqs_sin.contiguous().cpu()
+        compressed_cos, compressed_sin = utils_module.build_rope_tables(
+            config_module.FLASH, 4, dtype=torch.bfloat16
+        )
+        return (
+            torch.stack((swa_cos, compressed_cos), dim=0).contiguous().cpu(),
+            torch.stack((swa_sin, compressed_sin), dim=0).contiguous().cpu(),
+        )

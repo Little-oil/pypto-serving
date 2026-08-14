@@ -89,6 +89,35 @@ def test_deepseek_mtp_decode_abi_keeps_device_state_fused_only():
     assert fused == (*standalone[:5], *device_state, *standalone[5:])
 
 
+def test_deepseek_rope_profiles_keep_swa_and_compressed_layers_distinct():
+    class Utils:
+        @staticmethod
+        def build_rope_tables(_config, compress_ratio, *, dtype):
+            return (
+                torch.full((2, 2), float(compress_ratio), dtype=dtype),
+                torch.full((2, 2), float(compress_ratio + 1), dtype=dtype),
+            )
+
+    executor = npu_executor.DeepSeekV4PyptoExecutor(
+        platform="a2a3sim",
+        device_ids=tuple(range(8)),
+        compile_kernels=False,
+    )
+    freqs_cos, freqs_sin = executor._build_rope_tables(
+        Utils(),
+        SimpleNamespace(FLASH=object()),
+    )
+
+    assert freqs_cos.shape == (2, 2, 2)
+    assert freqs_sin.shape == (2, 2, 2)
+    assert freqs_cos.dtype == torch.bfloat16
+    assert freqs_sin.dtype == torch.bfloat16
+    assert torch.equal(freqs_cos[0], torch.zeros((2, 2), dtype=torch.bfloat16))
+    assert torch.equal(freqs_sin[0], torch.ones((2, 2), dtype=torch.bfloat16))
+    assert torch.equal(freqs_cos[1], torch.full((2, 2), 4.0, dtype=torch.bfloat16))
+    assert torch.equal(freqs_sin[1], torch.full((2, 2), 5.0, dtype=torch.bfloat16))
+
+
 def test_accept_mtp_tokens_commits_second_main_token_only_on_draft_match():
     accepted = accept_mtp_tokens(
         torch.tensor([[11, 12], [21, 22]], dtype=torch.long),
@@ -777,7 +806,10 @@ def test_deepseek_compile_selects_mtp_programs(
     monkeypatch.setattr(
         npu_executor.DeepSeekV4PyptoExecutor,
         "_build_rope_tables",
-        lambda self, utils_module, config_module: (torch.empty(1), torch.empty(1)),
+        lambda self, utils_module, config_module: (
+            torch.empty((2, 1, 1)),
+            torch.empty((2, 1, 1)),
+        ),
     )
     executor = npu_executor.DeepSeekV4PyptoExecutor(
         platform="a2a3sim",
@@ -2249,8 +2281,8 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
-            freqs_cos=torch.empty((1, 1), dtype=torch.bfloat16),
-            freqs_sin=torch.empty((1, 1), dtype=torch.bfloat16),
+            freqs_cos=torch.empty((2, 1, 1), dtype=torch.bfloat16),
+            freqs_sin=torch.empty((2, 1, 1), dtype=torch.bfloat16),
         )
     )
     prefill = runner._ensure_prefill_fwd_buffers(hidden_size=1)
