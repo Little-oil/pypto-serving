@@ -1232,8 +1232,9 @@ class _DeepSeekV4MainDecodeOutput:
 
 @dataclass(frozen=True)
 class _DeepSeekV4PendingMtpDecode:
-    """Completed device dispatch whose small host outputs await reclaim."""
+    """Submitted device dispatch whose small host outputs await reclaim."""
 
+    dispatch: "_DeepSeekV4PendingL3Dispatch"
     inputs: DeepSeekV4PreparedDecodeInputs
     sampled_ids: torch.Tensor
     accepted_counts: torch.Tensor
@@ -1252,6 +1253,47 @@ class _DeepSeekV4MtpVerification:
     tail_pre_hc_hidden: torch.Tensor
     tail_positions: torch.Tensor
     first_logits: torch.Tensor
+
+
+@dataclass
+class _DeepSeekV4PendingL3Dispatch:
+    """Own one asynchronous PyPTO dispatch until completion is reclaimed."""
+
+    worker: Any
+    handle: Any
+    uploaded: tuple[DeviceTensor, ...]
+    name: str
+    _released: bool = False
+    _error: BaseException | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def wait(self) -> None:
+        """Wait for completion and release per-dispatch device uploads once."""
+        with self._lock:
+            if self._released:
+                if self._error is not None:
+                    raise self._error
+                return
+            error: BaseException | None = None
+            try:
+                with profile_span(
+                    f"{self.name}.worker_wait",
+                    cat="kernel",
+                    level="kernel",
+                ):
+                    self.handle.result()
+            except BaseException as exc:
+                error = exc
+            for tensor in self.uploaded:
+                try:
+                    self.worker.free_tensor(tensor)
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+            self._error = error
+            self._released = True
+            if error is not None:
+                raise error
 
 
 @dataclass
@@ -2116,7 +2158,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         batch: DecodeBatch,
         prepared: object,
     ) -> object:
-        """Run the blocking PyPTO dispatch, leaving host reclaim to another lane."""
+        """Submit PyPTO device work, leaving completion and reclaim to another lane."""
         if self._compiled.num_speculative_tokens != 1:
             raise RuntimeError("split decode reclaim requires fused DeepSeekV4 MTP")
         if not isinstance(prepared, DeepSeekV4PreparedDecodeInputs):
@@ -2868,7 +2910,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         inputs: DeepSeekV4PreparedDecodeInputs,
         states: tuple[_DeepSeekV4MtpRequestState, ...],
     ) -> _DeepSeekV4PendingMtpDecode:
-        """Launch a command-lane-complete fused MTP snapshot."""
+        """Submit a command-lane-complete fused MTP snapshot."""
         if inputs.dispatch_args is None:
             raise RuntimeError("DeepSeekV4 fused decode snapshot is not ready to launch")
         active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
@@ -2878,7 +2920,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 cat="executor",
                 args={"actual_tokens": active_tokens, "fused_mtp": True},
             ):
-                self._run_l3(self._require_decode_callable(), *inputs.dispatch_args)
+                dispatch = self._submit_l3(
+                    self._require_decode_callable(),
+                    *inputs.dispatch_args,
+                )
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
@@ -2886,6 +2931,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ) from exc
         staged = self._decode_input_slots[inputs.buffer_slot]
         return _DeepSeekV4PendingMtpDecode(
+            dispatch=dispatch,
             inputs=inputs,
             sampled_ids=staged["sampled_ids"],
             accepted_counts=staged["mtp_accepted_counts"],
@@ -2897,6 +2943,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _reclaim_mtp_decode(self, pending: _DeepSeekV4PendingMtpDecode) -> DecodeResult:
         """Convert one completed output slot into scheduler-visible tokens."""
+        pending.dispatch.wait()
         inputs = pending.inputs
         layout = self._compiled.layout
         decode_seq = layout.decode_seq
@@ -3409,9 +3456,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     else buffers.decode_input_ids
                 ),
                 "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": buffers.decode_hidden_out,
-                "next_pre_hc_hidden": buffers.decode_pre_hc_out,
-                "logits": buffers.decode_logits,
+                "hidden_out": (
+                    staged["mtp_hidden_out"] if staged is not None else buffers.decode_hidden_out
+                ),
+                "next_pre_hc_hidden": (
+                    staged["mtp_pre_hc_out"] if staged is not None else buffers.decode_pre_hc_out
+                ),
+                "logits": staged["mtp_logits"] if staged is not None else buffers.decode_logits,
                 "sampled_ids": (
                     staged["mtp_sampled_ids"] if staged is not None else buffers.decode_sampled_ids
                 ),
@@ -3468,9 +3519,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Bind all steady L3 arguments on the prepare lane."""
         staged = self._decode_input_slots[inputs.buffer_slot]
-        hidden_buffer = self._require_decode_output_buffer(hidden_size)
+        if staged["logits"].shape[-1] != int(vocab_size):
+            raise ValueError("prepared decode logits buffer does not match the model vocabulary")
+        hidden_buffer = staged["hidden_out"]
         pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(hidden_size)
-        logits_buffer = self._require_decode_logits_buffer(vocab_size)
+        logits_buffer = staged["logits"]
         main_args = self._decode_fwd_args(
             inputs,
             pre_hc_hidden_buffer,
@@ -4360,23 +4413,48 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         torch.int32,
                         name=f"{prefix}_mtp_tail_positions",
                     ),
+                    # PyPTO asynchronous handles retain mutable bindings until
+                    # completion. Keep every Host Out tensor slot-local, not
+                    # only the small outputs consumed by reclaim.
+                    "hidden_out": self._shared_empty(
+                        (ranks, tokens, int(hidden_size)),
+                        torch.bfloat16,
+                        name=f"{prefix}_hidden_out",
+                    ),
+                    "logits": self._shared_empty(
+                        (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
+                        torch.float32,
+                        name=f"{prefix}_logits",
+                    ),
+                    "mtp_hidden_out": self._shared_empty(
+                        (ranks, tokens, int(hidden_size)),
+                        torch.bfloat16,
+                        name=f"{prefix}_mtp_hidden_out",
+                    ),
+                    "mtp_pre_hc_out": self._shared_empty(
+                        (ranks, tokens, layout.hc_mult, int(hidden_size)),
+                        torch.float32,
+                        name=f"{prefix}_mtp_pre_hc_out",
+                    ),
+                    "mtp_logits": self._shared_empty(
+                        (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
+                        torch.float32,
+                        name=f"{prefix}_mtp_logits",
+                    ),
                 }
 
             # Two execution snapshots let the command thread prepare step N+1
             # while the device thread consumes step N. Worker slot ownership is
             # released only after output reclaim has finished reading the slot.
             self._decode_input_slots = [allocate_input_slot(0), allocate_input_slot(1)]
+            self._decode_logits_buffer = self._decode_input_slots[0]["logits"]
             buffers = _DeepSeekV4DecodeSharedBuffers(
                 pre_hc_hidden_out=self._shared_empty(
                     (ranks, tokens, layout.hc_mult, int(hidden_size)),
                     torch.float32,
                     name="decode_pre_hc_hidden_out",
                 ),
-                x_out=self._shared_empty(
-                    (ranks, tokens, int(hidden_size)),
-                    torch.bfloat16,
-                    name="decode_x_out",
-                ),
+                x_out=self._decode_input_slots[0]["hidden_out"],
                 sampled_ids=self._decode_input_slots[0]["sampled_ids"],
                 tensors=self._decode_input_slots[0],
             )
@@ -4398,6 +4476,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ranks = layout.ranks
         tokens = layout.decode_tokens
         hidden = int(hidden_size)
+        self._ensure_decode_buffers(hidden)
         loaded = self.load_mtp_weights()
         weights = dict(loaded.tensors)
         # The real MTP pool is allocated directly on each worker after runtime
@@ -4801,6 +4880,39 @@ class DeepSeekV4ModelRunner(ModelRunner):
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
+
+    def _submit_l3(
+        self,
+        callable_spec: DeepSeekV4L3Callable,
+        *args: Any,
+    ) -> _DeepSeekV4PendingL3Dispatch:
+        """Submit one L3 program and transfer argument ownership to its handle."""
+        if self._l3_worker is None:
+            self._assert_l3_args_shared_before_worker(callable_spec, args)
+        worker = self._shared_l3_worker()
+        uploaded: list[DeviceTensor] = []
+        try:
+            l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
+            with profile_span(
+                f"{callable_spec.name}.worker_submit",
+                cat="kernel",
+                level="kernel",
+                args={
+                    "block_dim": callable_spec.block_dim,
+                    "aicpu_thread_num": callable_spec.aicpu_thread_num,
+                },
+            ):
+                handle = worker.submit(callable_spec.compiled, *l3_args)
+        except BaseException:
+            for tensor in uploaded:
+                worker.free_tensor(tensor)
+            raise
+        return _DeepSeekV4PendingL3Dispatch(
+            worker=worker,
+            handle=handle,
+            uploaded=tuple(uploaded),
+            name=callable_spec.name,
+        )
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:

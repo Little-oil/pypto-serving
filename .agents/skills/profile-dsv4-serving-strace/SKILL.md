@@ -100,7 +100,8 @@ Require all of the following:
    acceptance lines.
 5. Eight distinct `[chip_process pid=... dev=...] ready` mappings are present.
 6. `serving-trace/trace.json` contains non-empty `traceEvents`, including framework spans
-   and `deepseek_v4_decode_mtp_fused` for every proposed decode step.
+   and either a blocking `deepseek_v4_decode_mtp_fused` span or paired asynchronous
+   `.worker_submit` / `.worker_wait` spans for every proposed decode step.
 7. `server.log` contains host `[STRACE]` records and no `clk=dev` records.
 8. `simpler-swimlane.json` and `serving-strace-swimlane.json` contain non-empty
    `traceEvents`.

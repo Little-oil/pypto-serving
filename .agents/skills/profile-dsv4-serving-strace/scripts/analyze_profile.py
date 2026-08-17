@@ -94,16 +94,38 @@ def main() -> None:
     serving_events = serving_trace["traceEvents"]
 
     kernel_durations_ms: dict[str, list[float]] = defaultdict(list)
+    async_kernel_events: dict[str, dict[str, list[dict]]] = defaultdict(
+        lambda: {"submit": [], "wait": []}
+    )
     for event in serving_events:
+        name = event.get("name", "")
+        for suffix, phase in ((".worker_submit", "submit"), (".worker_wait", "wait")):
+            if event.get("ph") == "X" and name.endswith(suffix):
+                async_kernel_events[name[: -len(suffix)]][phase].append(event)
+                break
         if (
             event.get("ph") == "X"
             and event.get("cat") == "kernel"
-            and not event.get("name", "").endswith(".worker_run")
+            and not name.endswith((".worker_run", ".worker_submit", ".worker_wait"))
         ):
             # Current serving profile spans use the event name as the kernel
             # identifier; older traces also duplicated it in args.kernel.
             kernel_name = event.get("args", {}).get("kernel") or event["name"]
             kernel_durations_ms[kernel_name].append(event["dur"] / 1000.0)
+    for kernel_name, phases in async_kernel_events.items():
+        submits = sorted(phases["submit"], key=lambda event: event["ts"])
+        waits = sorted(phases["wait"], key=lambda event: event["ts"])
+        if len(submits) != len(waits):
+            raise RuntimeError(
+                f"unpaired async kernel spans for {kernel_name}: "
+                f"submit={len(submits)}, wait={len(waits)}"
+            )
+        for submit, wait in zip(submits, waits, strict=True):
+            submit_start = submit["ts"]
+            completion = wait["ts"] + wait["dur"]
+            if wait["ts"] < submit_start + submit["dur"]:
+                raise RuntimeError(f"invalid async kernel lifecycle for {kernel_name}")
+            kernel_durations_ms[kernel_name].append((completion - submit_start) / 1000.0)
     missing_kernels = REQUIRED_KERNELS - kernel_durations_ms.keys()
     if missing_kernels:
         raise RuntimeError(f"missing one-L2 serving kernel spans: {sorted(missing_kernels)}")
@@ -272,6 +294,11 @@ def main() -> None:
             "event_count": len(serving_events),
             "span_count": len(serving_spans),
             "span_categories": dict(sorted(serving_categories.items())),
+            "decode_timing_source": (
+                "async_submit_to_wait_end"
+                if DECODE_KERNEL in async_kernel_events
+                else "blocking_kernel_span"
+            ),
         },
         "simpler": {
             "span_count": len(spans),
@@ -304,6 +331,10 @@ def main() -> None:
     fused_serving = summary["serving_kernel_ms"][DECODE_KERNEL]["steady_after_first"]
     if fused_serving is None:
         raise RuntimeError("need more than one fused decode kernel span")
+    decode_timing_label = {
+        "async_submit_to_wait_end": "submit-to-completion",
+        "blocking_kernel_span": "blocking kernel span",
+    }[summary["serving_profile"]["decode_timing_source"]]
     host_stats = summary["simpler"]["decode_critical_steady_us"]
     critical_rank_counts = Counter(row["critical_device"] for row in decode_rows)
     critical_rank_summary = ", ".join(
@@ -328,7 +359,7 @@ def main() -> None:
 
 - Prefill main kernel span: {kernel_durations_ms['deepseek_v4_prefill'][0]:.3f} ms
 - Prefill MTP kernel span: {kernel_durations_ms['deepseek_v4_mtp_prefill'][0]:.3f} ms
-- Fused decode steady mean (steps 2-{proposed_steps}): {fused_serving['mean']:.3f} ms/iteration
+- Fused decode {decode_timing_label} steady mean (steps 2-{proposed_steps}): {fused_serving['mean']:.3f} ms/iteration
 
 ## Simpler Host STRACE
 

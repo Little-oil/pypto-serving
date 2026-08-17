@@ -1884,8 +1884,10 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
 
     state.device_state_initialized = True
     runner._require_decode_callable = lambda: SimpleNamespace(name="decode_mtp_fused")
-    runner._run_l3 = lambda _callable, *args: args == ("fused",) or pytest.fail(
-        "prepared dispatch arguments changed"
+    runner._submit_l3 = lambda _callable, *args: (
+        SimpleNamespace(wait=lambda: None)
+        if args == ("fused",)
+        else pytest.fail("prepared dispatch arguments changed")
     )
     pending = runner.dispatch_prepared_decode(model, batch, prepared)
     assert pending.states == (state,)
@@ -2211,16 +2213,20 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
         "mtp_committed_position_ids": mtp_buffers.decode_position_ids,
     }]
 
-    def fake_run_l3(callable_spec, *args):
+    def fake_submit_l3(callable_spec, *args):
         dispatches.append((callable_spec.name, args))
-        main_sampled_ids[0, 0, 0] = 5
-        main_sampled_ids[0, 1, 0] = 9
-        mtp_buffers.decode_accepted_counts[0, 0] = 2
-        mtp_buffers.decode_input_ids[0, 1] = 9
-        mtp_buffers.decode_position_ids[0, 1] = 128
-        mtp_buffers.decode_sampled_ids[0, 0, 0] = 7
 
-    runner._run_l3 = fake_run_l3
+        def complete():
+            main_sampled_ids[0, 0, 0] = 5
+            main_sampled_ids[0, 1, 0] = 9
+            mtp_buffers.decode_accepted_counts[0, 0] = 2
+            mtp_buffers.decode_input_ids[0, 1] = 9
+            mtp_buffers.decode_position_ids[0, 1] = 128
+            mtp_buffers.decode_sampled_ids[0, 0, 0] = 7
+
+        return SimpleNamespace(wait=complete)
+
+    runner._submit_l3 = fake_submit_l3
 
     result = runner._run_mtp_decode(
         model,
