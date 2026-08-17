@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -30,15 +31,66 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "dsv4-flash-w8a8"
-PROMPT = "Huawei is"
-MAX_NEW_TOKENS = 10
-EXPECTED_TEXT = " a leading global information and communications technology (ICT)"
+
+
+@dataclass(frozen=True)
+class MtpAccuracyCase:
+    num_speculative_tokens: int
+    prompt: str
+    prompt_tokens: int
+    max_new_tokens: int
+    expected_text: str
+
 
 # Keep the fused K=1 baseline and one standalone DeepSeek MTP decode shape.
 # K=3 selects the S=4/B=4 standalone tile. Multi-request state and other MTP
 # depths are covered by focused unit guards without expanding this hardware
 # feature gate.
-MTP_CASES = (1, 3)
+MTP_CASES = (
+    MtpAccuracyCase(
+        num_speculative_tokens=1,
+        # Official Palace Museum introduction: https://www.dpm.org.cn/Explore.html
+        # 新版 prompt：
+        # 紫禁城南北长961米，东西宽753米，四面围有高10米的城墙，城外有宽52米的护城河。
+        # 紫禁城有四座城门，南面为午门，北面为神武门，东面为东华门，西面为西华门。
+        prompt=(
+            "\u7d2b\u7981\u57ce\u5357\u5317\u957f961\u7c73\uff0c"
+            "\u4e1c\u897f\u5bbd753\u7c73\uff0c"
+            "\u56db\u9762\u56f4\u6709\u9ad810\u7c73\u7684\u57ce\u5899\uff0c"
+            "\u57ce\u5916\u6709\u5bbd52\u7c73\u7684\u62a4\u57ce\u6cb3\u3002"
+            "\u7d2b\u7981\u57ce\u6709\u56db\u5ea7\u57ce\u95e8\uff0c"
+            "\u5357\u9762\u4e3a\u5348\u95e8\uff0c"
+            "\u5317\u9762\u4e3a\u795e\u6b66\u95e8\uff0c"
+            "\u4e1c\u9762\u4e3a\u4e1c\u534e\u95e8\uff0c"
+            "\u897f\u9762\u4e3a\u897f\u534e\u95e8\u3002"
+        ),
+        prompt_tokens=64,
+        max_new_tokens=128,
+        # 新版 expected text：
+        # 城墙的四角，各有一座风姿绰约的角楼，民间有九梁十八柱七十二条脊之说，形容其结构的复杂。
+        # 紫禁城内的建筑分为外朝和内廷两部分。外朝的中心为太和殿、中和殿、保和殿，统称三大殿，
+        # 是国家举行大典礼的地方。三大殿左右两翼辅以文华殿、武英殿两组建筑。内廷的中心是乾清宫、
+        # 交泰殿、坤宁宫，统称后三宫，是皇帝和皇后居住的正宫。其后为御花园。后三宫两侧排列着东、
+        expected_text=(
+            "\u57ce\u5899\u7684\u56db\u89d2\uff0c\u5404\u6709\u4e00\u5ea7\u98ce\u59ff\u7ef0\u7ea6\u7684\u89d2\u697c\uff0c\u6c11\u95f4"
+            "\u6709\u4e5d\u6881\u5341\u516b\u67f1\u4e03\u5341\u4e8c\u6761\u810a\u4e4b\u8bf4\uff0c\u5f62\u5bb9\u5176\u7ed3\u6784\u7684"
+            "\u590d\u6742\u3002\u7d2b\u7981\u57ce\u5185\u7684\u5efa\u7b51\u5206\u4e3a\u5916\u671d\u548c\u5185\u5ef7\u4e24\u90e8\u5206"
+            "\u3002\u5916\u671d\u7684\u4e2d\u5fc3\u4e3a\u592a\u548c\u6bbf\u3001\u4e2d\u548c\u6bbf\u3001\u4fdd\u548c\u6bbf\uff0c\u7edf"
+            "\u79f0\u4e09\u5927\u6bbf\uff0c\u662f\u56fd\u5bb6\u4e3e\u884c\u5927\u5178\u793c\u7684\u5730\u65b9\u3002\u4e09\u5927\u6bbf"
+            "\u5de6\u53f3\u4e24\u7ffc\u8f85\u4ee5\u6587\u534e\u6bbf\u3001\u6b66\u82f1\u6bbf\u4e24\u7ec4\u5efa\u7b51\u3002\u5185\u5ef7"
+            "\u7684\u4e2d\u5fc3\u662f\u4e7e\u6e05\u5bab\u3001\u4ea4\u6cf0\u6bbf\u3001\u5764\u5b81\u5bab\uff0c\u7edf\u79f0\u540e\u4e09"
+            "\u5bab\uff0c\u662f\u7687\u5e1d\u548c\u7687\u540e\u5c45\u4f4f\u7684\u6b63\u5bab\u3002\u5176\u540e\u4e3a\u5fa1\u82b1\u56ed"
+            "\u3002\u540e\u4e09\u5bab\u4e24\u4fa7\u6392\u5217\u7740\u4e1c\u3001"
+        ),
+    ),
+    MtpAccuracyCase(
+        num_speculative_tokens=3,
+        prompt="Huawei is",
+        prompt_tokens=4,
+        max_new_tokens=10,
+        expected_text=" a leading global information and communications technology (ICT)",
+    ),
+)
 MTP_CASE_IDS = ("k1-fused", "k3-s4-b4")
 
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
@@ -137,14 +189,21 @@ def _wait_for_health(process: subprocess.Popen, port: int, deadline: float) -> N
     raise TimeoutError(f"DeepSeek server did not become healthy: {last_error}")
 
 
-def _request_completion(process: subprocess.Popen, port: int, deadline: float) -> dict:
+def _request_completion(
+    process: subprocess.Popen,
+    port: int,
+    deadline: float,
+    *,
+    prompt: str,
+    max_new_tokens: int,
+) -> dict:
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/completions",
         data=json.dumps(
             {
                 "model": MODEL_ID,
-                "prompt": PROMPT,
-                "max_tokens": MAX_NEW_TOKENS,
+                "prompt": prompt,
+                "max_tokens": max_new_tokens,
                 "temperature": 0.0,
                 "top_p": 1.0,
             }
@@ -266,13 +325,13 @@ def _print_server_log(log_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "num_speculative_tokens",
+    "case",
     MTP_CASES,
     ids=MTP_CASE_IDS,
 )
 def test_deepseek_v4_http_completion_matches_expected_text(
     tmp_path: Path,
-    num_speculative_tokens: int,
+    case: MtpAccuracyCase,
 ) -> None:
     model_dir_env = os.environ.get("PYPTO_DSV4_MODEL_DIR")
     model_dir = Path(model_dir_env) if model_dir_env else None
@@ -280,13 +339,13 @@ def test_deepseek_v4_http_completion_matches_expected_text(
         pytest.fail(f"PYPTO_DSV4_MODEL_DIR not set or not a directory: {model_dir}")
     devices = _task_devices()
     port = _unused_local_port()
-    log_path = tmp_path / f"deepseek-v4-k{num_speculative_tokens}-server.log"
+    log_path = tmp_path / f"deepseek-v4-k{case.num_speculative_tokens}-server.log"
     deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
 
     try:
         with log_path.open("w", encoding="utf-8") as server_log:
             process = subprocess.Popen(
-                _server_command(model_dir, devices, port, num_speculative_tokens),
+                _server_command(model_dir, devices, port, case.num_speculative_tokens),
                 cwd=ROOT,
                 stdout=server_log,
                 stderr=subprocess.STDOUT,
@@ -295,14 +354,24 @@ def test_deepseek_v4_http_completion_matches_expected_text(
             )
             try:
                 _wait_for_health(process, port, deadline)
-                response = _request_completion(process, port, deadline)
-                print(f"DeepSeek K={num_speculative_tokens} completion: {response}", flush=True)
+                response = _request_completion(
+                    process,
+                    port,
+                    deadline,
+                    prompt=case.prompt,
+                    max_new_tokens=case.max_new_tokens,
+                )
+                print(
+                    f"DeepSeek K={case.num_speculative_tokens} completion: {response}", flush=True
+                )
                 assert response.get("model") == MODEL_ID
                 choices = response.get("choices")
                 assert isinstance(choices, list) and len(choices) == 1
-                assert choices[0].get("text") == EXPECTED_TEXT
+                assert choices[0].get("text") == case.expected_text
                 assert choices[0].get("finish_reason") == "length"
-                assert response.get("usage", {}).get("completion_tokens") == MAX_NEW_TOKENS
+                usage = response.get("usage", {})
+                assert usage.get("prompt_tokens") == case.prompt_tokens
+                assert usage.get("completion_tokens") == case.max_new_tokens
             finally:
                 _stop_process_group(process)
     except BaseException:
@@ -330,7 +399,13 @@ def test_completion_http_error_includes_response_body(monkeypatch) -> None:
             return None
 
     with pytest.raises(RuntimeError, match="HTTP 500: device allocation failed"):
-        _request_completion(RunningProcess(), 1, time.monotonic() + 1)
+        _request_completion(
+            RunningProcess(),
+            1,
+            time.monotonic() + 1,
+            prompt="Huawei is",
+            max_new_tokens=1,
+        )
 
 
 def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -> None:
@@ -342,7 +417,8 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
 
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
-    assert MTP_CASES == (1, 3)
+    assert tuple(case.num_speculative_tokens for case in MTP_CASES) == (1, 3)
+    assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 128)
 
 
 def test_stop_process_group_suppresses_final_wait_timeout(monkeypatch, capsys) -> None:
