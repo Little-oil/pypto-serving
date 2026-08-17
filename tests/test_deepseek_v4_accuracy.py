@@ -65,12 +65,22 @@ MTP_CASES = (
             "\u897f\u9762\u4e3a\u897f\u534e\u95e8\u3002"
         ),
         prompt_tokens=64,
-        max_new_tokens=16,
-        # 新版 expected text：城墙的四角，各有一座风姿绰约的角楼，民间有
+        max_new_tokens=128,
+        # 新版 expected text：
+        # 城墙的四角，各有一座风姿绰约的角楼，民间有九梁十八柱七十二条脊之说，形容其结构的复杂。
+        # 紫禁城内的建筑分为外朝和内廷两部分。外朝的中心为太和殿、中和殿、保和殿，统称三大殿，
+        # 是国家举行大典礼的地方。三大殿左右两翼辅以文华殿、武英殿两组建筑。内廷的中心是乾清宫、
+        # 交泰殿、坤宁宫，统称后三宫，是皇帝和皇后居住的正宫。其后为御花园。后三宫两侧排列着东、
         expected_text=(
-            "\u57ce\u5899\u7684\u56db\u89d2\uff0c"
-            "\u5404\u6709\u4e00\u5ea7\u98ce\u59ff\u7ef0\u7ea6\u7684\u89d2\u697c\uff0c"
-            "\u6c11\u95f4\u6709"
+            "\u57ce\u5899\u7684\u56db\u89d2\uff0c\u5404\u6709\u4e00\u5ea7\u98ce\u59ff\u7ef0\u7ea6\u7684\u89d2\u697c\uff0c\u6c11\u95f4"
+            "\u6709\u4e5d\u6881\u5341\u516b\u67f1\u4e03\u5341\u4e8c\u6761\u810a\u4e4b\u8bf4\uff0c\u5f62\u5bb9\u5176\u7ed3\u6784\u7684"
+            "\u590d\u6742\u3002\u7d2b\u7981\u57ce\u5185\u7684\u5efa\u7b51\u5206\u4e3a\u5916\u671d\u548c\u5185\u5ef7\u4e24\u90e8\u5206"
+            "\u3002\u5916\u671d\u7684\u4e2d\u5fc3\u4e3a\u592a\u548c\u6bbf\u3001\u4e2d\u548c\u6bbf\u3001\u4fdd\u548c\u6bbf\uff0c\u7edf"
+            "\u79f0\u4e09\u5927\u6bbf\uff0c\u662f\u56fd\u5bb6\u4e3e\u884c\u5927\u5178\u793c\u7684\u5730\u65b9\u3002\u4e09\u5927\u6bbf"
+            "\u5de6\u53f3\u4e24\u7ffc\u8f85\u4ee5\u6587\u534e\u6bbf\u3001\u6b66\u82f1\u6bbf\u4e24\u7ec4\u5efa\u7b51\u3002\u5185\u5ef7"
+            "\u7684\u4e2d\u5fc3\u662f\u4e7e\u6e05\u5bab\u3001\u4ea4\u6cf0\u6bbf\u3001\u5764\u5b81\u5bab\uff0c\u7edf\u79f0\u540e\u4e09"
+            "\u5bab\uff0c\u662f\u7687\u5e1d\u548c\u7687\u540e\u5c45\u4f4f\u7684\u6b63\u5bab\u3002\u5176\u540e\u4e3a\u5fa1\u82b1\u56ed"
+            "\u3002\u540e\u4e09\u5bab\u4e24\u4fa7\u6392\u5217\u7740\u4e1c\u3001"
         ),
     ),
     MtpAccuracyCase(
@@ -408,7 +418,7 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
     assert tuple(case.num_speculative_tokens for case in MTP_CASES) == (1, 3)
-    assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 16)
+    assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 128)
 
 
 def test_stop_process_group_suppresses_final_wait_timeout(monkeypatch, capsys) -> None:
