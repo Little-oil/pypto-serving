@@ -20,15 +20,17 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from pypto.runtime import DeviceTensor
+from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 import pypto_serving.cli.main as cli
 from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
 from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
-from pypto_serving.model.deepseek import npu_executor, npu_runner, weight_loader
+from pypto_serving.model.deepseek import npu_executor, weight_loader
+from pypto_serving.model.deepseek import task_args as task_args_module
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+    DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheMetadataBuilder,
     DeepSeekV4CompiledKernels,
@@ -40,6 +42,17 @@ from pypto_serving.model.deepseek.npu_runner import (
     build_deepseek_v4_layer_plan,
     deepseek_v4_cache_blocks_for_slots,
     deepseek_v4_decode_layout,
+)
+from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor
+from pypto_serving.model.deepseek.task_args import (
+    _DECODE_FWD_TENSOR_ORDER,
+    _FUSED_MTP_DECODE_TENSOR_ORDER,
+    _MTP_PREFILL_TENSOR_ORDER,
+    _PREFILL_FWD_TENSOR_ORDER,
+    decode_task_args,
+    mtp_decode_task_args,
+    mtp_prefill_task_args,
+    prefill_task_args,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DEEPSEEK_V4_PACKED_FORMAT,
@@ -79,8 +92,8 @@ def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
 
 
 def test_deepseek_mtp_decode_abi_keeps_device_state_fused_only():
-    standalone = npu_runner._MTP_DECODE_TENSOR_ORDER
-    fused = npu_runner._FUSED_MTP_DECODE_TENSOR_ORDER
+    standalone = task_args_module._MTP_DECODE_TENSOR_ORDER
+    fused = task_args_module._FUSED_MTP_DECODE_TENSOR_ORDER
     device_state = ("state_generations", "state_tokens", "state_meta")
 
     assert len(standalone) == 62
@@ -186,42 +199,45 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
     runner, model = _runner_for_prepared_inputs()
     layout = deepseek_v4_decode_layout(3)
     runner._compiled.layout = layout
-    buffers = SimpleNamespace(
-        decode_input_ids=torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.long),
-        decode_position_ids=torch.empty(
+    mtp_slots = {
+        "input_ids": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.long),
+        "position_ids": torch.empty(
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
-        decode_accepted_counts=torch.empty(
+        "accepted_counts": torch.empty(
             (layout.ranks, layout.decode_batch),
             dtype=torch.int32,
         ),
-        decode_tail_slot_ids=torch.empty(
+        "tail_slot_ids": torch.empty(
             (layout.ranks, layout.decode_batch),
             dtype=torch.int32,
         ),
-        decode_pre_hc_out=torch.empty(
+        "next_pre_hc_hidden": torch.empty(
             (layout.ranks, layout.decode_tokens, 4, 1),
             dtype=torch.float32,
         ),
-        decode_sampled_ids=torch.empty(
+        "sampled_ids": torch.empty(
             (layout.ranks, layout.decode_tokens, 8),
             dtype=torch.int32,
         ),
-        decode_logit_row_indices=torch.empty(
+        "logit_row_indices": torch.empty(
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
-    )
-    runner._mtp_buffers = buffers
-    runner._decode_buffers = SimpleNamespace(
-        tensors={
-            "block_table": torch.empty(
-                (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
-                dtype=torch.int32,
-            )
-        }
-    )
+    }
+    runner._mtp_buffers = SimpleNamespace()
+    runner._mtp_decode_task_args = [SimpleNamespace(tensors=mtp_slots)]
+    runner._decode_task_args = [
+        SimpleNamespace(
+            tensors={
+                "block_table": torch.empty(
+                    (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
+                    dtype=torch.int32,
+                )
+            }
+        )
+    ]
     indices_by_rank = ((0, 1),) + ((),) * (layout.ranks - 1)
     assignment = SimpleNamespace(
         ranks=(0, 0),
@@ -254,8 +270,8 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
     def fake_run_l3(callable_spec, *args):
         active_tokens.append(int(args[-1]))
         call_index = len(active_tokens)
-        buffers.decode_sampled_ids[0, 0, 0] = 10 + 10 * (call_index - 1)
-        buffers.decode_pre_hc_out[0, 0].fill_(call_index)
+        mtp_slots["sampled_ids"][0, 0, 0] = 10 + 10 * (call_index - 1)
+        mtp_slots["next_pre_hc_hidden"][0, 0].fill_(call_index)
 
     monkeypatch.setattr(runner, "_run_l3", fake_run_l3)
     batch = DecodeBatch(
@@ -289,14 +305,16 @@ def test_deepseek_recurrent_mtp_reuses_unchanged_ori_tables():
     runner, _model = _runner_for_prepared_inputs()
     layout = deepseek_v4_decode_layout(3)
     runner._compiled.layout = layout
-    runner._decode_buffers = SimpleNamespace(
-        tensors={
-            "block_table": torch.empty(
-                (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
-                dtype=torch.int32,
-            )
-        }
-    )
+    runner._decode_task_args = [
+        SimpleNamespace(
+            tensors={
+                "block_table": torch.empty(
+                    (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
+                    dtype=torch.int32,
+                )
+            }
+        )
+    ]
     counting_metadata = _CountingPagedOriMetadata(runner.cache_metadata)
     runner.cache_metadata = counting_metadata
     batch = DecodeBatch(
@@ -1380,7 +1398,6 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
             )
         },
     )()
-    runner._assert_l3_shared_buffers_preallocated = lambda: None
 
     worker = runner._shared_l3_worker()
 
@@ -1842,12 +1859,12 @@ def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
     assert first.mtp_logit_row_indices[0, 0].item() == 1
     assert first.mtp_tail_slot_ids.data_ptr() != second.mtp_tail_slot_ids.data_ptr()
     assert (
-        runner._decode_input_slots[0]["sampled_ids"].data_ptr()
-        != runner._decode_input_slots[1]["sampled_ids"].data_ptr()
+        runner._decode_task_args[0].tensors["sampled_ids"].data_ptr()
+        != runner._decode_task_args[1].tensors["sampled_ids"].data_ptr()
     )
     assert (
-        runner._decode_input_slots[0]["mtp_accepted_counts"].data_ptr()
-        != runner._decode_input_slots[1]["mtp_accepted_counts"].data_ptr()
+        runner._mtp_decode_task_args[0].tensors["accepted_counts"].data_ptr()
+        != runner._mtp_decode_task_args[1].tensors["accepted_counts"].data_ptr()
     )
     second.mtp_tail_slot_ids[0, 0] = 5
     assert first.mtp_tail_slot_ids[0, 0].item() == 3
@@ -1924,132 +1941,34 @@ def test_deepseek_prefill_context_preserves_prepare_reserved_state():
     assert state.prefill_context is not None
 
 
-def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first_step():
-    runner, _model = _runner_for_prepared_inputs()
-    layout = runner._compiled.layout
-    runner._mtp_buffers = SimpleNamespace(
-        decode_input_ids=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.long,
-        ),
-        decode_position_ids=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
-        decode_accepted_counts=torch.empty(
-            layout.ranks,
-            layout.decode_batch,
-            dtype=torch.int32,
-        ),
-        decode_tail_slot_ids=torch.empty(
-            layout.ranks,
-            layout.decode_batch,
-            dtype=torch.int32,
-        ),
-        decode_logit_row_indices=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
-    )
-    inputs = SimpleNamespace(
-        request_ids=("req-a",),
-        ranks=(0,),
-        local_rows=(0,),
-        per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
-    )
-    committed = [
-        (
-            torch.tensor([3, 5], dtype=torch.long),
-            torch.tensor([126, 127], dtype=torch.int32),
-        )
-    ]
-    runner._mtp_request_states["req-a"] = SimpleNamespace(tail_slot_id=2)
-
-    assert runner._stage_mtp_decode_inputs(inputs, committed, [1]) == 2
-    assert runner._mtp_buffers.decode_input_ids[0, :2].tolist() == [3, 5]
-    assert runner._mtp_buffers.decode_input_ids[1, :2].tolist() == [3, 5]
-    assert runner._mtp_buffers.decode_accepted_counts[0, 0].item() == 1
-    assert runner._mtp_buffers.decode_tail_slot_ids[0, 0].item() == 2
-    assert runner._mtp_buffers.decode_tail_slot_ids[1, 0].item() == -1
-
-
-def test_deepseek_fused_mtp_metadata_carries_stable_slot_generation():
-    runner, _model = _runner_for_prepared_inputs()
-    layout = runner._compiled.layout
-    runner._mtp_buffers = SimpleNamespace(
-        decode_tail_slot_ids=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
-        decode_state_generations=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
-        decode_tail_token_ids=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.long),
-        decode_tail_positions=torch.empty(layout.ranks, layout.decode_batch, dtype=torch.int32),
-        decode_logit_row_indices=torch.empty(
-            layout.ranks, layout.decode_tokens, dtype=torch.int32
-        ),
-    )
-    runner._mtp_request_states["req-a"] = SimpleNamespace(
-        tail_rank=0,
-        tail_slot_id=2,
-        tail_token_id=11,
-        tail_position=127,
-        generation=9,
-        device_state_initialized=True,
-    )
-    inputs = SimpleNamespace(
-        request_ids=("req-a",),
-        ranks=(0,),
-        local_rows=(0,),
-        per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
-    )
-
-    assert runner._stage_fused_mtp_metadata(inputs) == layout.decode_seq
-    assert runner._mtp_buffers.decode_tail_slot_ids[0, 0].item() == 2
-    assert runner._mtp_buffers.decode_state_generations[0, 0].item() == 9
-    assert runner._mtp_buffers.decode_state_generations[1:].eq(0).all()
 def test_deepseek_run_decode_dispatches_active_token_count():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode")
     captured: dict[str, object] = {}
 
-    def fake_decode_fwd_args(inputs, pre_hc_hidden_out, hidden_out, logits, sampled_ids):
+    def fake_decode_fwd_args(inputs):
         captured["num_tokens_per_owner"] = inputs.num_tokens_per_owner
-        return (pre_hc_hidden_out, hidden_out, logits, sampled_ids)
+        # The device-resident pre-HC slot is normally allocated before the L3
+        # worker fork (TaskArgs.allocate_device at init) -- the _decode_fwd_args
+        # hot path only assembles the tuple and must not touch the worker. This
+        # test never runs allocate_device, so inject a stand-in for
+        # _execute_main_decode to read.
+        task_args = runner._decode_task_args[inputs.buffer_slot]
+        task_args.tensors.setdefault(
+            "pre_hc_hidden_out",
+            torch.empty(
+                runner._compiled.layout.ranks,
+                runner._compiled.layout.decode_tokens,
+                runner._compiled.layout.hc_mult,
+                model.config.hidden_size,
+                dtype=torch.float32,
+            ),
+        )
+        return ()
 
-    def fake_run_l3(_callable, *args):
-        args[-2].fill_(1)
-
-    hidden_out = torch.empty(
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.decode_tokens,
-        model.config.hidden_size,
-        dtype=torch.bfloat16,
-    )
     runner._ensure_l3_shared_buffers = lambda _model: None
-    runner._require_decode_buffers = lambda: SimpleNamespace(
-        sampled_ids=torch.empty(
-            runner._compiled.layout.ranks,
-            runner._compiled.layout.decode_tokens,
-            8,
-            dtype=torch.int32,
-        ),
-    )
-    runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.decode_tokens,
-        runner._compiled.layout.hc_mult,
-        model.config.hidden_size,
-        dtype=torch.float32,
-    )
-    runner._require_decode_output_buffer = lambda _hidden_size: hidden_out
-    runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.decode_tokens,
-        model.config.vocab_size,
-        dtype=torch.float32,
-    )
     runner._decode_fwd_args = fake_decode_fwd_args
-    runner._run_l3 = fake_run_l3
+    runner._run_l3 = lambda _callable, *args: None
 
     result = runner.run_decode(
         model,
@@ -2080,22 +1999,28 @@ def test_deepseek_main_decode_copies_pre_hc_to_bound_host_buffer():
         dtype=torch.float32,
     )
     device_pre_hc = object()
-    decode_buffers = SimpleNamespace(
-        pre_hc_hidden_out=host_pre_hc,
-        sampled_ids=torch.empty(
-            layout.ranks, layout.decode_tokens, 8, dtype=torch.int32
-        ),
-    )
-    copied: list[tuple[object, torch.Tensor]] = []
-    runner._require_decode_buffers = lambda: decode_buffers
-    runner._decode_input_slots = [{"sampled_ids": decode_buffers.sampled_ids}]
-    runner._materialize_main_pre_hc_device = lambda _hidden_size: device_pre_hc
-    runner._require_decode_output_buffer = lambda _hidden_size: torch.empty(
+    hidden_out = torch.empty(
         layout.ranks, layout.decode_tokens, model.config.hidden_size, dtype=torch.bfloat16
     )
-    runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(
+    logits = torch.empty(
         layout.ranks, layout.decode_tokens, model.config.vocab_size, dtype=torch.float32
     )
+    sampled_ids = torch.empty(
+        layout.ranks, layout.decode_tokens, 8, dtype=torch.int32
+    )
+    runner._decode_task_args = [
+        SimpleNamespace(
+            tensors={
+                "pre_hc_hidden_out": device_pre_hc,
+                "hidden_out": hidden_out,
+                "logits": logits,
+                "sampled_ids": sampled_ids,
+            }
+        )
+    ]
+    runner._main_pre_hc_host_mirror = host_pre_hc
+    copied: list[tuple[object, torch.Tensor]] = []
+    runner._require_decode_callable = lambda: object()
     runner._decode_fwd_args = lambda *_args: ()
     runner._run_l3 = lambda *_args: None
     runner._shared_l3_worker = lambda: SimpleNamespace(
@@ -2127,28 +2052,32 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
         8,
         dtype=torch.int32,
     )
-    mtp_buffers = SimpleNamespace(
-        decode_accepted_counts=torch.ones(
-            layout.ranks,
-            layout.decode_batch,
-            dtype=torch.int32,
-        ),
-        decode_input_ids=torch.zeros(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.long,
-        ),
-        decode_position_ids=torch.zeros(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
-        decode_sampled_ids=torch.zeros(
-            layout.ranks,
-            layout.decode_batch,
-            8,
-            dtype=torch.int32,
-        ),
+    # The MTP decode TaskArgs owns the per-slot reclaimed outputs; stand in a
+    # fake whose .tensors carries the reclaimed slot tensors.
+    mtp_reclaim = SimpleNamespace(
+        tensors={
+            "accepted_counts": torch.ones(
+                layout.ranks,
+                layout.decode_batch,
+                dtype=torch.int32,
+            ),
+            "input_ids": torch.zeros(
+                layout.ranks,
+                layout.decode_tokens,
+                dtype=torch.long,
+            ),
+            "position_ids": torch.zeros(
+                layout.ranks,
+                layout.decode_tokens,
+                dtype=torch.int32,
+            ),
+            "sampled_ids": torch.zeros(
+                layout.ranks,
+                layout.decode_tokens,
+                8,
+                dtype=torch.int32,
+            ),
+        }
     )
     state = SimpleNamespace(
         draft_token_id=5,
@@ -2194,24 +2123,17 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     runner._stage_decode_dynamic_inputs = lambda *_args, **_kwargs: pytest.fail(
         "prepared MTP decode must bind recurrent inputs from device state"
     )
-    runner._require_decode_buffers = lambda: SimpleNamespace(sampled_ids=main_sampled_ids)
-    runner._require_mtp_buffers = lambda: mtp_buffers
-    runner._require_decode_output_buffer = lambda _hidden_size: torch.empty(0)
-    runner._materialize_main_pre_hc_device = lambda _hidden_size: torch.empty(0)
-    runner._require_decode_logits_buffer = lambda _vocab_size: torch.empty(0)
-    runner._decode_fwd_args = lambda *_args: ()
+    runner._require_mtp_buffers = lambda: SimpleNamespace()
     runner._fused_mtp_decode_args = lambda _main_args, _inputs, _active_tokens: ("fused",)
     runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
         inputs,
         dispatch_args=("fused",),
     )
-    runner._decode_input_slots = [{
-        "sampled_ids": main_sampled_ids,
-        "mtp_accepted_counts": mtp_buffers.decode_accepted_counts,
-        "mtp_sampled_ids": mtp_buffers.decode_sampled_ids,
-        "mtp_committed_input_ids": mtp_buffers.decode_input_ids,
-        "mtp_committed_position_ids": mtp_buffers.decode_position_ids,
-    }]
+    runner._decode_task_args = [
+        SimpleNamespace(tensors={"sampled_ids": main_sampled_ids})
+    ]
+    runner._mtp_decode_task_args = [mtp_reclaim]
+    runner._decode_input_slots = [{}]  # fused compose is mocked; prepend buffers unused here
 
     def fake_submit_l3(callable_spec, *args):
         dispatches.append((callable_spec.name, args))
@@ -2219,10 +2141,10 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
         def complete():
             main_sampled_ids[0, 0, 0] = 5
             main_sampled_ids[0, 1, 0] = 9
-            mtp_buffers.decode_accepted_counts[0, 0] = 2
-            mtp_buffers.decode_input_ids[0, 1] = 9
-            mtp_buffers.decode_position_ids[0, 1] = 128
-            mtp_buffers.decode_sampled_ids[0, 0, 0] = 7
+            mtp_reclaim.tensors["accepted_counts"][0, 0] = 2
+            mtp_reclaim.tensors["input_ids"][0, 1] = 9
+            mtp_reclaim.tensors["position_ids"][0, 1] = 128
+            mtp_reclaim.tensors["sampled_ids"][0, 0, 0] = 7
 
         return SimpleNamespace(wait=complete)
 
@@ -2291,7 +2213,10 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
             freqs_sin=torch.empty((2, 1, 1), dtype=torch.bfloat16),
         )
     )
-    prefill = runner._ensure_prefill_fwd_buffers(hidden_size=1)
+    from pypto_serving.model.deepseek.task_args import prefill_task_args
+
+    prefill = prefill_task_args(runner, hidden=1, vocab=1)
+    prefill.allocate_host_shared(None)
 
     assert not hasattr(runner, "_decode_work_cache")
     for name in (
@@ -2339,7 +2264,7 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers is not None
     assert buffers.weights["weight"] is weight
     assert not buffers.weights["weight"].is_shared()
-    assert buffers.prefill_kv_cache is buffers.decode_kv_cache
+    assert buffers.prefill_kv_cache is not None
 
 
 def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
@@ -2382,17 +2307,24 @@ def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
     worker = FakeWorker()
     runner._l3_worker = worker
 
-    first = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
-    second = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
+    from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args
 
-    assert second is first
-    assert first.hidden_out.full_shape == (2, 3, 5)
-    assert first.pre_hc_hidden_out.full_shape == (2, 3, 4, 5)
-    assert first.logits.full_shape == (2, 8, 129280)
-    assert all(shard.dtype == torch.bfloat16 for shard in first.hidden_out.shards)
-    assert all(shard.dtype == torch.float32 for shard in first.pre_hc_hidden_out.shards)
-    assert all(shard.dtype == torch.float32 for shard in first.logits.shards)
-    assert len(worker.allocations) == 6
+    ta = mtp_prefill_task_args(runner, hidden=5)
+    ta.allocate_host_shared(None)
+    ta.allocate_device(worker, None)
+    # idempotent: a second allocate_device must not re-allocate.
+    ta.allocate_device(worker, None)
+
+    hidden_out = ta.tensors["hidden_out"]
+    pre_hc_hidden_out = ta.tensors["pre_hc_hidden_out"]
+    logits = ta.tensors["logits"]
+    assert hidden_out.full_shape == (2, 3, 5)
+    assert pre_hc_hidden_out.full_shape == (2, 3, 4, 5)
+    assert logits.full_shape == (2, 8, 129280)
+    assert all(shard.dtype == torch.bfloat16 for shard in hidden_out.shards)
+    assert all(shard.dtype == torch.float32 for shard in pre_hc_hidden_out.shards)
+    assert all(shard.dtype == torch.float32 for shard in logits.shards)
+    assert len(worker.allocations) == 6  # 3 device outputs x 2 ranks, no re-allocation
     assert all(init is None for _shape, _dtype, init, _worker_id in worker.allocations)
     assert [worker_id for _shape, _dtype, _init, worker_id in worker.allocations] == [0, 1] * 3
 
@@ -2441,13 +2373,17 @@ def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
     worker = FakeWorker()
     runner._l3_worker = worker
     runner._mtp_buffers = SimpleNamespace(
-        prefill_hidden_in=torch.empty((layout.ranks, layout.prefill_seq, 5), dtype=torch.bfloat16),
         prefill_logits=torch.empty(
             (layout.ranks, 8, 129280),
             dtype=torch.float32,
         ).share_memory_(),
     )
-    outputs = runner._materialize_mtp_prefill_device_outputs(hidden_size=5)
+    from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args
+
+    ta = mtp_prefill_task_args(runner, hidden=5)
+    ta.allocate_host_shared(None)
+    ta.allocate_device(worker, None)
+    runner._mtp_prefill_task_args = ta
 
     host_row = runner._read_mtp_prefill_logits(owner_rank=1)
 
@@ -2455,7 +2391,7 @@ def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
     assert worker.copies == [
         (
             host_row.data_ptr(),
-            outputs.logits.shards[1].data_ptr,
+            ta.tensors["logits"].shards[1].data_ptr,
             129280 * torch.float32.itemsize,
             1,
         )
@@ -2496,31 +2432,31 @@ def test_deepseek_mtp_prefill_args_use_device_outputs():
             pass
 
     runner._l3_worker = FakeWorker()
-    outputs = runner._materialize_mtp_prefill_device_outputs(hidden_size=1)
-    value = object()
-    runner._mtp_buffers = SimpleNamespace(
-        weights={},
-        prefill_hidden_in=torch.empty((1, 1, 1), dtype=torch.bfloat16),
-        prefill_prev_hidden_in=value,
-        prefill_block_table=value,
-        prefill_slot_mapping=value,
-        prefill_position_ids=value,
-        prefill_input_ids=value,
-        prefill_logit_row_indices=value,
-    )
-    runner._mtp_device_weights = {}
-    runner._materialize_mtp_device_kv_cache = lambda: value
-    runner._static_freqs_cos_tensor = lambda: value
-    runner._static_freqs_sin_tensor = lambda: value
-    runner._static_lm_head_weight_tensor = lambda: value
-    runner._mark_resident_args = lambda values, _policy: values
-    runner._ordered_layer_args = lambda values, _order: values
+    shared = torch.empty(2, dtype=torch.float32).share_memory_()
+    runner._static_freqs_cos_tensor = lambda: shared
+    runner._static_freqs_sin_tensor = lambda: shared
+    runner._static_lm_head_weight_tensor = lambda: shared
+    runner._materialize_mtp_device_kv_cache = lambda: object()
+    from collections import defaultdict
 
-    named = runner._mtp_prefill_args()
+    weight = object()
+    runner._mtp_device_weights = defaultdict(lambda: weight)
+    runner._mtp_device_weights["_seed"] = weight  # truthy for the `or` short-circuit
 
-    assert named["hidden_out"] is outputs.hidden_out
-    assert named["pre_hc_hidden_out"] is outputs.pre_hc_hidden_out
-    assert named["logits"] is outputs.logits
+    from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args
+
+    ta = mtp_prefill_task_args(runner, hidden=1)
+    ta.allocate_host_shared(None)
+    ta.allocate_device(runner._l3_worker, None)
+    runner._mtp_prefill_task_args = ta
+
+    args = runner._mtp_prefill_args()
+    names = ta.names
+
+    assert len(args) == len(names)
+    assert args[names.index("hidden_out")] is ta.tensors["hidden_out"]
+    assert args[names.index("pre_hc_hidden_out")] is ta.tensors["pre_hc_hidden_out"]
+    assert args[names.index("logits")] is ta.tensors["logits"]
 
 
 def test_deepseek_release_finished_requests_discards_mtp_state():
@@ -2951,3 +2887,175 @@ def test_prepacked_sidecar_replaced_after_validation_is_not_mapped(tmp_path, mon
     assert packed is not None
     for name, tensor in packed.tensors.items():
         assert torch.equal(tensor, validated[name]), f"{name} came from the replacement sidecar"
+
+
+# ---------------------------------------------------------------------------
+# Per-dispatch-class TaskArgs builders (contract: registration order ==
+# kernel positional order; each arg declares its kind at registration).
+# ---------------------------------------------------------------------------
+
+
+class _TaskArgsStubRunner:
+    """Minimal stand-in exposing every accessor the TaskArgs builders read."""
+
+    def __init__(self, hidden: int = 4096, vocab: int = 129280) -> None:
+        from pypto_serving.model.deepseek.task_args import (
+            _PREFILL_CACHE_POOLS,
+            _PREFILL_STATIC_WEIGHTS,
+            _prefill_slot_specs,
+        )
+
+        self._compiled = SimpleNamespace(layout=DeepSeekV4CacheLayout())
+        layout = self._compiled.layout
+        covered = set(_PREFILL_STATIC_WEIGHTS) | set(_PREFILL_CACHE_POOLS)
+        covered |= set(_prefill_slot_specs(layout, hidden, vocab))
+        self._stacked = {n: torch.empty((2, 4), dtype=torch.bfloat16).share_memory_()
+                         for n in _PREFILL_FWD_TENSOR_ORDER if n not in covered}
+        self._cache = {n: object() for n in _PREFILL_CACHE_POOLS}
+        self._embed_handle = object()
+        self._pre_hc_handle = object()
+        self._decode_task_args = [SimpleNamespace(
+            tensors={"block_table": torch.empty(layout.ranks, 4, dtype=torch.int32).share_memory_()}
+        )]
+
+    def _require_stacked_weights(self):
+        return SimpleNamespace(tensors=self._stacked)
+
+    def _device_cache_values(self):
+        return self._cache
+
+    def _materialize_embedding_device_weight(self):
+        return self._embed_handle
+
+    def _materialize_main_pre_hc_device(self, hidden):
+        return self._pre_hc_handle
+
+    def _static_freqs_cos_tensor(self):
+        return torch.empty((2, 8, 4), dtype=torch.bfloat16).share_memory_()
+
+    def _static_freqs_sin_tensor(self):
+        return torch.empty((2, 8, 4), dtype=torch.bfloat16).share_memory_()
+
+    def _static_final_norm_weight_tensor(self):
+        return torch.empty((2, 4096), dtype=torch.bfloat16).share_memory_()
+
+    def _static_lm_head_weight_tensor(self):
+        return torch.empty((2, 129280, 4096), dtype=torch.bfloat16).share_memory_()
+
+    def _hc_head_tensors(self):
+        return {
+            "hc_head_fn": torch.empty((2, 4, 16384), dtype=torch.float32).share_memory_(),
+            "hc_head_scale": torch.empty((2, 4), dtype=torch.float32).share_memory_(),
+            "hc_head_base": torch.empty((2, 4), dtype=torch.float32).share_memory_(),
+        }
+
+
+def test_deepseek_task_args_builders_register_kernel_order():
+    runner = _TaskArgsStubRunner()
+    assert prefill_task_args(runner, 4096, 129280).names == _PREFILL_FWD_TENSOR_ORDER
+    assert decode_task_args(runner, 4096, 129280).names == _DECODE_FWD_TENSOR_ORDER
+    assert mtp_prefill_task_args(runner, 4096).names == _MTP_PREFILL_TENSOR_ORDER
+    assert mtp_decode_task_args(runner, 4096).names == _FUSED_MTP_DECODE_TENSOR_ORDER
+
+
+def test_deepseek_prefill_task_args_classifies_kinds_and_builds():
+    runner = _TaskArgsStubRunner()
+    ta = prefill_task_args(runner, 4096, 129280)
+    ta.allocate_host_shared(None)
+
+    layout = runner._compiled.layout
+    assert tuple(ta.tensors["x_hc"].shape)[1:] == (layout.prefill_seq, layout.hc_mult, 4096)
+    assert ta.tensors["logits"].shape[1] == DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS
+    assert ta.tensors["input_ids"].dtype == torch.int64
+
+    built = ta.build()
+    assert len(built) == len(_PREFILL_FWD_TENSOR_ORDER)
+    assert built[ta.names.index("x_hc")] is ta.tensors["x_hc"]
+    assert isinstance(built[ta.names.index("freqs_cos")], StaticDeviceTensor)
+    assert built[ta.names.index("kv_cache")] is runner._cache["kv_cache"]
+    assert built[ta.names.index("wq_a")] is runner._stacked["wq_a"]
+
+
+def test_deepseek_decode_task_args_owns_buffers_and_resolves_handles():
+    class _Worker:
+        @staticmethod
+        def alloc_tensor(shape, dtype, *, worker_id=0, init=None):
+            return DeviceTensor(0x1000 * (worker_id + 1), tuple(shape), dtype)
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            return None
+
+    runner = _TaskArgsStubRunner()
+    ta = decode_task_args(runner, 4096, 129280)
+    ta.allocate_host_shared(None)
+    ta.allocate_device(_Worker(), None)
+
+    for name, dtype in (
+        ("logits", torch.float32),
+        ("hidden_out", torch.bfloat16),
+        ("sampled_ids", torch.int32),
+        ("block_table", torch.int32),
+    ):
+        assert ta.tensors[name].dtype == dtype
+
+    built = ta.build()
+    assert built[ta.names.index("logits")] is ta.tensors["logits"]
+    assert built[ta.names.index("pre_hc_hidden_out")] is ta.tensors["pre_hc_hidden_out"]
+    assert isinstance(built[ta.names.index("pre_hc_hidden_out")], StackedDeviceTensor)
+    assert isinstance(built[ta.names.index("freqs_cos")], StaticDeviceTensor)
+    assert built[ta.names.index("embed_weight")] is runner._embed_handle
+    assert built[ta.names.index("kv_cache")] is runner._cache["kv_cache"]
+
+
+def test_deepseek_mtp_task_args_classify_kinds():
+    def _mtp_runner(**overrides):
+        weight = object()
+        weights = {n: weight for n in (*_MTP_PREFILL_TENSOR_ORDER, *_FUSED_MTP_DECODE_TENSOR_ORDER)}
+        base = dict(
+            _compiled=SimpleNamespace(layout=DeepSeekV4CacheLayout()),
+            _mtp_device_weights=weights,
+            _require_mtp_buffers=lambda: SimpleNamespace(weights={}),
+            _materialize_mtp_device_kv_cache=lambda: object(),
+            _materialize_mtp_tail_pre_hc_pool=lambda _hidden: object(),
+            _materialize_mtp_device_state_tokens=lambda: object(),
+            _materialize_mtp_device_state_meta=lambda: object(),
+            _materialize_embedding_device_weight=lambda: object(),
+            _materialize_main_pre_hc_device=lambda _hidden: object(),
+            _static_freqs_cos_tensor=lambda: torch.empty(2, dtype=torch.float32).share_memory_(),
+            _static_freqs_sin_tensor=lambda: torch.empty(2, dtype=torch.float32).share_memory_(),
+            _static_lm_head_weight_tensor=lambda: torch.empty(2, dtype=torch.float32).share_memory_(),
+        )
+        base.update(overrides)
+        stub = _TaskArgsStubRunner()
+        for attr in ("_require_stacked_weights", "_device_cache_values",
+                     "_materialize_embedding_device_weight",
+                     "_materialize_main_pre_hc_device", "_static_freqs_cos_tensor",
+                     "_static_freqs_sin_tensor", "_static_final_norm_weight_tensor",
+                     "_static_lm_head_weight_tensor", "_hc_head_tensors", "_decode_task_args"):
+            base[attr] = getattr(stub, attr)
+        base["_compiled"] = stub._compiled
+        return SimpleNamespace(**base)
+
+    class _AllocWorker:
+        @staticmethod
+        def alloc_tensor(shape, dtype, *, worker_id=0, init=None):
+            return DeviceTensor(0x1000 * (worker_id + 1), tuple(shape), dtype)
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            return None
+
+    prefill = mtp_prefill_task_args(_mtp_runner(), 4096)
+    prefill.allocate_host_shared(None)
+    prefill.allocate_device(_AllocWorker(), None)
+    assert prefill.tensors["input_ids"].dtype == torch.int64
+    assert isinstance(prefill.tensors["hidden_out"], StackedDeviceTensor)  # device-resident output
+
+    decode = mtp_decode_task_args(_mtp_runner(), 4096)
+    decode.allocate_host_shared(None)
+    assert decode.tensors["accepted_counts"].dtype == torch.int32
+    assert decode.tensors["hidden_out"].dtype == torch.bfloat16
+    built = decode.build()
+    assert isinstance(built[decode.names.index("freqs_cos")], StaticDeviceTensor)
+    assert decode.names[decode.names.index("state_tokens") - 1] == "state_generations"

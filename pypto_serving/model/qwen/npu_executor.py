@@ -13,9 +13,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 
@@ -30,6 +28,7 @@ from pypto_serving.model.common.executor.utils import (
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
+    QwenLayout,
     _L3Callable,
     Qwen314BModelRunner,
 )
@@ -68,23 +67,6 @@ def _kernel_batch_pad(kernel_module: object) -> tuple[int, bool]:
         f"{getattr(kernel_module, '__name__', kernel_module)!r} exposes neither "
         "BATCH_PAD nor BATCH; cannot determine the kernel's padded batch width"
     )
-
-
-@dataclass
-class _KernelLayerWeights:
-    """Kernel-ready weights for one transformer layer."""
-
-    input_rms_weight: torch.Tensor
-    wq: torch.Tensor
-    wk: torch.Tensor
-    wv: torch.Tensor
-    q_norm_weight: torch.Tensor
-    k_norm_weight: torch.Tensor
-    wo: torch.Tensor
-    post_rms_weight: torch.Tensor
-    w_gate: torch.Tensor
-    w_up: torch.Tensor
-    w_down: torch.Tensor
 
 
 def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
@@ -317,64 +299,19 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
         final_norm_weight = self._shared_tensor(model.final_norm_weight.view(1, -1).float().cpu())
         decode_weights = self._stage_stacked_decode_weights(model)
-        prefill_token_ids_buffer = torch.empty(
-            (kernel_batch * model.runtime.max_seq_len,),
-            dtype=torch.int32,
-        ).share_memory_()
-        prefill_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
-        prefill_chunk_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
-        prefill_chunk_offsets_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
-        prefill_block_table_buffer = torch.empty(
-            (kernel_batch * max_blocks_per_seq,),
-            dtype=torch.int32,
-        ).share_memory_()
-        prefill_slot_mapping_buffer = torch.empty(
-            (kernel_batch * model.runtime.max_seq_len,),
-            dtype=torch.int32,
-        ).share_memory_()
-        prefill_logits_buffer = torch.empty(
-            (kernel_batch, padded_vocab),
-            dtype=torch.float32,
-        ).share_memory_()
-        prefill_topk_values_buffer = torch.empty(
-            (kernel_batch, topk_width),
-            dtype=torch.float32,
-        ).share_memory_()
-        prefill_topk_indices_buffer = torch.empty(
-            (kernel_batch, topk_width),
-            dtype=torch.int32,
-        ).share_memory_()
-        decode_logits_buffer = torch.empty(
-            (kernel_batch, padded_vocab),
-            dtype=torch.float32,
-        ).share_memory_()
-        decode_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
-        decode_block_table_buffer = torch.empty(
-            (kernel_batch * max_blocks_per_seq,),
-            dtype=torch.int32,
-        ).share_memory_()
-        decode_slot_mapping_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
-        decode_token_ids_buffer = torch.empty(
-            (kernel_batch, sampled_ids_width),
-            dtype=torch.int32,
-        ).share_memory_()
-        decode_sampled_ids_buffer = torch.empty(
-            (kernel_batch, sampled_ids_width),
-            dtype=torch.int32,
-        ).share_memory_()
-        decode_topk_values_buffer = torch.empty(
-            (kernel_batch, topk_width),
-            dtype=torch.float32,
-        ).share_memory_()
-        decode_topk_indices_buffer = torch.empty(
-            (kernel_batch, topk_width),
-            dtype=torch.int32,
-        ).share_memory_()
-        sampling_control_buffer = torch.empty((2,), dtype=torch.int32).share_memory_()
-        decode_next_hidden_buffer = torch.empty(
-            (kernel_batch, model.config.hidden_size),
-            dtype=torch.bfloat16,
-        ).share_memory_()
+        # The per-dispatch I/O host buffers are owned by the runner's TaskArgs;
+        # only the shape-defining constants are passed through here so the
+        # TaskArgs builders can size the slots.
+        layout = QwenLayout(
+            kernel_batch=kernel_batch,
+            max_seq_len=model.runtime.max_seq_len,
+            page_size=page_size,
+            max_blocks_per_seq=max_blocks_per_seq,
+            padded_vocab=padded_vocab,
+            hidden_size=model.config.hidden_size,
+            sampled_ids_width=sampled_ids_width,
+            topk_width=topk_width,
+        )
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -386,25 +323,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
-            prefill_token_ids_buffer=prefill_token_ids_buffer,
-            prefill_seq_lens_buffer=prefill_seq_lens_buffer,
-            prefill_chunk_lens_buffer=prefill_chunk_lens_buffer,
-            prefill_chunk_offsets_buffer=prefill_chunk_offsets_buffer,
-            prefill_block_table_buffer=prefill_block_table_buffer,
-            prefill_slot_mapping_buffer=prefill_slot_mapping_buffer,
-            prefill_logits_buffer=prefill_logits_buffer,
-            prefill_topk_values_buffer=prefill_topk_values_buffer,
-            prefill_topk_indices_buffer=prefill_topk_indices_buffer,
-            decode_seq_lens_buffer=decode_seq_lens_buffer,
-            decode_block_table_buffer=decode_block_table_buffer,
-            decode_slot_mapping_buffer=decode_slot_mapping_buffer,
-            decode_logits_buffer=decode_logits_buffer,
-            decode_token_ids_buffer=decode_token_ids_buffer,
-            decode_sampled_ids_buffer=decode_sampled_ids_buffer,
-            decode_topk_values_buffer=decode_topk_values_buffer,
-            decode_topk_indices_buffer=decode_topk_indices_buffer,
-            sampling_control_buffer=sampling_control_buffer,
-            decode_next_hidden_buffer=decode_next_hidden_buffer,
+            layout=layout,
         )
 
     def _compile_jit_fwd_callable(
@@ -421,29 +340,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         """
         return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)
 
-    @staticmethod
-    def _load_runtime_config(output_dir: Path) -> dict[str, Any]:
-        """Load ``RUNTIME_CONFIG`` from a generated ``kernel_config.py``."""
-        config_path = output_dir / "kernel_config.py"
-        spec = importlib.util.spec_from_file_location(f"_qwen_l2_kernel_config_{abs(hash(output_dir))}", config_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load kernel_config.py from {config_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return dict(getattr(module, "RUNTIME_CONFIG", {}))
-
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
         """Stage per-layer weights into pre-allocated stacked shm tensors,
         copying layers in parallel across worker threads.
 
-        Same output as building every per-layer ``_KernelLayerWeights`` and then
-        ``torch.cat``-ing them (see ``_stack_decode_weights``), and the same ~1x
-        peak host memory as the serial stream (only the stacked destination plus
-        the transient views live at once). The per-layer copies dominate startup
-        (~90s serially for a 14B), so they run on a thread pool: each layer owns a
-        disjoint row-slice of every stacked tensor, and ``copy_`` releases the GIL
-        for the memcpy + dtype cast, so the copies genuinely overlap.
+        Each weight kind gets one stacked tensor (num_layers slabs along dim 0):
+        projections are transposed to bf16, norm gammas to [1, N] float. Peak
+        host memory is ~1x (only the stacked destination plus the transient views
+        live at once). The per-layer copies dominate startup (~90s serially for a
+        14B), so they run on a thread pool: each layer owns a disjoint row-slice
+        of every stacked tensor, and ``copy_`` releases the GIL for the memcpy +
+        dtype cast, so the copies genuinely overlap.
         """
         from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
 
@@ -532,32 +440,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # regresses beyond that, so cap the default even on many-core hosts.
         return max(1, min(num_layers, os.cpu_count() or 8, 32))
 
-    @staticmethod
-    def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
-        """Stack per-layer weights into fused decode-kernel tensors."""
-        # Stack from already-prepared per-layer kernel weights. Each
-        # _KernelLayerWeights field is already in the kernel-ready shape/dtype
-        # (transposed bf16 cpu for projections, [1, N] float cpu for norms),
-        # so a plain cat along dim 0 is all that's left. Reading from the
-        # original model.layers here would crash because _release_layer_weights
-        # has already replaced those tensors with torch.empty(0).
-        def cat(attr: str) -> torch.Tensor:
-            return torch.cat([getattr(l, attr) for l in layers], dim=0)
-
-        return {
-            "decode_input_rms_weight": cat("input_rms_weight").contiguous(),
-            "decode_wq":               cat("wq"),
-            "decode_wk":               cat("wk"),
-            "decode_wv":               cat("wv"),
-            "decode_q_norm_weight":    cat("q_norm_weight").contiguous(),
-            "decode_k_norm_weight":    cat("k_norm_weight").contiguous(),
-            "decode_wo":               cat("wo"),
-            "decode_post_rms_weight":  cat("post_rms_weight").contiguous(),
-            "decode_w_gate":           cat("w_gate"),
-            "decode_w_up":             cat("w_up"),
-            "decode_w_down":           cat("w_down"),
-        }
-
     @classmethod
     def _validate_total_kv_pages(cls, model: RuntimeModel, kernel_batch: int) -> None:
         """Validate that runtime KV page count covers the batch capacity."""
@@ -568,28 +450,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"total_kv_pages must be at least kernel_batch ({kernel_batch}), "
                 f"got {model.runtime.total_kv_pages}"
             )
-
-    @staticmethod
-    def _kernel_weight(weight: torch.Tensor) -> torch.Tensor:
-        """Convert a 2-D model weight into kernel-ready orientation and dtype."""
-        return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu().share_memory_()
-
-    @classmethod
-    def _kernel_layer_weights(cls, layer) -> _KernelLayerWeights:
-        """Convert one Hugging Face layer into kernel-ready weight tensors."""
-        return _KernelLayerWeights(
-            input_rms_weight=cls._shared_tensor(layer.input_rms_weight.view(1, -1).float().cpu()),
-            wq=cls._kernel_weight(layer.wq),
-            wk=cls._kernel_weight(layer.wk),
-            wv=cls._kernel_weight(layer.wv),
-            q_norm_weight=cls._shared_tensor(layer.q_norm_weight.view(1, -1).float().cpu()),
-            k_norm_weight=cls._shared_tensor(layer.k_norm_weight.view(1, -1).float().cpu()),
-            wo=cls._kernel_weight(layer.wo),
-            post_rms_weight=cls._shared_tensor(layer.post_rms_weight.view(1, -1).float().cpu()),
-            w_gate=cls._kernel_weight(layer.w_gate),
-            w_up=cls._kernel_weight(layer.w_up),
-            w_down=cls._kernel_weight(layer.w_down),
-        )
 
     @staticmethod
     def _shared_tensor(tensor: torch.Tensor) -> torch.Tensor:

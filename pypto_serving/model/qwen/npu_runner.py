@@ -29,7 +29,10 @@ from pypto_serving.config.types import (
     RuntimeModel,
     SamplingCandidates,
 )
+from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor, resolve_l3_arg
+from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.common.runner.task_args import TaskArgs
 from pypto_serving.tools.profile import profile_span
 
 
@@ -42,8 +45,33 @@ from pypto_serving.model.common.compiler.l3_callable import L3Callable as _L3Cal
 
 
 @dataclass
+class QwenLayout:
+    """Shape-defining constants for the Qwen3-14B host-shared buffers.
+
+    Computed by the executor (which has the model + kernel constants) and read
+    by ``task_args.py`` to size the TaskArgs slots. This keeps buffer-shape
+    derivation in the executor (model/kernel context) while the allocation
+    itself lives with the runner's TaskArgs.
+    """
+
+    kernel_batch: int
+    max_seq_len: int
+    page_size: int
+    max_blocks_per_seq: int
+    padded_vocab: int
+    hidden_size: int
+    sampled_ids_width: int
+    topk_width: int
+
+
+@dataclass
 class _CompiledKernels:
-    """Compiled Qwen3-14B kernels and immutable runtime tensors."""
+    """Compiled Qwen3-14B kernels and immutable runtime tensors.
+
+    The per-dispatch I/O host buffers are owned by the runner's TaskArgs
+    (allocated via ``TaskArgs.allocate_host_shared``); only the compiled
+    programs, the static weights, and the shape layout live here.
+    """
 
     prefill: _L3Callable
     decode: _L3Callable
@@ -55,72 +83,44 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     padded_embed_weight: torch.Tensor
     decode_weights: dict[str, torch.Tensor]
-    prefill_token_ids_buffer: torch.Tensor
-    prefill_seq_lens_buffer: torch.Tensor
-    prefill_chunk_lens_buffer: torch.Tensor
-    prefill_chunk_offsets_buffer: torch.Tensor
-    prefill_block_table_buffer: torch.Tensor
-    prefill_slot_mapping_buffer: torch.Tensor
-    prefill_logits_buffer: torch.Tensor
-    prefill_topk_values_buffer: torch.Tensor
-    prefill_topk_indices_buffer: torch.Tensor
-    decode_seq_lens_buffer: torch.Tensor
-    decode_block_table_buffer: torch.Tensor
-    decode_slot_mapping_buffer: torch.Tensor
-    decode_logits_buffer: torch.Tensor
-    decode_token_ids_buffer: torch.Tensor
-    decode_sampled_ids_buffer: torch.Tensor
-    decode_topk_values_buffer: torch.Tensor
-    decode_topk_indices_buffer: torch.Tensor
-    sampling_control_buffer: torch.Tensor
-    decode_next_hidden_buffer: torch.Tensor
+    layout: QwenLayout
 
 
 @dataclass
 class _PrefillInputs:
-    """Host tensors passed to the prefill kernel."""
+    """Per-call prefill dispatch inputs spliced into the built TaskArgs tuple.
+
+    The fixed-shape buffers (seq_lens / chunk_lens / block_table / ...) are read
+    from the prefill TaskArgs slots by ``build()``; only the length-
+    ``total_tokens`` ``input_ids`` / ``slot_mapping`` slices vary per call.
+    """
 
     actual_batch: int
     token_ids: torch.Tensor
-    seq_lens: torch.Tensor
-    chunk_lens: torch.Tensor
-    chunk_offsets: torch.Tensor
-    block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
 
 @dataclass
 class _DecodeKernelInputs:
-    """Fixed-batch tensors passed to the fused decode kernel."""
+    """Per-call decode context for host readback (buffers live in the decode TaskArgs)."""
 
     actual_batch: int
-    token_ids: torch.Tensor
-    seq_lens: torch.Tensor
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
     logits: torch.Tensor
-
-
-@dataclass
-class _StaticDeviceTensor:
-    """A shared host tensor to upload into the shared L3 worker once."""
-
-    tensor: torch.Tensor
 
 
 @dataclass
 class _StaticKernelArgs:
     """Static worker-resident kernel arguments reused across dispatches."""
 
-    final_norm_weight: _StaticDeviceTensor
-    rope_cos: _StaticDeviceTensor
-    rope_sin: _StaticDeviceTensor
-    padded_lm_head_weight: _StaticDeviceTensor
-    padded_embed_weight: _StaticDeviceTensor
-    decode_weights: dict[str, _StaticDeviceTensor]
+    final_norm_weight: StaticDeviceTensor
+    rope_cos: StaticDeviceTensor
+    rope_sin: StaticDeviceTensor
+    padded_lm_head_weight: StaticDeviceTensor
+    padded_embed_weight: StaticDeviceTensor
+    decode_weights: dict[str, StaticDeviceTensor]
 
 
-class Qwen314BModelRunner(ModelRunner):
+class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
     """Runtime wrapper for one Qwen3-14B model's compiled PyPTO kernels."""
 
     def __init__(
@@ -132,8 +132,7 @@ class Qwen314BModelRunner(ModelRunner):
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
-        self._l3_worker: Any | None = None
-        self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
+        self._init_l3_dispatch(stacked=False)
         # Device-resident decode output scratch (greedy path): allocated directly on
         # the worker (no host copy) so the per-step memset + D2H copy-back of the
         # max-batch logits/next_hidden vanish.
@@ -146,17 +145,57 @@ class Qwen314BModelRunner(ModelRunner):
         # changes (or when a different row-0 value must be used for padding).
         self._decode_block_table_row_pages: list[list[int] | None] = []
         self._decode_token_padding_initialized = False
-        self._prefill_metadata_arrays: tuple[Any, ...] = ()
+        self._prefill_metadata_arrays: tuple = ()
         self._prefill_slot_mapping_array: np.ndarray | None = None
+        # Per-call length-total_tokens slices over the full prefill input_ids /
+        # slot_mapping slots, spliced into the built prefill tuple at dispatch.
+        self._active_prefill_token_ids: torch.Tensor | None = None
+        self._active_prefill_slot_mapping: torch.Tensor | None = None
+        # Per-dispatch TaskArgs owning the host-shared I/O buffers.
+        self._prefill_task_args: TaskArgs | None = None
+        self._decode_task_args: TaskArgs | None = None
+        self._topk_select_task_args: TaskArgs | None = None
         if compiled is not None:
             self._share_static_kernel_tensors()
-            self._prefill_metadata_arrays = (
-                compiled.prefill_seq_lens_buffer.numpy(),
-                compiled.prefill_chunk_lens_buffer.numpy(),
-                compiled.prefill_chunk_offsets_buffer.numpy(),
-            )
-            self._prefill_slot_mapping_array = compiled.prefill_slot_mapping_buffer.numpy()
             self._static_args = self._build_static_kernel_args()
+            self._ensure_task_args()
+
+    def _ensure_task_args(self) -> None:
+        """Build and allocate the per-dispatch TaskArgs (owns the host buffers).
+
+        Runs at construction -- after the static weights are shared -- so the
+        host-shared slots are in shared memory before the L3 worker is created.
+        """
+        from pypto_serving.model.qwen.task_args import (  # noqa: PLC0415
+            decode_task_args,
+            prefill_task_args,
+            topk_select_task_args,
+        )
+        self._prefill_task_args = prefill_task_args(self)
+        self._decode_task_args = decode_task_args(self)
+        self._topk_select_task_args = topk_select_task_args(self)
+        for task_args in (
+            self._prefill_task_args,
+            self._decode_task_args,
+            self._topk_select_task_args,
+        ):
+            task_args.allocate_host_shared(self._compiled.layout)
+        # Numpy views over the persistent prefill metadata slots (written via
+        # numpy each step in _prepare_prefill_inputs).
+        prefill_tensors = self._prefill_task_args.tensors
+        self._prefill_metadata_arrays = (
+            prefill_tensors["seq_lens"].numpy(),
+            prefill_tensors["chunk_lens"].numpy(),
+            prefill_tensors["chunk_offsets"].numpy(),
+        )
+        self._prefill_slot_mapping_array = prefill_tensors["slot_mapping"].numpy()
+
+    @property
+    def _active_kv_cache(self) -> Any:
+        """The single materialized paged KV cache (read by the TaskArgs lazy sources)."""
+        if not self._kv_caches:
+            raise RuntimeError("KV cache is not initialized")
+        return next(iter(self._kv_caches.values()))
 
     #: Scratch KV pages for the profile pass — slot=-1 means only page 0
     #: is ever touched (reads via block_table=0, writes via slot clamp to 0).
@@ -423,69 +462,53 @@ class Qwen314BModelRunner(ModelRunner):
             f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
         )
         compiled = self._compiled
-        kv_cache = list(self._kv_caches.values())[0]
+        # The scratch KV cache is materialized before warmup; the TaskArgs lazy
+        # sources read it via _active_kv_cache at build() time.
+        prefill = self._prefill_task_args.tensors
 
         # -- prefill ---------------------------------------------------------
-        compiled.prefill_token_ids_buffer[:total_tokens].zero_()
-        compiled.prefill_seq_lens_buffer.zero_()
-        compiled.prefill_chunk_lens_buffer.zero_()
-        compiled.prefill_chunk_offsets_buffer.zero_()
-        compiled.prefill_block_table_buffer.fill_(0)    # all reads from page 0
-        compiled.prefill_slot_mapping_buffer.fill_(-1)  # all writes to page 0
+        prefill["input_ids"][:total_tokens].zero_()
+        prefill["seq_lens"].zero_()
+        prefill["chunk_lens"].zero_()
+        prefill["chunk_offsets"].zero_()
+        prefill["block_table"].fill_(0)    # all reads from page 0
+        prefill["slot_mapping"].fill_(-1)  # all writes to page 0
 
         token_offset = 0
         for b in range(batch):
-            compiled.prefill_seq_lens_buffer[b] = per_req
-            compiled.prefill_chunk_lens_buffer[b] = per_req
-            compiled.prefill_chunk_offsets_buffer[b] = token_offset
+            prefill["seq_lens"][b] = per_req
+            prefill["chunk_lens"][b] = per_req
+            prefill["chunk_offsets"][b] = token_offset
             token_offset += per_req
 
         prefill_inputs = _PrefillInputs(
             actual_batch=batch,
-            token_ids=compiled.prefill_token_ids_buffer[:total_tokens],
-            seq_lens=compiled.prefill_seq_lens_buffer,
-            chunk_lens=compiled.prefill_chunk_lens_buffer,
-            chunk_offsets=compiled.prefill_chunk_offsets_buffer,
-            block_table=compiled.prefill_block_table_buffer,
-            slot_mapping=compiled.prefill_slot_mapping_buffer,
+            token_ids=prefill["input_ids"][:total_tokens],
+            slot_mapping=prefill["slot_mapping"][:total_tokens],
         )
 
         logger.info(f"[warmup] prefill dispatch … (batch={batch}, tokens={total_tokens})")
         t0 = time.perf_counter()
-        self._run_distributed_program(
-            compiled.prefill,
-            *self._prefill_kernel_args(
-                prefill_inputs, kv_cache.key_pages, kv_cache.value_pages,
-                compiled.prefill_logits_buffer,
-            ),
-        )
+        self._run_l3(compiled.prefill, *self._prefill_kernel_args(prefill_inputs))
         logger.info(f"[warmup] prefill done ({time.perf_counter() - t0:.2f} s)")
 
         # -- decode (full fixed batch, minimal seq) -------------------------
-        compiled.decode_token_ids_buffer.zero_()
+        decode = self._decode_task_args.tensors
+        decode["token_ids"].zero_()
         self._decode_token_padding_initialized = True
-        compiled.decode_seq_lens_buffer.zero_()
-        compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
-        compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
+        decode["seq_lens"].zero_()
+        decode["block_table"].fill_(0)     # all reads from page 0
+        decode["slot_mapping"].fill_(-1)   # all writes to page 0
         self._decode_block_table_row_pages.clear()
 
         for b in range(batch):
-            compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
-
-        decode_kernel_inputs = _DecodeKernelInputs(
-            actual_batch=batch,
-            token_ids=compiled.decode_token_ids_buffer,
-            seq_lens=compiled.decode_seq_lens_buffer,
-            block_table=compiled.decode_block_table_buffer,
-            slot_mapping=compiled.decode_slot_mapping_buffer,
-            logits=compiled.decode_logits_buffer,
-        )
+            decode["seq_lens"][b] = min(per_req + 1, max_seq)
 
         logger.info(f"[warmup] decode dispatch … (batch={batch}, seq_len={per_req + 1})")
         t0 = time.perf_counter()
-        self._run_distributed_program(
+        self._run_l3(
             compiled.decode,
-            *self._decode_kernel_args(decode_kernel_inputs, kv_cache.key_pages, kv_cache.value_pages),
+            *self._decode_kernel_args(device_sampling=False),
         )
         logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
 
@@ -519,7 +542,12 @@ class Qwen314BModelRunner(ModelRunner):
             self._share_cpu_tensor(tensor)
 
     def _iter_static_host_tensors(self) -> tuple[torch.Tensor, ...]:
-        """Return host tensors that must be shared before the worker forks."""
+        """Return host tensors that must be shared before the worker forks.
+
+        The per-dispatch I/O buffers are owned by the TaskArgs (allocated as
+        shared memory via ``shared_empty``), so only the immutable static
+        weights need sharing here.
+        """
         compiled = self._compiled
         return (
             compiled.final_norm_weight,
@@ -528,24 +556,6 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.padded_lm_head_weight,
             compiled.padded_embed_weight,
             *compiled.decode_weights.values(),
-            compiled.prefill_token_ids_buffer,
-            compiled.prefill_seq_lens_buffer,
-            compiled.prefill_chunk_lens_buffer,
-            compiled.prefill_chunk_offsets_buffer,
-            compiled.prefill_block_table_buffer,
-            compiled.prefill_slot_mapping_buffer,
-            compiled.prefill_logits_buffer,
-            compiled.prefill_topk_values_buffer,
-            compiled.prefill_topk_indices_buffer,
-            compiled.decode_seq_lens_buffer,
-            compiled.decode_block_table_buffer,
-            compiled.decode_slot_mapping_buffer,
-            compiled.decode_logits_buffer,
-            compiled.decode_token_ids_buffer,
-            compiled.decode_sampled_ids_buffer,
-            compiled.decode_topk_values_buffer,
-            compiled.decode_topk_indices_buffer,
-            compiled.decode_next_hidden_buffer,
         )
 
     def _build_static_kernel_args(self) -> _StaticKernelArgs:
@@ -574,16 +584,13 @@ class Qwen314BModelRunner(ModelRunner):
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
 
-        logits_padded = compiled.prefill_logits_buffer
+        logits_padded = self._prefill_task_args.tensors["logits"]
 
-        kv_cache = self._materialize_kv_cache(model)
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
+        # Materialize the KV cache so the TaskArgs lazy sources resolve it via
+        # _active_kv_cache at build() time.
+        self._materialize_kv_cache(model)
 
-        self._run_distributed_program(
-            compiled.prefill,
-            *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
-        )
+        self._run_l3(compiled.prefill, *self._prefill_kernel_args(prefill_inputs))
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = batch.seq_lens[batch_idx]
@@ -595,8 +602,8 @@ class Qwen314BModelRunner(ModelRunner):
         )
         sampling_candidates = self._device_topk_outputs(
             logits_padded,
-            compiled.prefill_topk_values_buffer,
-            compiled.prefill_topk_indices_buffer,
+            self._topk_select_task_args.tensors["prefill_topk_values"],
+            self._topk_select_task_args.tensors["prefill_topk_indices"],
             prefill_inputs.actual_batch,
             allow=batch.allow_device_topk_sampling,
         )
@@ -628,11 +635,8 @@ class Qwen314BModelRunner(ModelRunner):
         model_id = model.config.model_id
         kernel_inputs = self._prepare_decode_inputs(model, batch)
 
-        kv_cache = self._kv_caches.get(model_id)
-        if kv_cache is None:
+        if self._kv_caches.get(model_id) is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
 
         device_sampling = (
             batch.allow_device_greedy_sampling or batch.allow_device_topk_sampling
@@ -640,19 +644,14 @@ class Qwen314BModelRunner(ModelRunner):
         selector_logits = (
             self._decode_logits_device_arg() if device_sampling else kernel_inputs.logits
         )
-        self._run_distributed_program(
+        self._run_l3(
             compiled.decode,
-            *self._decode_kernel_args(
-                kernel_inputs,
-                k_cache,
-                v_cache,
-                device_sampling=device_sampling,
-            ),
+            *self._decode_kernel_args(device_sampling=device_sampling),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         sampled_ids, next_hidden = self._integrated_sample_result(
-            compiled.decode_sampled_ids_buffer,
+            self._decode_task_args.tensors["sampled_ids"],
             # decode_fwd's next_hidden output is the embedding for sampled_ids_in
             # used by this decode step. The newly sampled token is embedded at the
             # start of the following decode_fwd call, so there is no next-step
@@ -663,8 +662,8 @@ class Qwen314BModelRunner(ModelRunner):
         )
         sampling_candidates = self._device_topk_outputs(
             selector_logits,
-            compiled.decode_topk_values_buffer,
-            compiled.decode_topk_indices_buffer,
+            self._topk_select_task_args.tensors["decode_topk_values"],
+            self._topk_select_task_args.tensors["decode_topk_indices"],
             kernel_inputs.actual_batch,
             allow=batch.allow_device_topk_sampling,
         )
@@ -713,15 +712,15 @@ class Qwen314BModelRunner(ModelRunner):
         """Run the sampling selector in exact greedy mode for prefill."""
         if not allow:
             return None
-        compiled = self._compiled
+        topk = self._topk_select_task_args.tensors
         self._run_sampling_selector(
             logits,
-            compiled.prefill_topk_values_buffer,
-            compiled.prefill_topk_indices_buffer,
+            topk["prefill_topk_values"],
+            topk["prefill_topk_indices"],
             actual_batch,
             selection_k=1,
         )
-        return compiled.prefill_topk_indices_buffer[:actual_batch, :1].clone()
+        return topk["prefill_topk_indices"][:actual_batch, :1].clone()
 
     def _device_topk_outputs(
         self,
@@ -757,10 +756,10 @@ class Qwen314BModelRunner(ModelRunner):
         selection_k: int,
     ) -> None:
         """Run the shared greedy/top-k selector without adding another worker program."""
-        control = self._compiled.sampling_control_buffer
+        control = self._topk_select_task_args.tensors["sampling_control"]
         control[0] = int(actual_batch)
         control[1] = int(selection_k)
-        self._run_distributed_program(
+        self._run_l3(
             self._compiled.topk_select,
             logits,
             control,
@@ -768,116 +767,33 @@ class Qwen314BModelRunner(ModelRunner):
             indices_buffer,
         )
 
-    def _prefill_kernel_args(
-        self,
-        inputs: _PrefillInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
-        logits: torch.Tensor,
-    ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order."""
-        static = self._require_static_args()
-        weights = static.decode_weights
-        return (
-            inputs.token_ids,
-            inputs.seq_lens,
-            inputs.chunk_lens,
-            inputs.chunk_offsets,
-            weights["decode_input_rms_weight"],
-            weights["decode_wq"],
-            weights["decode_wk"],
-            weights["decode_wv"],
-            weights["decode_q_norm_weight"],
-            weights["decode_k_norm_weight"],
-            static.rope_cos,
-            static.rope_sin,
-            inputs.block_table,
-            inputs.slot_mapping,
-            k_cache,
-            v_cache,
-            weights["decode_wo"],
-            weights["decode_w_gate"],
-            weights["decode_w_up"],
-            weights["decode_w_down"],
-            weights["decode_post_rms_weight"],
-            static.final_norm_weight,
-            static.padded_lm_head_weight,
-            static.padded_embed_weight,
-            logits,
-        )
+    def _prefill_kernel_args(self, inputs: _PrefillInputs) -> tuple[Any, ...]:
+        """Return arguments in ``qwen3_prefill_host`` signature order.
 
-    def _decode_kernel_args(
-        self,
-        inputs: _DecodeKernelInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
-        *,
-        device_sampling: bool = False,
-    ) -> tuple[Any, ...]:
+        Fixed-shape buffers and weights come from the prefill TaskArgs
+        (``build()``); the per-call ``input_ids`` / ``slot_mapping`` are
+        length-``total_tokens`` slices over the full slots, spliced in.
+        """
+        task_args = self._prefill_task_args
+        args = list(task_args.build())
+        args[task_args.names.index("input_ids")] = inputs.token_ids
+        args[task_args.names.index("slot_mapping")] = inputs.slot_mapping
+        return tuple(args)
+
+    def _decode_kernel_args(self, *, device_sampling: bool = False) -> tuple[Any, ...]:
         """Return arguments in ``qwen3_decode_host`` signature order.
 
-        On device greedy or top-k sampling, logits + next_hidden are passed as
-        worker-resident (device) tensors so they are never staged/copied-back
-        per step. Only sampled ids or top-k candidates remain host-visible.
+        Buffers and weights come from the decode TaskArgs (``build()``). Under
+        device sampling, ``logits`` and ``next_hidden`` swap from the host slots
+        to worker-resident device scratch (spliced in), so full-vocabulary
+        logits are never staged/copied-back per step.
         """
-        static = self._require_static_args()
-        weights = static.decode_weights
-        logits_arg = self._decode_logits_device_arg() if device_sampling else inputs.logits
-        next_hidden_arg = (
-            self._decode_next_hidden_device_arg()
-            if device_sampling
-            else self._compiled.decode_next_hidden_buffer
-        )
-        return (
-            weights["decode_input_rms_weight"],
-            weights["decode_wq"],
-            weights["decode_wk"],
-            weights["decode_wv"],
-            weights["decode_q_norm_weight"],
-            weights["decode_k_norm_weight"],
-            inputs.seq_lens,
-            inputs.block_table,
-            inputs.slot_mapping,
-            static.rope_cos,
-            static.rope_sin,
-            k_cache,
-            v_cache,
-            weights["decode_wo"],
-            weights["decode_w_gate"],
-            weights["decode_w_up"],
-            weights["decode_w_down"],
-            weights["decode_post_rms_weight"],
-            static.final_norm_weight,
-            static.padded_lm_head_weight,
-            logits_arg,
-            static.padded_embed_weight,
-            inputs.token_ids,
-            self._compiled.decode_sampled_ids_buffer,
-            next_hidden_arg,
-        )
-
-    def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> None:
-        """Run a compiled HOST wrapper through the shared PyPTO L3 worker."""
-        span_args = {
-            "kernel": callable_spec.name,
-            "aicpu_thread_num": callable_spec.aicpu_thread_num,
-        }
-        with profile_span(
-            callable_spec.name,
-            cat="kernel",
-            level="kernel",
-            args=span_args,
-        ):
-            worker = self._shared_l3_worker()
-            l3_args = callable_spec.dispatch_args + tuple(self._coerce_l3_arg(worker, arg) for arg in args)
-            worker_run_args = dict(span_args)
-            with profile_span(
-                f"{callable_spec.name}.worker_run",
-                cat="kernel",
-                level="kernel",
-                args=worker_run_args,
-            ):
-                worker.run(callable_spec.compiled, *l3_args)
+        task_args = self._decode_task_args
+        args = list(task_args.build())
+        if device_sampling:
+            args[task_args.names.index("logits")] = self._decode_logits_device_arg()
+            args[task_args.names.index("next_hidden")] = self._decode_next_hidden_device_arg()
+        return tuple(args)
 
     def _shared_l3_worker(self) -> Any:
         """Return the worker shared by the generation prefill/decode path."""
@@ -893,30 +809,17 @@ class Qwen314BModelRunner(ModelRunner):
             self._l3_worker = worker
         return worker
 
-    def _coerce_l3_arg(self, worker: Any, arg: Any) -> Any:
-        """Convert static upload markers to worker-resident tensors."""
-        if not isinstance(arg, _StaticDeviceTensor):
-            return arg
-        tensor = arg.tensor
-        key = (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
-        cached = self._l3_static_tensors.get(key)
-        if cached is not None:
-            return cached
-        dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
-        self._l3_static_tensors[key] = dev
-        return dev
-
     def _decode_logits_device_arg(self) -> DeviceTensor:
         """Device-resident decode logits scratch for device sampling.
 
         Allocated directly on the worker and left uninitialized — the fused decode
         kernel writes every max_batch row before the on-device sampler reads it — so
         it forwards as a device pointer with no per-step staging/memset/D2H (and no
-        ``_coerce_l3_arg`` dict lookup on the hot path).
+        ``resolve_l3_arg`` dict lookup on the hot path).
         """
         dev = self._decode_logits_dev_tensor
         if dev is None:
-            buffer = self._compiled.decode_logits_buffer
+            buffer = self._decode_task_args.tensors["logits"]
             dev = self._shared_l3_worker().alloc_tensor(buffer.shape, buffer.dtype)
             self._decode_logits_dev_tensor = dev
         return dev
@@ -925,7 +828,7 @@ class Qwen314BModelRunner(ModelRunner):
         """Device-resident decode next_hidden scratch (never read on host)."""
         dev = self._decode_next_hidden_dev_tensor
         if dev is None:
-            buffer = self._compiled.decode_next_hidden_buffer
+            buffer = self._decode_task_args.tensors["next_hidden"]
             dev = self._shared_l3_worker().alloc_tensor(buffer.shape, buffer.dtype)
             self._decode_next_hidden_dev_tensor = dev
         return dev
@@ -942,16 +845,16 @@ class Qwen314BModelRunner(ModelRunner):
             static.padded_embed_weight,
             *static.decode_weights.values(),
         ):
-            self._coerce_l3_arg(worker, arg)
+            resolve_l3_arg(worker, arg, self._l3_static_tensors, stacked=self._l3_stacked)
 
     @staticmethod
-    def _static_device_tensor(tensor: torch.Tensor) -> _StaticDeviceTensor:
+    def _static_device_tensor(tensor: torch.Tensor) -> StaticDeviceTensor:
         """Mark a CPU tensor for one-time upload to the shared worker."""
         if tensor.device.type != "cpu":
             raise ValueError("worker-resident tensor must be on CPU")
         if not tensor.is_contiguous():
             raise ValueError("worker-resident tensor must be contiguous")
-        return _StaticDeviceTensor(Qwen314BModelRunner._share_cpu_tensor(tensor))
+        return StaticDeviceTensor(Qwen314BModelRunner._share_cpu_tensor(tensor))
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -970,8 +873,7 @@ class Qwen314BModelRunner(ModelRunner):
                 if worker is not None:
                     worker.close()
             finally:
-                self._l3_worker = None
-                self._l3_static_tensors.clear()
+                self._reset_l3_dispatch()
 
     def _prepare_prefill_inputs(
         self,
@@ -979,7 +881,6 @@ class Qwen314BModelRunner(ModelRunner):
         batch: PrefillBatch,
     ) -> _PrefillInputs:
         """Copy packed prefill inputs into persistent kernel buffers."""
-        compiled = self._compiled
         batch_count = len(batch.request_ids)
         actual_batch = self._validate_batch_size(model, batch_count)
 
@@ -1001,12 +902,13 @@ class Qwen314BModelRunner(ModelRunner):
         if total_tokens > max_tokens:
             raise ValueError(f"prefill total tokens {total_tokens} exceeds kernel capacity {max_tokens}")
 
-        token_ids = compiled.prefill_token_ids_buffer[:total_tokens]
-        seq_lens = compiled.prefill_seq_lens_buffer
-        chunk_lens = compiled.prefill_chunk_lens_buffer
-        chunk_offsets = compiled.prefill_chunk_offsets_buffer
-        block_table = compiled.prefill_block_table_buffer
-        slot_mapping = compiled.prefill_slot_mapping_buffer[:total_tokens]
+        buffers = self._prefill_task_args.tensors
+        token_ids = buffers["input_ids"][:total_tokens]
+        seq_lens = buffers["seq_lens"]
+        chunk_lens = buffers["chunk_lens"]
+        chunk_offsets = buffers["chunk_offsets"]
+        block_table = buffers["block_table"]
+        slot_mapping = buffers["slot_mapping"][:total_tokens]
         slot_mapping_array = self._prefill_slot_mapping_array
         if slot_mapping_array is None:
             raise RuntimeError("prefill slot-mapping buffer is not initialized")
@@ -1047,10 +949,6 @@ class Qwen314BModelRunner(ModelRunner):
         return _PrefillInputs(
             actual_batch=actual_batch,
             token_ids=token_ids,
-            seq_lens=seq_lens,
-            chunk_lens=chunk_lens,
-            chunk_offsets=chunk_offsets,
-            block_table=block_table,
             slot_mapping=slot_mapping,
         )
 
@@ -1066,20 +964,21 @@ class Qwen314BModelRunner(ModelRunner):
         Block-table rows persist across calls and are rewritten only when their
         page IDs change.
         """
-        compiled = self._compiled
+        buffers = self._decode_task_args.tensors
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         kernel_batch = model.runtime.max_batch_size
         page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
 
-        if kernel_batch > compiled.decode_logits_buffer.shape[0]:
+        logits_buffer = buffers["logits"]
+        if kernel_batch > logits_buffer.shape[0]:
             raise ValueError(
                 f"kernel batch {kernel_batch} exceeds logits buffer batch "
-                f"{compiled.decode_logits_buffer.shape[0]}"
+                f"{logits_buffer.shape[0]}"
             )
 
-        token_ids = compiled.decode_token_ids_buffer
+        token_ids = buffers["token_ids"]
         token_rows = token_ids.reshape(kernel_batch, -1)
         active_token_rows = batch.token_ids.reshape(actual_batch, -1)
         if active_token_rows.shape[1] != 1:
@@ -1096,7 +995,7 @@ class Qwen314BModelRunner(ModelRunner):
             self._decode_token_padding_initialized = True
         token_rows[:actual_batch, :1].copy_(active_token_rows)
 
-        seq_lens = compiled.decode_seq_lens_buffer
+        seq_lens = buffers["seq_lens"]
         seq_lens_flat = seq_lens.reshape(-1)
         active_seq_lens = batch.seq_lens.reshape(-1)
         if active_seq_lens.numel() < actual_batch:
@@ -1106,9 +1005,9 @@ class Qwen314BModelRunner(ModelRunner):
         seq_lens_flat[:actual_batch].copy_(active_seq_lens[:actual_batch])
         seq_len_values = seq_lens_flat[:actual_batch].tolist()
 
-        block_table = compiled.decode_block_table_buffer
+        block_table = buffers["block_table"]
         block_table_rows = block_table.reshape(kernel_batch, max_blocks)
-        slot_mapping = compiled.decode_slot_mapping_buffer
+        slot_mapping = buffers["slot_mapping"]
         slot_mapping_flat = slot_mapping.reshape(-1)
         if len(self._decode_block_table_row_pages) != kernel_batch:
             self._decode_block_table_row_pages = [None] * kernel_batch
@@ -1156,11 +1055,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
-            token_ids=token_ids,
-            seq_lens=seq_lens,
-            block_table=block_table,
-            slot_mapping=slot_mapping,
-            logits=compiled.decode_logits_buffer,
+            logits=logits_buffer,
         )
 
     def _write_cached_decode_block_table_row(
