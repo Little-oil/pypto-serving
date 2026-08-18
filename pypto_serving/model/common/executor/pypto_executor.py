@@ -114,7 +114,7 @@ class PyptoExecutor(ModelExecutor, ABC):
                 cat="executor",
                 args={"model_id": model.config.model_id, "batch_size": len(request_ids)},
             ):
-                finalize(model, request_ids, sampled_token_ids)
+                finalize(request_ids, sampled_token_ids)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""

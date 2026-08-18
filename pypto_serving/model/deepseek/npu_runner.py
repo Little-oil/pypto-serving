@@ -14,7 +14,10 @@ import math
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pypto_serving.model.common.runner.task_args import TaskArgs
 
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
@@ -31,6 +34,12 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
 )
+from pypto_serving.model.common.runner.buffer_set import (
+    copy_shared,
+    share_cpu_tensor,
+    shared_empty,
+)
+from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4GlobalWeights,
@@ -87,47 +96,6 @@ DEEPSEEK_V4_HCA_NUM_LAYERS = 20
 DEEPSEEK_V4_LM_HEAD_TP_SIZE = 4
 DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS = 8
 DEEPSEEK_V4_SAMPLED_IDS_PAD = 8
-
-# Policy values indicate whether a resident argument contains mutable request
-# cache state and therefore must be invalidated before its Host backing is
-# reused for a later request.
-_MAIN_STATIC_RESIDENT_POLICY = {
-    "freqs_cos": False,
-    "freqs_sin": False,
-    "hc_head_fn": False,
-    "hc_head_scale": False,
-    "hc_head_base": False,
-    "final_norm_w": False,
-    "lm_head_weight": False,
-}
-_MAIN_CACHE_RESIDENT_POLICY = {
-    "kv_cache": True,
-    "cmp_kv": True,
-    "idx_kv_cache": True,
-    "idx_kv_scale": True,
-    "hca_compress_state": True,
-    "csa_compress_state": True,
-    "csa_inner_compress_state": True,
-}
-_PREFILL_RESIDENT_POLICY = {
-    **_MAIN_STATIC_RESIDENT_POLICY,
-    **_MAIN_CACHE_RESIDENT_POLICY,
-}
-_DECODE_RESIDENT_POLICY = {
-    **_MAIN_STATIC_RESIDENT_POLICY,
-    **_MAIN_CACHE_RESIDENT_POLICY,
-    "embed_weight": False,
-}
-_MTP_RESIDENT_POLICY = {
-    "freqs_cos": False,
-    "freqs_sin": False,
-    "lm_head_weight": False,
-    "kv_cache": True,
-}
-_MTP_DECODE_RESIDENT_POLICY = {
-    **_MTP_RESIDENT_POLICY,
-    "embed_weight": False,
-}
 
 
 def build_deepseek_v4_cache_group_specs(
@@ -274,266 +242,13 @@ def deepseek_v4_cache_blocks_for_slots(
     }
 
 
-def deepseek_v4_physical_cache_blocks(
-    group_specs: Sequence[KVCacheGroupSpec],
-    capacity_slots: int,
-    *,
-    scratch_blocks: int,
-) -> dict[str, int]:
-    """Return physical blocks per rank, including isolated padding pages."""
-    if scratch_blocks <= 0:
-        raise ValueError("DeepSeekV4 scratch_blocks must be positive")
-    return {
-        name: num_blocks + int(scratch_blocks)
-        for name, num_blocks in deepseek_v4_cache_blocks_for_slots(
-            group_specs,
-            capacity_slots,
-        ).items()
-    }
-
-
-# Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
-# mirrors pypto-lib prefill_fwd.py ``l3_prefill_fwd`` host signature: every
-# layer-stacked weight/state tensor in core-parameter order, followed by the
-# ``hc_head`` collapse weights, final RMSNorm input, device LM-head weights, and
-# hidden/logit outputs and owner-major execution metadata.
-# The cache pools are ``pl.InOut`` tensors shared by prefill and decode; mutable
-# block tables, slot mappings and token metadata remain shared host inputs.
-_PREFILL_FWD_TENSOR_ORDER = (
-    "x_hc",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_w",
-    "wq_a",
-    "wq_b",
-    "wq_b_scale",
-    "wkv",
-    "gamma_cq",
-    "gamma_ckv",
-    "kv_cache",
-    "attn_sink",
-    "wo_a",
-    "wo_b",
-    "wo_b_scale",
-    "cmp_kv",
-    "hca_cmp_wkv",
-    "hca_cmp_wgate",
-    "hca_cmp_ape",
-    "hca_cmp_norm_w",
-    "hca_compress_state",
-    "csa_cmp_wkv",
-    "csa_cmp_wgate",
-    "csa_cmp_ape",
-    "csa_cmp_norm_w",
-    "csa_compress_state",
-    "csa_hadamard_idx",
-    "csa_idx_wq_b",
-    "csa_idx_wq_b_scale",
-    "csa_weights_proj",
-    "csa_inner_wkv",
-    "csa_inner_wgate",
-    "csa_inner_ape",
-    "csa_inner_norm_w",
-    "csa_inner_compress_state",
-    "idx_kv_cache",
-    "idx_kv_scale",
-    "hca_compress_state_block_table",
-    "csa_compress_state_block_table",
-    "csa_inner_compress_state_block_table",
-    "freqs_cos",
-    "freqs_sin",
-    "ori_block_table",
-    "cmp_block_table",
-    "idx_block_table",
-    "ori_slot_mapping",
-    "position_ids",
-    "input_ids",
-    "hca_cmp_slot_mapping",
-    "hca_state_slot_mapping",
-    "csa_cmp_slot_mapping",
-    "csa_idx_slot_mapping",
-    "csa_state_slot_mapping",
-    "csa_inner_state_slot_mapping",
-    "hc_ffn_fn",
-    "hc_ffn_scale",
-    "hc_ffn_base",
-    "norm_w",
-    "gate_w",
-    "gate_bias",
-    "tid2eid",
-    "routed_w1",
-    "routed_w1_scale",
-    "routed_w3",
-    "routed_w3_scale",
-    "routed_w2",
-    "routed_w2_scale",
-    "shared_w1",
-    "shared_w1_scale",
-    "shared_w3",
-    "shared_w3_scale",
-    "shared_w2",
-    "shared_w2_scale",
-    "hc_head_fn",
-    "hc_head_scale",
-    "hc_head_base",
-    "final_norm_w",
-    "pre_hc_hidden_out",
-    "lm_head_weight",
-    "hidden_out",
-    "logits",
-    "num_tokens_per_owner",
-    "logit_row_indices",
-)
-
-# Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
-# mirrors pypto-lib decode_fwd.py ``l3_decode_fwd`` host signature: after the
-# ``hc_head`` collapse weights the kernel performs final RMSNorm and device
-# LM-head projection.
-_DECODE_FWD_TENSOR_ORDER = (
-    "embed_weight",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_w",
-    "wq_a",
-    "wq_b",
-    "wq_b_scale",
-    "wkv",
-    "gamma_cq",
-    "gamma_ckv",
-    "kv_cache",
-    "attn_sink",
-    "wo_a",
-    "wo_b",
-    "wo_b_scale",
-    "hca_cmp_wkv",
-    "hca_cmp_wgate",
-    "hca_cmp_ape",
-    "hca_cmp_norm_w",
-    "hca_compress_state",
-    "csa_cmp_wkv",
-    "csa_cmp_wgate",
-    "csa_cmp_ape",
-    "csa_cmp_norm_w",
-    "csa_compress_state",
-    "csa_idx_wq_b",
-    "csa_idx_wq_b_scale",
-    "csa_weights_proj",
-    "csa_hadamard_idx",
-    "csa_inner_wkv",
-    "csa_inner_wgate",
-    "csa_inner_ape",
-    "csa_inner_norm_w",
-    "csa_inner_compress_state",
-    "cmp_kv",
-    "idx_kv_cache",
-    "idx_kv_scale",
-    "hc_ffn_fn",
-    "hc_ffn_scale",
-    "hc_ffn_base",
-    "norm_w",
-    "gate_w",
-    "gate_bias",
-    "tid2eid",
-    "routed_w1",
-    "routed_w1_scale",
-    "routed_w3",
-    "routed_w3_scale",
-    "routed_w2",
-    "routed_w2_scale",
-    "shared_w1",
-    "shared_w1_scale",
-    "shared_w3",
-    "shared_w3_scale",
-    "shared_w2",
-    "shared_w2_scale",
-    "freqs_cos",
-    "freqs_sin",
-    "block_table",
-    "position_ids",
-    "kv_seq_lens",
-    "hca_compress_state_block_table",
-    "csa_compress_state_block_table",
-    "csa_inner_compress_state_block_table",
-    "cmp_block_table",
-    "idx_block_table",
-    "block_counts",
-    "input_ids",
-    "hc_head_fn",
-    "hc_head_scale",
-    "hc_head_base",
-    "final_norm_w",
-    "pre_hc_hidden_out",
-    "lm_head_weight",
-    "hidden_out",
-    "logits",
-    "sampled_ids",
-    "num_tokens_per_owner",
-    "logit_row_indices",
-)
-
-_MTP_PREFILL_TENSOR_ORDER = (
-    "hidden_states", "prev_hidden_states",
-    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
-    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
-    "position_ids", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
-    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
-    "gate_w", "gate_bias", "tid2eid", "input_ids",
-    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
-    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
-    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
-    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
-)
-
-_MTP_DECODE_TENSOR_ORDER = (
-    "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
-    "accepted_counts", "tail_slot_ids", "position_ids",
-    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
-    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table",
-    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
-    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
-    "gate_w", "gate_bias", "tid2eid", "input_ids",
-    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
-    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
-    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
-    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
-    "logit_row_indices",
-)
-
-# The fused K=1 kernel owns persistent draft state, while the standalone MTP
-# kernel used to build additional K>1 drafts keeps the original stateless ABI.
-_FUSED_MTP_DECODE_TENSOR_ORDER = (
-    *_MTP_DECODE_TENSOR_ORDER[:5],
-    "state_generations", "state_tokens", "state_meta",
-    *_MTP_DECODE_TENSOR_ORDER[5:],
-)
-
-_FUSED_MTP_SHARED_TENSORS = frozenset(
-    {
-        "embed_weight",
-        "main_pre_hc_hidden",
-        "freqs_cos",
-        "freqs_sin",
-        "ori_block_table",
-        "lm_head_weight",
-    }
-)
-
 _MTP_DEVICE_STATE_TOKEN_WIDTH = 2
 _MTP_DEVICE_STATE_META_WIDTH = 4
 _MTP_STATE_VALID = 0
 _MTP_STATE_GENERATION = 1
 _MTP_STATE_TAIL_POSITION = 2
 _MTP_STATE_COMMITTED_COUNT = 3
+
 
 @dataclass(frozen=True)
 class DeepSeekV4CacheLayout:
@@ -714,26 +429,6 @@ class DeepSeekV4CacheMetadataBuilder:
                 mapping[row, col] = int(block_ids[block_index % len(block_ids)]) * block_size + offset
         return mapping
 
-    def sliding_window_slot_mapping_from_ids(
-        self,
-        per_request_block_ids: Sequence[Sequence[int]],
-        positions: Sequence[Sequence[int]],
-    ) -> torch.Tensor:
-        """Map absolute positions into one scheduler-owned sliding-window block."""
-        if len(per_request_block_ids) != len(positions):
-            raise ValueError("block IDs and positions must have the same row count")
-        width = max((len(row) for row in positions), default=0)
-        mapping = torch.full((len(positions), width), -1, dtype=torch.long)
-        for row, (block_ids, row_positions) in enumerate(
-            zip(per_request_block_ids, positions, strict=True)
-        ):
-            if not block_ids:
-                raise ValueError(f"sliding-window row {row} has no allocated block")
-            block_id = int(block_ids[0])
-            for col, position in enumerate(row_positions):
-                mapping[row, col] = block_id * self.layout.block_size + int(position) % self.layout.block_size
-        return mapping
-
     def paged_ori_block_table_from_ids(
         self,
         per_request_block_ids: Sequence[Sequence[int]],
@@ -777,44 +472,6 @@ class DeepSeekV4CacheMetadataBuilder:
                 mapping[row, col] = ids[logical_block % len(ids)] * block_size + offset
         return mapping
 
-    def swa_window_indices_and_lens_from_ids(
-        self,
-        per_request_block_ids: Sequence[Sequence[int]],
-        positions: Sequence[Sequence[int]],
-        *,
-        exclude_current: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lower SWA windows through scheduler-owned ori ring blocks."""
-        if len(per_request_block_ids) != len(positions):
-            raise ValueError("block IDs and positions must have the same row count")
-        per_row = max((len(row) for row in positions), default=0)
-        total = len(positions) * per_row
-        window = int(self.layout.sliding_window)
-        block_size = int(self.layout.block_size)
-        indices = torch.full((total, window), -1, dtype=torch.int32)
-        lens = torch.zeros((total,), dtype=torch.int32)
-        for row, (block_ids, row_positions) in enumerate(
-            zip(per_request_block_ids, positions, strict=True)
-        ):
-            ids = tuple(int(block_id) for block_id in block_ids)
-            if not ids:
-                raise ValueError(f"ori ring row {row} has no allocated blocks")
-            overlay = {int(position) for position in row_positions} if exclude_current else set()
-            for seq_index, position in enumerate(row_positions):
-                token = row * per_row + seq_index
-                absolute_position = int(position)
-                start = max(0, absolute_position - window + 1)
-                out_index = 0
-                for visible_position in range(start, absolute_position + 1):
-                    if visible_position in overlay:
-                        continue
-                    logical_block, offset = divmod(visible_position, block_size)
-                    physical_block = ids[logical_block % len(ids)]
-                    indices[token, out_index] = physical_block * block_size + offset
-                    out_index += 1
-                lens[token] = out_index
-        return indices, lens
-
     @staticmethod
     def compressed_slot_mapping_from_ids(
         per_request_block_ids: Sequence[Sequence[int]],
@@ -857,21 +514,6 @@ class DeepSeekV4CacheMetadataBuilder:
             positions,
             block_size=state_block_size,
         )
-
-    @staticmethod
-    def replicate_first_row(tensor: torch.Tensor, *, actual_rows: int, kernel_rows: int) -> torch.Tensor:
-        """Pad kernel inputs by replicating row 0 into inactive rows."""
-        if actual_rows <= 0:
-            raise ValueError("actual_rows must be positive")
-        if kernel_rows < actual_rows:
-            raise ValueError("kernel_rows must be >= actual_rows")
-        if tensor.shape[0] < actual_rows:
-            raise ValueError("tensor has fewer rows than actual_rows")
-        out = torch.empty((kernel_rows, *tensor.shape[1:]), dtype=tensor.dtype)
-        out[:actual_rows].copy_(tensor[:actual_rows])
-        if actual_rows < kernel_rows:
-            out[actual_rows:].copy_(tensor[0:1].expand(kernel_rows - actual_rows, *tensor.shape[1:]))
-        return out
 
 
 class DeepSeekV4InputBuilder:
@@ -921,125 +563,6 @@ class DeepSeekV4InputBuilder:
             rank_rows[rank].copy_(rows)
         return self._expand_hc(rank_rows)
 
-    def decode_x_hc(
-        self,
-        embeddings: torch.Tensor,
-        *,
-        ranks: Sequence[int],
-        local_rows: Sequence[int],
-        out: torch.Tensor | None = None,
-        fill_all: bool = True,
-    ) -> torch.Tensor:
-        """Pack one autoregressive token per request into rank-local rows."""
-        token_rows = embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1)
-        return self._pack_decode_x_hc(
-            token_rows,
-            ranks=ranks,
-            local_rows=local_rows,
-            out=out,
-            fill_all=fill_all,
-        )
-
-    def decode_token_rows_x_hc(
-        self,
-        embeddings: torch.Tensor,
-        *,
-        ranks: Sequence[int],
-        local_rows: Sequence[int],
-        out: torch.Tensor | None = None,
-        fill_all: bool = True,
-    ) -> torch.Tensor:
-        """Pack explicit request-local token rows for target verification."""
-        return self._pack_decode_x_hc(
-            embeddings,
-            ranks=ranks,
-            local_rows=local_rows,
-            out=out,
-            fill_all=fill_all,
-        )
-
-    def _pack_decode_x_hc(
-        self,
-        token_rows: torch.Tensor,
-        *,
-        ranks: Sequence[int],
-        local_rows: Sequence[int],
-        out: torch.Tensor | None,
-        fill_all: bool,
-    ) -> torch.Tensor:
-        """Pack explicit per-request token rows into the fixed decode tile."""
-        if (
-            token_rows.ndim != 3
-            or token_rows.shape[0] <= 0
-            or int(token_rows.shape[1]) != self.layout.decode_seq
-            or int(token_rows.shape[2]) != self.hidden_size
-        ):
-            raise ValueError("decode token rows must have shape [requests, decode_seq, hidden]")
-        if len(ranks) != token_rows.shape[0] or len(local_rows) != token_rows.shape[0]:
-            raise ValueError("decode token rows, ranks, and local rows must align")
-        token_rows = token_rows.to(torch.float32)
-        if out is None:
-            rows = torch.zeros(
-                (self.layout.ranks, self.layout.decode_tokens, self.hidden_size),
-                dtype=token_rows.dtype,
-                device=token_rows.device,
-            )
-            fallback = token_rows[0, -1]
-            for rank in range(self.layout.ranks):
-                rows[rank].copy_(fallback.reshape(1, -1).expand(self.layout.decode_tokens, -1))
-            for index, (rank, local_row) in enumerate(zip(ranks, local_rows, strict=True)):
-                rank = int(rank)
-                local_row = int(local_row)
-                if not 0 <= rank < self.layout.ranks:
-                    raise ValueError(f"decode rank {rank} is out of range")
-                if not 0 <= local_row < self.layout.decode_batch:
-                    raise ValueError(f"decode local row {local_row} is out of range")
-                start = local_row * self.layout.decode_seq
-                rows[rank, start : start + self.layout.decode_seq].copy_(token_rows[index])
-            return self._expand_hc(rows)
-
-        expected_shape = (
-            self.layout.ranks,
-            self.layout.decode_tokens,
-            self.layout.hc_mult,
-            self.hidden_size,
-        )
-        if tuple(out.shape) != expected_shape or out.dtype != torch.float32:
-            raise ValueError(
-                "decode x_hc output must have "
-                f"shape={expected_shape} dtype=torch.float32, "
-                f"got shape={tuple(out.shape)} dtype={out.dtype}"
-            )
-        if out.device.type != "cpu":
-            raise ValueError("decode x_hc shared output must be on CPU")
-
-        fallback = token_rows[0, -1]
-        fill_tokens = self.layout.decode_tokens
-        if not fill_all:
-            fill_tokens = (max(int(row) for row in local_rows) + 1) * self.layout.decode_seq
-        out[:, :fill_tokens].copy_(
-            fallback.reshape(1, 1, 1, -1).expand(
-                self.layout.ranks,
-                fill_tokens,
-                self.layout.hc_mult,
-                self.hidden_size,
-            )
-        )
-        for index, (rank, local_row) in enumerate(zip(ranks, local_rows, strict=True)):
-            rank = int(rank)
-            local_row = int(local_row)
-            if not 0 <= rank < self.layout.ranks:
-                raise ValueError(f"decode rank {rank} is out of range")
-            if not 0 <= local_row < self.layout.decode_batch:
-                raise ValueError(f"decode local row {local_row} is out of range")
-            start = local_row * self.layout.decode_seq
-            out[rank, start : start + self.layout.decode_seq].copy_(
-                token_rows[index]
-                .unsqueeze(1)
-                .expand(self.layout.decode_seq, self.layout.hc_mult, self.hidden_size)
-            )
-        return out
-
     def _expand_hc(self, rank_rows: torch.Tensor) -> torch.Tensor:
         if (
             rank_rows.ndim != 3
@@ -1060,21 +583,6 @@ class DeepSeekV4InputBuilder:
 # Compiled HOST-dispatched program. Unified with qwen's _L3Callable in
 # pypto_serving.model.common.compiler.l3_callable.
 from pypto_serving.model.common.compiler.l3_callable import L3Callable as DeepSeekV4L3Callable
-
-
-@dataclass
-class _StaticDeviceTensor:
-    """Rank-stacked CPU tensor marker uploaded to every chip worker once."""
-
-    tensor: torch.Tensor
-    cache_state: bool = False
-
-
-@dataclass
-class _TransientDeviceTensor:
-    """CPU tensor marker uploaded for one layer dispatch and then freed."""
-
-    tensor: torch.Tensor
 
 
 @dataclass
@@ -1234,7 +742,7 @@ class _DeepSeekV4MainDecodeOutput:
 class _DeepSeekV4PendingMtpDecode:
     """Submitted device dispatch whose small host outputs await reclaim."""
 
-    dispatch: "_DeepSeekV4PendingL3Dispatch"
+    dispatch: "PendingL3Dispatch"
     inputs: DeepSeekV4PreparedDecodeInputs
     sampled_ids: torch.Tensor
     accepted_counts: torch.Tensor
@@ -1256,118 +764,25 @@ class _DeepSeekV4MtpVerification:
 
 
 @dataclass
-class _DeepSeekV4PendingL3Dispatch:
-    """Own one asynchronous PyPTO dispatch until completion is reclaimed."""
+class _DeepSeekV4MtpSharedBuffers:
+    """MTP weights, KV-cache placeholder, and recurrent-state init buffers.
 
-    worker: Any
-    handle: Any
-    uploaded: tuple[DeviceTensor, ...]
-    name: str
-    _released: bool = False
-    _error: BaseException | None = None
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-
-    def wait(self) -> None:
-        """Wait for completion and release per-dispatch device uploads once."""
-        with self._lock:
-            if self._released:
-                if self._error is not None:
-                    raise self._error
-                return
-            error: BaseException | None = None
-            try:
-                with profile_span(
-                    f"{self.name}.worker_wait",
-                    cat="kernel",
-                    level="kernel",
-                ):
-                    self.handle.result()
-            except BaseException as exc:
-                error = exc
-            for tensor in self.uploaded:
-                try:
-                    self.worker.free_tensor(tensor)
-                except BaseException as exc:
-                    if error is None:
-                        error = exc
-            self._error = error
-            self._released = True
-            if error is not None:
-                raise error
-
-
-@dataclass
-class _DeepSeekV4DecodeSharedBuffers:
-    """Reusable decode shared-memory buffers inherited by the L3 chip workers."""
-
-    pre_hc_hidden_out: torch.Tensor
-    x_out: torch.Tensor
-    sampled_ids: torch.Tensor
-    tensors: dict[str, torch.Tensor]
-
-
-@dataclass
-class _DeepSeekV4PrefillFwdSharedBuffers:
-    """Reusable packed-prefill shared buffers inherited by the L3 chip workers.
-
-    For the single ``l3_prefill_fwd`` dispatch the work caches are flattened 5-D
-    (kv_cache/cmp_kv stack across all 43 hidden layers, idx_kv_cache across the 21
-    compress_ratio==4 layers) and the compress-state kv/score caches stack across
-    the CSA (x21) and HCA (x20) groups. The per-step metadata, RoPE tables and
-    compress-state block tables are shared single per-rank copies (the kernel
-    slices them per layer). ``tensors`` is keyed by ``_PREFILL_FWD_TENSOR_ORDER``
-    name (excluding the stacked weights, which live in ``_stacked_host_weights``,
-    and ``freqs_*``/``x_hc`` which are tracked explicitly). The final normalized
-    hidden output is held separately in ``_prefill_output_buffer``.
+    The prefill host inputs/outputs live on the MTP prefill TaskArgs; the decode
+    per-slot reclaimed outputs and write-only outputs live on the MTP decode
+    TaskArgs.  What remains here: the MTP host weights (pre-upload), the 1-page
+    KV-cache placeholder, the state-init seed buffers, and the prefill host
+    readback mirror for ``_read_mtp_prefill_logits``.  ``prefill_pre_hc_mirror``
+    holds the D2H readback of the MTP prefill pre-HC output consumed by the
+    arbitrary-depth recurrent path.
     """
 
-    x_hc: torch.Tensor
-    freqs_cos: torch.Tensor
-    freqs_sin: torch.Tensor
-    tensors: dict[str, torch.Tensor]
-
-
-@dataclass
-class _DeepSeekV4MtpSharedBuffers:
-    """MTP weights, unified SWA cache, recurrent state, and outputs."""
-
     weights: dict[str, torch.Tensor]
-    prefill_hidden_in: torch.Tensor
-    prefill_prev_hidden_in: torch.Tensor
-    prefill_input_ids: torch.Tensor
-    prefill_position_ids: torch.Tensor
-    prefill_block_table: torch.Tensor
-    prefill_slot_mapping: torch.Tensor
     prefill_kv_cache: torch.Tensor
-    decode_input_ids: torch.Tensor
-    decode_position_ids: torch.Tensor
-    decode_accepted_counts: torch.Tensor
-    decode_tail_slot_ids: torch.Tensor
-    decode_tail_token_ids: torch.Tensor
-    decode_tail_positions: torch.Tensor
-    decode_state_generations: torch.Tensor
     state_init_tokens: torch.Tensor
     state_init_meta: torch.Tensor
     tail_init_hidden: torch.Tensor
-    decode_kv_cache: torch.Tensor
-    prefill_hidden_out: torch.Tensor
-    prefill_pre_hc_out: torch.Tensor
     prefill_logits: torch.Tensor
-    prefill_logit_row_indices: torch.Tensor
-    decode_hidden_out: torch.Tensor
-    decode_pre_hc_out: torch.Tensor
-    decode_logits: torch.Tensor
-    decode_sampled_ids: torch.Tensor
-    decode_logit_row_indices: torch.Tensor
-
-
-@dataclass
-class _DeepSeekV4MtpPrefillDeviceOutputs:
-    """Worker-resident MTP prefill outputs shared across requests."""
-
-    hidden_out: StackedDeviceTensor
-    pre_hc_hidden_out: StackedDeviceTensor
-    logits: StackedDeviceTensor
+    prefill_pre_hc_mirror: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1471,7 +886,7 @@ def accept_mtp_tokens(main_token_ids: torch.Tensor, draft_token_ids: torch.Tenso
     return accepted
 
 
-class DeepSeekV4ModelRunner(ModelRunner):
+class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     """Runner boundary for DeepSeekV4 W8A8 kernels and model-specific caches."""
 
     def __init__(
@@ -1483,11 +898,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._compiled = compiled
         self.cache_metadata = DeepSeekV4CacheMetadataBuilder(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
-        self._l3_worker: Any | None = None
-        self._l3_static_tensors: dict[
-            tuple[int, tuple[int, ...], torch.dtype], StackedDeviceTensor
-        ] = {}
-        self._l3_cache_tensor_keys: set[tuple[int, tuple[int, ...], torch.dtype]] = set()
+        self._init_l3_dispatch(stacked=True)
         self._cache_group_specs: tuple[KVCacheGroupSpec, ...] = ()
         self._cache_group_num_blocks: dict[str, int] = {}
         self._decode_device_cache: DeepSeekV4DeviceCache | None = None
@@ -1496,18 +907,20 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_lm_head_weight: torch.Tensor | None = None
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
-        self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
-        self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
+        self._prefill_task_args: TaskArgs | None = None
+        # Per ping-pong slot: the host-shared ``_DECODE_FWD_TENSOR_ORDER``
+        # buffers (metadata inputs, sampled_ids, hidden/logits outputs) live on
+        # the decode TaskArgs; the device-resident pre-HC output is a
+        # device-resident slot on the same TaskArgs.  ``_decode_input_slots``
+        # keeps only the MTP-specific reclaimed buffers until the MTP builders
+        # migrate (Step 5).
+        self._decode_task_args: list[TaskArgs] = []
         self._decode_input_slots: list[dict[str, torch.Tensor]] = []
         self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
             None
         ] * compiled.layout.ranks
         self._decode_assignment_cache_key: tuple[tuple[str, ...], tuple[int, ...]] | None = None
         self._decode_assignment_cache: _DeepSeekV4DecodeAssignment | None = None
-        self._decode_logit_row_range = torch.arange(
-            compiled.layout.decode_tokens,
-            dtype=torch.int32,
-        )
         self._decode_fwd_args_cache: tuple[Any, ...] | None = None
         self._mtp_decode_args_cache: tuple[Any, ...] | None = None
         self._fused_mtp_main_args: tuple[Any, ...] | None = None
@@ -1515,21 +928,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._embedding_device_weight: StackedDeviceTensor | None = None
-        self._main_pre_hc_device: StackedDeviceTensor | None = None
         self._mtp_tail_pre_hc_pool: StackedDeviceTensor | None = None
         self._mtp_device_state_tokens: StackedDeviceTensor | None = None
         self._mtp_device_state_meta: StackedDeviceTensor | None = None
         self._l3_shared_buffers_ready = False
         self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
-        self._prefill_output_buffer: torch.Tensor | None = None
-        self._prefill_pre_hc_output_buffer: torch.Tensor | None = None
-        self._prefill_logits_buffer: torch.Tensor | None = None
-        self._decode_logits_buffer: torch.Tensor | None = None
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
-        self._mtp_decode_inputs_initialized = False
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
-        self._mtp_prefill_device_outputs: _DeepSeekV4MtpPrefillDeviceOutputs | None = None
+        self._main_pre_hc_host_mirror: torch.Tensor | None = None
+        self._mtp_prefill_task_args: TaskArgs | None = None
+        self._mtp_decode_task_args: list[TaskArgs] = []
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_state_lock = threading.RLock()
         self._mtp_free_tail_slots: list[list[int]] = [
@@ -2283,10 +1692,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if max_position >= model.runtime.max_seq_len:
             raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
 
-        self._ensure_decode_buffers(model.config.hidden_size)
-        if not 0 <= buffer_slot < len(self._decode_input_slots):
+        self._ensure_decode_buffers(model.config.hidden_size, model.config.vocab_size)
+        if not 0 <= buffer_slot < len(self._decode_task_args):
             raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
-        staged = self._decode_input_slots[buffer_slot]
+        staged = self._decode_task_args[buffer_slot].tensors
         staged["num_tokens_per_owner"].zero_()
         staged["logit_row_indices"].fill_(-1)
         self._stage_decode_dynamic_inputs(
@@ -2357,7 +1766,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 ),
             }
             for name, value in static_values.items():
-                self._copy_shared(
+                copy_shared(
                     staged[name][rank],
                     value,
                     name=f"decode_{name}_rank{rank}",
@@ -2554,13 +1963,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
             args={"actual_tokens": max(inputs.actual_tokens)},
         ):
             self._stage_prefill_fwd_inputs(inputs)
-            hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
-            pre_hc_hidden_buffer = self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
-            logits_buffer = self._require_prefill_logits_buffer(model.config.vocab_size)
-            hidden_buffer.zero_()
-            pre_hc_hidden_buffer.zero_()
-            logits_buffer.zero_()
-            args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer, logits_buffer)
+            self._prefill_task_args.clear_outputs()
+            args = self._prefill_fwd_args()
+            pre_hc_hidden_buffer = self._prefill_task_args.tensors["pre_hc_hidden_out"]
+            logits_buffer = self._prefill_task_args.tensors["logits"]
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.prefill.l3_dispatch",
@@ -2578,8 +1984,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ) from exc
         self._prefill_completion(inputs, pre_hc_hidden_buffer)
 
-        active_hidden = hidden_buffer[:, : max(inputs.actual_tokens), :]
-
         logits = torch.stack(
             tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
         ).float()
@@ -2587,7 +1991,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def finalize_prefill(
         self,
-        model: RuntimeModel,
         request_ids: Sequence[str],
         sampled_token_ids: Sequence[int],
     ) -> None:
@@ -2636,7 +2039,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 batch.token_ids, len(batch.request_ids)
             )
             self._stage_decode_dynamic_inputs(
-                self._decode_input_slots[prepared.buffer_slot],
+                self._decode_task_args[prepared.buffer_slot].tensors,
                 batch,
                 assignment=assignment,
                 positions=positions,
@@ -2929,15 +2332,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
-        staged = self._decode_input_slots[inputs.buffer_slot]
+        ta = self._decode_task_args[inputs.buffer_slot]
+        mtp_ta = self._mtp_decode_task_args[inputs.buffer_slot]
+        mtp = mtp_ta.tensors
         return _DeepSeekV4PendingMtpDecode(
             dispatch=dispatch,
             inputs=inputs,
-            sampled_ids=staged["sampled_ids"],
-            accepted_counts=staged["mtp_accepted_counts"],
-            mtp_sampled_ids=staged["mtp_sampled_ids"],
-            committed_input_ids=staged["mtp_committed_input_ids"],
-            committed_position_ids=staged["mtp_committed_position_ids"],
+            sampled_ids=ta.tensors["sampled_ids"],
+            accepted_counts=mtp["accepted_counts"],
+            mtp_sampled_ids=mtp["sampled_ids"],
+            committed_input_ids=mtp["input_ids"],
+            committed_position_ids=mtp["position_ids"],
             states=states,
         )
 
@@ -3085,13 +2490,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """Run the mode-independent packed main-model decode kernel."""
         with profile_span("DeepSeekV4ModelRunner.decode.prepare_inputs", cat="executor"):
             inputs = prepared
-        decode_buffers = self._require_decode_buffers()
+        ta = self._decode_task_args[inputs.buffer_slot]
         active_decode_tokens = max(inputs.per_rank_counts) * active_seq
-
-        hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
-        pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(model.config.hidden_size)
-        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
-        sampled_ids_buffer = self._decode_input_slots[inputs.buffer_slot]["sampled_ids"]
         # The active hidden/pre-HC rows are pl.Out tensors and the grouped LM
         # head overwrites every logits row, including rows selected with -1.
         # Pre-clearing these reusable buffers only adds host memory bandwidth.
@@ -3101,13 +2501,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             cat="executor",
             args={"actual_tokens": num_tokens},
         ):
-            args = self._decode_fwd_args(
-                inputs,
-                pre_hc_hidden_buffer,
-                hidden_buffer,
-                logits_buffer,
-                sampled_ids_buffer,
-            )
+            args = self._decode_fwd_args(inputs)
         try:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.l3_dispatch",
@@ -3123,27 +2517,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 packed decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
-        active_hidden = hidden_buffer[:, :active_decode_tokens, :]
+        hidden_buffer = ta.tensors["hidden_out"]
 
-        captured_pre_hc: torch.Tensor | StackedDeviceTensor = pre_hc_hidden_buffer
+        captured_pre_hc: torch.Tensor | StackedDeviceTensor = ta.tensors["pre_hc_hidden_out"]
         if self._compiled.mtp_decode is not None:
             # Arbitrary-depth verification needs selected target pre-HC rows on
             # the host, while recurrent MTP still consumes the device-resident
             # output. Read back complete shards from their allocation base; a
             # raw D2H copy from an offset device pointer is not supported by the
             # distributed control path.
+            host_mirror = self._require_main_pre_hc_host_mirror()
             self._shared_l3_worker().copy_stacked_from(
-                pre_hc_hidden_buffer,
-                decode_buffers.pre_hc_hidden_out,
+                ta.tensors["pre_hc_hidden_out"],
+                host_mirror,
             )
-            captured_pre_hc = decode_buffers.pre_hc_hidden_out
+            captured_pre_hc = host_mirror
 
         return _DeepSeekV4MainDecodeOutput(
             inputs=inputs,
             hidden=hidden_buffer,
             pre_hc_hidden=captured_pre_hc,
-            logits=logits_buffer,
-            sampled_ids=sampled_ids_buffer,
+            logits=ta.tensors["logits"],
+            sampled_ids=ta.tensors["sampled_ids"],
         )
 
     @staticmethod
@@ -3204,18 +2599,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._static_freqs_cos_tensor()
             self._static_freqs_sin_tensor()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_buffers", cat="executor"):
-            self._ensure_decode_buffers(model.config.hidden_size)
+            self._ensure_decode_buffers(model.config.hidden_size, model.config.vocab_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
             self._ensure_mtp_buffers(model.config.hidden_size)
-        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_outputs", cat="executor"):
-            self._require_prefill_output_buffer(model.config.hidden_size)
-            self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
-            self._require_prefill_logits_buffer(model.config.vocab_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_final_norm", cat="executor"):
             self._static_final_norm_weight_tensor()
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_lm_head", cat="executor"):
             self._static_lm_head_weight_tensor()
-            self._require_decode_logits_buffer(model.config.vocab_size)
         if self._stacked_host_weights is None:
             if self._stacked_device_weights is None:
                 with profile_span(
@@ -3228,135 +2618,37 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 del stacked_weights
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_hc_head", cat="executor"):
             self._hc_head_tensors()
-        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_fwd_buffers", cat="executor"):
-            self._ensure_prefill_fwd_buffers(model.config.hidden_size)
-        with profile_span("DeepSeekV4ModelRunner.prepare.validate_shared_buffers", cat="executor"):
-            self._assert_l3_shared_buffers_preallocated()
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_prefill_task_args", cat="executor"):
+            from pypto_serving.model.deepseek.task_args import prefill_task_args  # noqa: PLC0415
+
+            self._prefill_task_args = prefill_task_args(
+                self, model.config.hidden_size, model.config.vocab_size
+            )
+            self._prefill_task_args.allocate_host_shared(None)
         with profile_span("DeepSeekV4ModelRunner.upload_resident_weights", cat="executor"):
             self._materialize_resident_weights()
         self._l3_shared_buffers_ready = True
 
-    def _assert_l3_shared_buffers_preallocated(self) -> None:
-        missing = self._missing_l3_shared_buffers()
-        if missing:
-            raise RuntimeError(
-                "DeepSeekV4 L3 worker cannot start before all shared host buffers are preallocated; "
-                "missing: " + ", ".join(missing)
-            )
-
-    def _missing_l3_shared_buffers(self) -> list[str]:
-        missing: list[str] = []
-        expected = {
-            "final_norm_w": self._static_final_norm_weight,
-            "lm_head_weight": self._static_lm_head_weight,
-            "freqs_cos": self._static_freqs_cos,
-            "freqs_sin": self._static_freqs_sin,
-            "prefill_fwd_buffers": self._prefill_fwd_buffers,
-            "decode_buffers": self._decode_buffers,
-            "stacked_weights": self._stacked_host_weights or self._stacked_device_weights,
-            "hc_head_buffers": self._hc_head_buffers,
-            "prefill_output": self._prefill_output_buffer,
-            "prefill_pre_hc_output": self._prefill_pre_hc_output_buffer,
-            "prefill_logits": self._prefill_logits_buffer,
-            "decode_logits": self._decode_logits_buffer,
-        }
-        if self._compiled.mtp_prefill is not None or self._compiled.mtp_decode is not None:
-            expected["mtp_buffers"] = self._mtp_buffers
-        for name, value in expected.items():
-            if value is None:
-                missing.append(name)
-        if self._stacked_host_weights is not None and not self._stacked_host_weights:
-            missing.append("stacked_weights")
-        if self._hc_head_buffers is not None and not self._hc_head_buffers:
-            missing.append("hc_head_buffers")
-        return missing
-
-    def _prefill_fwd_args(
-        self,
-        pre_hc_hidden_out: torch.Tensor,
-        hidden_out: torch.Tensor,
-        logits: torch.Tensor,
-    ) -> tuple[Any, ...]:
+    def _prefill_fwd_args(self) -> tuple[Any, ...]:
         """Build the single packed ``l3_prefill_fwd`` argument tuple.
 
-        The kernel runs final RMSNorm and the device-side LM-head.
+        The kernel runs final RMSNorm and the device-side LM-head. Every positional
+        arg is declared on ``_prefill_task_args`` (see ``deepseek/task_args.py``).
         """
-        buffers = self._require_prefill_fwd_buffers()
-        stacked = self._require_stacked_weights()
-        hc_head = self._hc_head_tensors()
-        values = dict(stacked.tensors)
-        values.update(
-            {
-                "x_hc": buffers.x_hc,
-                "freqs_cos": buffers.freqs_cos,
-                "freqs_sin": buffers.freqs_sin,
-                "hc_head_fn": hc_head["hc_head_fn"],
-                "hc_head_scale": hc_head["hc_head_scale"],
-                "hc_head_base": hc_head["hc_head_base"],
-                "final_norm_w": self._static_final_norm_weight_tensor(),
-                "pre_hc_hidden_out": pre_hc_hidden_out,
-                "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": hidden_out,
-                "logits": logits,
-                "num_tokens_per_owner": buffers.tensors["num_tokens_per_owner"],
-                "logit_row_indices": buffers.tensors["logit_row_indices"],
-            }
-        )
-        values.update(buffers.tensors)
-        values.update(self._device_cache_values())
-        values = self._mark_resident_args(values, _PREFILL_RESIDENT_POLICY)
-        return self._ordered_layer_args(values, _PREFILL_FWD_TENSOR_ORDER)
+        return self._prefill_task_args.build()
 
-    def _decode_fwd_args(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        pre_hc_hidden_out: torch.Tensor | StackedDeviceTensor,
-        hidden_out: torch.Tensor,
-        logits: torch.Tensor,
-        sampled_ids: torch.Tensor,
-    ) -> tuple[Any, ...]:
-        """Build the single packed ``l3_decode_fwd`` argument tuple."""
-        cache = self._materialize_decode_device_cache()
-        stacked = self._require_stacked_weights()
-        hc_head = self._hc_head_tensors()
-        values = dict(stacked.tensors)
-        values.update(
-            {
-                "embed_weight": self._materialize_embedding_device_weight(),
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": cache.kv_cache,
-                "block_table": inputs.block_table,
-                "position_ids": inputs.position_ids,
-                "kv_seq_lens": inputs.kv_seq_lens,
-                "hca_compress_state": cache.hca_compress_state,
-                "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
-                "csa_compress_state": cache.csa_compress_state,
-                "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
-                "csa_inner_compress_state": cache.csa_inner_compress_state,
-                "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
-                "cmp_kv": cache.cmp_kv,
-                "cmp_block_table": inputs.cmp_block_table,
-                "idx_kv_cache": cache.idx_kv_cache,
-                "idx_kv_scale": cache.idx_kv_scale,
-                "idx_block_table": inputs.idx_block_table,
-                "block_counts": inputs.block_counts,
-                "input_ids": inputs.input_ids,
-                "hc_head_fn": hc_head["hc_head_fn"],
-                "hc_head_scale": hc_head["hc_head_scale"],
-                "hc_head_base": hc_head["hc_head_base"],
-                "final_norm_w": self._static_final_norm_weight_tensor(),
-                "pre_hc_hidden_out": pre_hc_hidden_out,
-                "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": hidden_out,
-                "logits": logits,
-                "sampled_ids": sampled_ids,
-                "num_tokens_per_owner": inputs.num_tokens_per_owner,
-                "logit_row_indices": inputs.logit_row_indices,
-            }
-        )
-        values = self._mark_resident_args(values, _DECODE_RESIDENT_POLICY)
-        return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
+    def _decode_fwd_args(self, inputs: DeepSeekV4PreparedDecodeInputs) -> tuple[Any, ...]:
+        """Build the single packed ``l3_decode_fwd`` argument tuple from the decode TaskArgs.
+
+        The TaskArgs owns every ``_DECODE_FWD_TENSOR_ORDER`` buffer (host-shared
+        metadata/outputs as slots, device-resident pre-HC output as a slot,
+        weights/caches/embed as lazy sources).  Both the host-shared and the
+        device-resident slots are allocated before the L3 worker fork / at
+        resident-weight materialization, so this hot path only assembles the
+        tuple -- it must not touch the worker (the prepare lane runs concurrently
+        with an in-flight dispatch in the depth-2 pipeline).
+        """
+        return self._decode_task_args[inputs.buffer_slot].build()
 
     def _device_cache_values(self) -> dict[str, StackedDeviceTensor]:
         """Return the unified worker-resident cache pools by kernel argument name."""
@@ -3372,34 +2664,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         }
 
     def _mtp_prefill_args(self) -> tuple[Any, ...]:
-        buffers = self._require_mtp_buffers()
-        kv_cache = self._materialize_mtp_device_kv_cache()
-        if kv_cache is None:
-            raise RuntimeError("DeepSeekV4 MTP KV cache is unavailable")
-        outputs = self._materialize_mtp_prefill_device_outputs(
-            int(buffers.prefill_hidden_in.shape[-1])
-        )
-        values = dict(self._mtp_device_weights or buffers.weights)
-        values.update(
-            {
-                "hidden_states": buffers.prefill_hidden_in,
-                "prev_hidden_states": buffers.prefill_prev_hidden_in,
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": kv_cache,
-                "ori_block_table": buffers.prefill_block_table,
-                "ori_slot_mapping": buffers.prefill_slot_mapping,
-                "position_ids": buffers.prefill_position_ids,
-                "input_ids": buffers.prefill_input_ids,
-                "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": outputs.hidden_out,
-                "pre_hc_hidden_out": outputs.pre_hc_hidden_out,
-                "logits": outputs.logits,
-                "logit_row_indices": buffers.prefill_logit_row_indices,
-            }
-        )
-        values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
-        return self._ordered_layer_args(values, _MTP_PREFILL_TENSOR_ORDER)
+        """Build the single packed ``l3_mtp_prefill`` argument tuple from the prefill TaskArgs."""
+        return self._mtp_prefill_task_args.build()
 
     def _mtp_decode_args(
         self,
@@ -3407,87 +2673,29 @@ class DeepSeekV4ModelRunner(ModelRunner):
         *,
         include_device_state: bool = False,
     ) -> tuple[Any, ...]:
-        buffer_slot = inputs.buffer_slot if inputs is not None else -1
-        buffers = self._require_mtp_buffers()
-        staged = self._decode_input_slots[buffer_slot] if inputs is not None else None
-        tail_slot_ids = (
-            inputs.mtp_tail_slot_ids
-            if inputs is not None and inputs.mtp_tail_slot_ids is not None
-            else buffers.decode_tail_slot_ids
-        )
-        logit_row_indices = (
-            inputs.mtp_logit_row_indices
-            if inputs is not None and inputs.mtp_logit_row_indices is not None
-            else buffers.decode_logit_row_indices
-        )
-        kv_cache = self._materialize_mtp_device_kv_cache()
-        if kv_cache is None:
-            raise RuntimeError("DeepSeekV4 MTP KV cache is unavailable")
-        values = dict(self._mtp_device_weights or buffers.weights)
-        values.update(
-            {
-                "embed_weight": self._materialize_embedding_device_weight(),
-                "main_pre_hc_hidden": self._materialize_main_pre_hc_device(
-                    int(self.load_packed_global_weights().embed_weight.shape[1])
-                ),
-                "tail_pre_hc_pool": self._materialize_mtp_tail_pre_hc_pool(
-                    int(self.load_packed_global_weights().embed_weight.shape[1])
-                ),
-                "accepted_counts": (
-                    staged["mtp_accepted_counts"] if staged is not None else buffers.decode_accepted_counts
-                ),
-                "tail_slot_ids": tail_slot_ids,
-                "position_ids": (
-                    staged["mtp_committed_position_ids"]
-                    if staged is not None
-                    else buffers.decode_position_ids
-                ),
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": kv_cache,
-                "ori_block_table": (
-                    inputs.block_table
-                    if inputs is not None
-                    else self._require_decode_buffers().tensors["block_table"]
-                ),
-                "input_ids": (
-                    staged["mtp_committed_input_ids"]
-                    if staged is not None
-                    else buffers.decode_input_ids
-                ),
-                "lm_head_weight": self._static_lm_head_weight_tensor(),
-                "hidden_out": (
-                    staged["mtp_hidden_out"] if staged is not None else buffers.decode_hidden_out
-                ),
-                "next_pre_hc_hidden": (
-                    staged["mtp_pre_hc_out"] if staged is not None else buffers.decode_pre_hc_out
-                ),
-                "logits": staged["mtp_logits"] if staged is not None else buffers.decode_logits,
-                "sampled_ids": (
-                    staged["mtp_sampled_ids"] if staged is not None else buffers.decode_sampled_ids
-                ),
-                "logit_row_indices": logit_row_indices,
-            }
-        )
+        """Build the standalone or fused ``l3_mtp_decode`` tuple from the MTP decode TaskArgs.
+
+        The MTP decode TaskArgs registers the full ``_FUSED_MTP_DECODE_TENSOR_ORDER``
+        (it owns the per-ping-pong-slot reclaimed outputs and write-only outputs as
+        host slots; the strip-shared main-decode handles, MTP kv_cache / tail pool /
+        recurrent state, and weights are lazy sources resolved at ``build()`` time).
+        The standalone arbitrary-depth path passes the kernel the same args minus
+        the three fused-only device-state args (``state_generations``,
+        ``state_tokens``, ``state_meta``); the fused K=1 path is assembled by
+        ``_fused_mtp_decode_args`` instead.  When ``inputs`` is None the recurrent
+        MTP path has already staged the per-slot buffers directly.
+        """
+        buffer_slot = inputs.buffer_slot if inputs is not None else 0
+        mtp_ta = self._mtp_decode_task_args[buffer_slot]
+        built = mtp_ta.build()
         if include_device_state:
-            values.update(
-                {
-                    "state_generations": (
-                        inputs.mtp_state_generations
-                        if inputs is not None and inputs.mtp_state_generations is not None
-                        else buffers.decode_state_generations
-                    ),
-                    "state_tokens": self._materialize_mtp_device_state_tokens(),
-                    "state_meta": self._materialize_mtp_device_state_meta(),
-                }
-            )
-        values = self._mark_resident_args(values, _MTP_DECODE_RESIDENT_POLICY)
-        tensor_order = (
-            _FUSED_MTP_DECODE_TENSOR_ORDER
-            if include_device_state
-            else _MTP_DECODE_TENSOR_ORDER
+            return built
+        excluded = {"state_generations", "state_tokens", "state_meta"}
+        return tuple(
+            arg
+            for name, arg in zip(mtp_ta.names, built, strict=True)
+            if name not in excluded
         )
-        return self._ordered_layer_args(values, tensor_order)
 
     def _fused_mtp_decode_args(
         self,
@@ -3495,19 +2703,29 @@ class DeepSeekV4ModelRunner(ModelRunner):
         inputs: DeepSeekV4PreparedDecodeInputs,
         active_tokens: int,
     ) -> tuple[Any, ...]:
-        """Append the non-shared MTP arguments to the main decode arguments."""
-        buffers = self._require_mtp_buffers()
-        mtp_args = self._mtp_decode_args(inputs, include_device_state=True)
-        fused_mtp_args = tuple(
+        """Stitch the main decode tuple with the MTP-only args + tail prepend + scalar.
+
+        The MTP decode TaskArgs owns every ``_FUSED_MTP_DECODE_TENSOR_ORDER`` arg;
+        the shared names (embed/freqs/lm_head/ori_block_table/main_pre_hc_hidden)
+        are stripped because the fused kernel takes them from the main decode
+        tuple.  The tail token ids / positions are fused-only prepend buffers (not
+        in the MTP arg order) and stay in ``_decode_input_slots``.
+        """
+        from pypto_serving.model.deepseek.task_args import _FUSED_MTP_SHARED_TENSORS  # noqa: PLC0415
+
+        mtp_ta = self._mtp_decode_task_args[inputs.buffer_slot]
+        mtp_args = mtp_ta.build()
+        mtp_only = tuple(
             arg
-            for name, arg in zip(_FUSED_MTP_DECODE_TENSOR_ORDER, mtp_args, strict=True)
+            for name, arg in zip(mtp_ta.names, mtp_args, strict=True)
             if name not in _FUSED_MTP_SHARED_TENSORS
         )
+        staged = self._decode_input_slots[inputs.buffer_slot]
         return (
             *main_args,
-            self._decode_input_slots[inputs.buffer_slot]["mtp_tail_token_ids"],
-            self._decode_input_slots[inputs.buffer_slot]["mtp_tail_positions"],
-            *fused_mtp_args,
+            staged["mtp_tail_token_ids"],
+            staged["mtp_tail_positions"],
+            *mtp_only,
             self._int32_scalar(active_tokens),
         )
 
@@ -3518,19 +2736,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         vocab_size: int,
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Bind all steady L3 arguments on the prepare lane."""
-        staged = self._decode_input_slots[inputs.buffer_slot]
-        if staged["logits"].shape[-1] != int(vocab_size):
-            raise ValueError("prepared decode logits buffer does not match the model vocabulary")
-        hidden_buffer = staged["hidden_out"]
-        pre_hc_hidden_buffer = self._materialize_main_pre_hc_device(hidden_size)
-        logits_buffer = staged["logits"]
-        main_args = self._decode_fwd_args(
-            inputs,
-            pre_hc_hidden_buffer,
-            hidden_buffer,
-            logits_buffer,
-            staged["sampled_ids"],
-        )
+        main_args = self._decode_fwd_args(inputs)
         active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
         return replace(
             inputs,
@@ -3558,25 +2764,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             embed = self._compiled.weight_store.load_tensor("embed.weight").contiguous().cpu()
             self._compiled.embedding_weight = embed
         return embed.index_select(0, token_ids.detach().cpu().to(torch.long).reshape(-1)).to(dtype)
-
-    def _main_speculative_batch(
-        self,
-        model: RuntimeModel,
-        batch: DecodeBatch,
-        draft_token_ids: torch.Tensor,
-    ) -> DecodeBatch:
-        actual_batch = len(batch.request_ids)
-        draft = draft_token_ids[:actual_batch].detach().cpu().to(torch.long)
-        current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
-        corrected_seq_lens = self._correct_mtp_seq_lens(batch)
-        return replace(
-            batch,
-            token_ids=draft.reshape(actual_batch, 1),
-            hidden_states=None,
-            prev_token_ids=current,
-            prev_hidden_states=None,
-            seq_lens=corrected_seq_lens + 1,
-        )
 
     def _device_state_placeholder_batch(self, batch: DecodeBatch) -> DecodeBatch:
         """Build valid fallback rows; the fused kernel replaces every active row."""
@@ -3752,7 +2939,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if previous_hidden.shape[0] != actual_batch:
             raise ValueError("MTP recurrent hidden rows must align with active requests")
 
-        buffers = self._require_mtp_buffers()
+        self._require_mtp_buffers()  # validates the MTP buffers are staged
+        mtp_slots = self._mtp_decode_task_args[0].tensors
         assignment = self._decode_assignment(batch)
         token_ids = token_ids.detach().cpu().to(torch.long).reshape(actual_batch)
         positions = positions.detach().cpu().to(torch.int32).reshape(actual_batch)
@@ -3776,11 +2964,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
 
             fallback_index = wave_indices[0]
-            buffers.decode_input_ids.fill_(int(token_ids[fallback_index]))
-            buffers.decode_position_ids.fill_(int(positions[fallback_index]))
-            buffers.decode_accepted_counts.fill_(1)
-            buffers.decode_tail_slot_ids.fill_(-1)
-            buffers.decode_logit_row_indices.fill_(-1)
+            mtp_slots["input_ids"].fill_(int(token_ids[fallback_index]))
+            mtp_slots["position_ids"].fill_(int(positions[fallback_index]))
+            mtp_slots["accepted_counts"].fill_(1)
+            mtp_slots["tail_slot_ids"].fill_(-1)
+            mtp_slots["logit_row_indices"].fill_(-1)
             for rank, request_index in wave_items:
                 state = self._require_mtp_request_state(batch.request_ids[request_index])
                 self._write_mtp_tail_hidden(
@@ -3788,10 +2976,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     rank,
                     previous_hidden[request_index],
                 )
-                buffers.decode_input_ids[rank, 0] = int(token_ids[request_index])
-                buffers.decode_position_ids[rank, 0] = int(positions[request_index])
-                buffers.decode_tail_slot_ids[rank, 0] = int(state.tail_slot_id)
-                buffers.decode_logit_row_indices[rank, 0] = 0
+                mtp_slots["input_ids"][rank, 0] = int(token_ids[request_index])
+                mtp_slots["position_ids"][rank, 0] = int(positions[request_index])
+                mtp_slots["tail_slot_ids"][rank, 0] = int(state.tail_slot_id)
+                mtp_slots["logit_row_indices"][rank, 0] = 0
 
             with profile_span(
                 "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
@@ -3806,17 +2994,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
             for rank, request_index in wave_items:
                 next_tokens[request_index] = int(
-                    buffers.decode_sampled_ids[rank, 0, 0].item()
+                    mtp_slots["sampled_ids"][rank, 0, 0].item()
                 )
                 next_hidden[request_index] = (
-                    buffers.decode_pre_hc_out[rank, 0].detach().cpu().clone()
+                    mtp_slots["next_pre_hc_hidden"][rank, 0].detach().cpu().clone()
                 )
 
         if any(token is None for token in next_tokens) or any(
             hidden is None for hidden in next_hidden
         ):
             raise RuntimeError("recurrent MTP decoding left incomplete request state")
-        self._mtp_decode_inputs_initialized = True
         return (
             torch.tensor(next_tokens, dtype=torch.long),
             torch.stack(next_hidden),
@@ -3860,7 +3047,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 raise ValueError(f"decode row {request_index} is missing grouped KV blocks: ori")
             active_ori_ids[request_index] = ori_ids
 
-        block_tables = self._require_decode_buffers().tensors["block_table"]
+        block_tables = self._decode_task_args[0].tensors["block_table"]
         for rank in range(layout.ranks):
             request_index = requests_by_rank.get(rank)
             if request_index is None:
@@ -3881,7 +3068,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
-            self._copy_shared(
+            copy_shared(
                 block_tables[rank],
                 self.cache_metadata.paged_ori_block_table_from_ids(padded_ids),
                 name=f"mtp_recurrent_block_table_rank{rank}",
@@ -3919,27 +3106,30 @@ class DeepSeekV4ModelRunner(ModelRunner):
         shifted_hidden = torch.zeros_like(context.hidden_states, dtype=torch.bfloat16)
         shifted_hidden[: n - 1].copy_(context.hidden_states[1:n].to(torch.bfloat16))
         shifted_hidden[n - 1].copy_(first_hidden)
-        buffers.prefill_hidden_in.copy_(
+        ta = self._mtp_prefill_task_args
+        ta.tensors["hidden_states"].copy_(
             shifted_hidden.unsqueeze(0).expand(layout.ranks, -1, -1)
         )
-        buffers.prefill_prev_hidden_in.copy_(
+        ta.tensors["prev_hidden_states"].copy_(
             context.prev_hidden_states.unsqueeze(0).expand(layout.ranks, -1, -1, -1)
         )
 
         shifted_ids = context.input_ids.clone()
         shifted_ids[: n - 1].copy_(context.input_ids[1:n])
         shifted_ids[n - 1].copy_(first_token[0])
-        buffers.prefill_input_ids.copy_(shifted_ids.unsqueeze(0).expand(layout.ranks, -1))
-        buffers.prefill_position_ids.copy_(
+        ta.tensors["input_ids"].copy_(shifted_ids.unsqueeze(0).expand(layout.ranks, -1))
+        ta.tensors["position_ids"].copy_(
             context.position_ids.unsqueeze(0).expand(layout.ranks, -1)
         )
-        buffers.prefill_block_table.copy_(
+        ta.tensors["ori_block_table"].copy_(
             context.block_table.unsqueeze(0).expand(layout.ranks, -1)
         )
-        buffers.prefill_slot_mapping.fill_(-1)
-        buffers.prefill_slot_mapping[owner_rank].copy_(context.slot_mapping)
-        buffers.prefill_logit_row_indices.fill_(-1)
-        buffers.prefill_logit_row_indices[owner_rank, 0] = n - 1
+        ori_slot_mapping = ta.tensors["ori_slot_mapping"]
+        ori_slot_mapping.fill_(-1)
+        ori_slot_mapping[owner_rank].copy_(context.slot_mapping)
+        logit_row_indices = ta.tensors["logit_row_indices"]
+        logit_row_indices.fill_(-1)
+        logit_row_indices[owner_rank, 0] = n - 1
         with profile_span(
             "DeepSeekV4ModelRunner.mtp.prefill.l3_dispatch",
             cat="executor",
@@ -3966,8 +3156,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
         state.tail_position = int(context.position_ids[n - 1].item())
         self._initialize_mtp_device_state(state)
         state.prompt_len = n
+        # The MTP prefill pre-HC output is a device-resident TaskArgs slot; read
+        # the whole owner shard back into the host mirror (a raw D2H copy from an
+        # offset device pointer is unsupported) and select the seed row.
+        self._shared_l3_worker().copy_stacked_from(
+            self._mtp_prefill_task_args.tensors["pre_hc_hidden_out"],
+            buffers.prefill_pre_hc_mirror,
+        )
         state.draft_pre_hc_hidden = (
-            buffers.prefill_pre_hc_out[owner_rank, n - 1].detach().cpu().clone()
+            buffers.prefill_pre_hc_mirror[owner_rank, n - 1].detach().cpu().clone()
         )
         state.draft_position = int(context.position_ids[n - 1].item()) + 1
         state.prefill_context = None
@@ -4038,183 +3235,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         state.device_state_initialized = True
 
-    def _mtp_committed_window(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        main_ids: torch.Tensor,
-        *,
-        request_index: int,
-        accepted_count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build one request's fixed MTP window from committed outputs only."""
-        layout = self._compiled.layout
-        request_id = inputs.request_ids[request_index]
-        state = self._require_mtp_request_state(request_id)
-        owner_rank = inputs.ranks[request_index]
-        row_start = inputs.local_rows[request_index] * layout.decode_seq
-        row_slice = slice(row_start, row_start + layout.decode_seq)
-        if accepted_count == layout.decode_seq:
-            return (
-                main_ids[request_index, :layout.decode_seq].detach().cpu().to(torch.long),
-                inputs.position_ids[owner_rank, row_slice].detach().cpu().to(torch.int32),
-            )
-        if accepted_count != 1 or layout.decode_seq != 2:
-            raise ValueError(
-                "DeepSeekV4 MTP currently supports next_n=1 acceptance only; "
-                f"got accepted_count={accepted_count}, decode_seq={layout.decode_seq}"
-            )
-        if (
-            state.tail_token_id is None
-            or state.tail_slot_id is None
-            or state.tail_position is None
-        ):
-            raise RuntimeError(f"DeepSeekV4 MTP committed tail is not initialized for {request_id!r}")
-        return (
-            torch.tensor(
-                (state.tail_token_id, int(main_ids[request_index, 0].item())),
-                dtype=torch.long,
-            ),
-            torch.tensor(
-                (state.tail_position, int(inputs.position_ids[owner_rank, row_start].item())),
-                dtype=torch.int32,
-            ),
-        )
-
-    def _advance_mtp_drafts(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        main_ids: torch.Tensor,
-        *,
-        accepted_counts: Sequence[int],
-    ) -> None:
-        """Run one packed MTP decode and scatter new draft state by request ID."""
-        if len(accepted_counts) != inputs.actual_batch:
-            raise ValueError("MTP accepted counts must align with active requests")
-        buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
-        with profile_span("DeepSeekV4ModelRunner.mtp.commit_windows", cat="executor"):
-            committed = [
-                self._mtp_committed_window(
-                    inputs,
-                    main_ids,
-                    request_index=index,
-                    accepted_count=int(accepted_counts[index]),
-                )
-                for index in range(inputs.actual_batch)
-            ]
-        active_tokens = self._stage_mtp_decode_inputs(inputs, committed, accepted_counts)
-        # The MTP pl.Out tensors follow the same overwrite contract as the main
-        # decode outputs, so no host-side clear is required before dispatch.
-        with profile_span(
-            "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
-            cat="executor",
-            args={"actual_tokens": active_tokens},
-        ):
-            self._run_l3(
-                self._require_mtp_decode_callable(),
-                *self._mtp_decode_args(),
-                self._int32_scalar(active_tokens),
-            )
-        for request_index, request_id in enumerate(inputs.request_ids):
-            state = self._require_mtp_request_state(request_id)
-            committed_ids, committed_positions = committed[request_index]
-            state.draft_token_id = int(
-                buffers.decode_sampled_ids[
-                    inputs.ranks[request_index],
-                    inputs.local_rows[request_index],
-                    0,
-                ].item()
-            )
-            state.tail_token_id = int(committed_ids[-1].item())
-            state.tail_position = int(committed_positions[-1].item())
-
-    def _stage_mtp_decode_inputs(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        committed: Sequence[tuple[torch.Tensor, torch.Tensor]],
-        accepted_counts: Sequence[int],
-    ) -> int:
-        """Stage compact committed windows into persistent MTP decode buffers."""
-        buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
-        fallback_ids, fallback_positions = committed[0]
-        active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
-        fill_tokens = (
-            layout.decode_tokens
-            if not self._mtp_decode_inputs_initialized
-            else active_tokens
-        )
-        fill_rows = fill_tokens // layout.decode_seq
-
-        with profile_span("DeepSeekV4ModelRunner.mtp.pack_inputs", cat="executor"):
-            fallback_id_rows = fallback_ids.repeat(fill_rows)
-            fallback_position_rows = fallback_positions.repeat(fill_rows)
-            buffers.decode_input_ids[:, :fill_tokens].copy_(
-                fallback_id_rows.unsqueeze(0).expand(layout.ranks, -1)
-            )
-            buffers.decode_position_ids[:, :fill_tokens].copy_(
-                fallback_position_rows.unsqueeze(0).expand(layout.ranks, -1)
-            )
-            buffers.decode_accepted_counts.fill_(1)
-            buffers.decode_tail_slot_ids.fill_(-1)
-            for request_index, (rank, local_row) in enumerate(
-                zip(inputs.ranks, inputs.local_rows, strict=True)
-            ):
-                row_start = local_row * layout.decode_seq
-                row_slice = slice(row_start, row_start + layout.decode_seq)
-                ids, positions = committed[request_index]
-                buffers.decode_input_ids[rank, row_slice].copy_(ids)
-                buffers.decode_position_ids[rank, row_slice].copy_(positions)
-                state = self._require_mtp_request_state(inputs.request_ids[request_index])
-                if state.tail_slot_id is None:
-                    raise RuntimeError(
-                        f"DeepSeekV4 MTP tail slot is missing for {inputs.request_ids[request_index]!r}"
-                    )
-                buffers.decode_accepted_counts[rank, local_row] = int(
-                    accepted_counts[request_index]
-                )
-                buffers.decode_tail_slot_ids[rank, local_row] = state.tail_slot_id
-        buffers.decode_logit_row_indices.fill_(-1)
-        for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True):
-            buffers.decode_logit_row_indices[rank, local_row] = (
-                local_row * layout.decode_seq + layout.decode_seq - 1
-            )
-        self._mtp_decode_inputs_initialized = True
-        return active_tokens
-
-    def _stage_fused_mtp_metadata(self, inputs: DeepSeekV4PreparedDecodeInputs) -> int:
-        """Bind active rows to stable device-state generations."""
-        buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
-        buffers.decode_tail_slot_ids.fill_(-1)
-        buffers.decode_state_generations.zero_()
-        buffers.decode_logit_row_indices.fill_(-1)
-        for request_id, rank, local_row in zip(
-            inputs.request_ids,
-            inputs.ranks,
-            inputs.local_rows,
-            strict=True,
-        ):
-            state = self._require_mtp_request_state(request_id)
-            if (
-                state.tail_slot_id is None
-                or not state.device_state_initialized
-            ):
-                raise RuntimeError(
-                    f"DeepSeekV4 MTP committed tail is not initialized for {request_id!r}"
-                )
-            if state.tail_rank != rank:
-                raise RuntimeError(
-                    f"DeepSeekV4 MTP state rank changed for {request_id!r}: "
-                    f"slot rank={state.tail_rank}, decode rank={rank}"
-                )
-            buffers.decode_tail_slot_ids[rank, local_row] = state.tail_slot_id
-            buffers.decode_state_generations[rank, local_row] = state.generation
-            buffers.decode_logit_row_indices[rank, local_row] = (
-                local_row * layout.decode_seq + layout.decode_seq - 1
-            )
-        return max(inputs.per_rank_counts) * layout.decode_seq
-
     def _prepare_mtp_device_state_descriptors(
         self,
         inputs: DeepSeekV4PreparedDecodeInputs,
@@ -4235,10 +3255,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         """
         if self._compiled.num_speculative_tokens != 1:
             return inputs
-        staged = self._decode_input_slots[inputs.buffer_slot]
-        tail_slot_ids = staged["mtp_tail_slot_ids"]
-        state_generations = staged["mtp_state_generations"]
-        logit_row_indices = staged["mtp_logit_row_indices"]
+        staged = self._mtp_decode_task_args[inputs.buffer_slot].tensors
+        tail_slot_ids = staged["tail_slot_ids"]
+        state_generations = staged["state_generations"]
+        logit_row_indices = staged["logit_row_indices"]
         tail_slot_ids.fill_(-1)
         state_generations.zero_()
         logit_row_indices.fill_(-1)
@@ -4290,176 +3310,84 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError("DeepSeekV4 stacked decode weights are not available")
         return DeepSeekV4StackedLayerWeights(tensors=tensors)
 
-    def _ordered_layer_args(self, values: dict[str, Any], names: Sequence[str]) -> tuple[Any, ...]:
-        missing = [name for name in names if name not in values]
-        if missing:
-            raise KeyError(f"DeepSeekV4 layer dispatch is missing tensors: {', '.join(missing)}")
-        return tuple(values[name] for name in names)
+    def _ensure_decode_buffers(self, hidden_size: int, vocab_size: int = DEEPSEEK_V4_VOCAB_SIZE) -> None:
+        """Allocate the decode TaskArgs (host-shared slots) and MTP reclaim slots.
 
-    def _ensure_decode_buffers(self, hidden_size: int) -> _DeepSeekV4DecodeSharedBuffers:
-        buffers = self._decode_buffers
-        if buffers is None:
-            self._ensure_shared_host_allocation_before_worker("decode inputs")
-            layout = self._compiled.layout
-            ranks = layout.ranks
-            batch = layout.decode_batch
-            tokens = layout.decode_tokens
+        Runs before the L3 worker forks so the fork-inherited host shared memory
+        carries every buffer the chip workers read.  The device-resident pre-HC
+        output slot is allocated lazily at first dispatch (post-fork) by
+        ``_decode_fwd_args``.
+        """
+        if self._decode_task_args:
+            return
+        self._ensure_shared_host_allocation_before_worker("decode inputs")
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        batch = layout.decode_batch
 
-            def allocate_input_slot(slot: int) -> dict[str, torch.Tensor]:
+        from pypto_serving.model.deepseek.task_args import (  # noqa: PLC0415
+            decode_task_args,
+            mtp_decode_task_args,
+        )
+
+        # Two execution snapshots let the command thread prepare step N+1 while
+        # the device thread consumes step N.  Worker slot ownership is released
+        # only after output reclaim has finished reading the slot.  The
+        # ``_DECODE_FWD_TENSOR_ORDER`` buffers (metadata inputs, sampled_ids,
+        # hidden/logits outputs) are owned by the decode TaskArgs; the
+        # device-resident pre-HC output is a device slot on the same TaskArgs.
+        self._decode_task_args = []
+        for slot in (0, 1):
+            task_args = decode_task_args(self, int(hidden_size), int(vocab_size))
+            task_args.allocate_host_shared(None)
+            self._decode_task_args.append(task_args)
+
+        # MTP decode TaskArgs (one per ping-pong slot) own the
+        # ``_MTP_DECODE_TENSOR_ORDER`` reclaimed + write-only outputs.  The fused
+        # prepend buffers (tail token ids / positions) are not part of the kernel
+        # arg order, so they stay in ``_decode_input_slots``.
+        legacy_mtp = (
+            self._compiled.mtp_prefill is not None
+            and self._compiled.mtp_decode is not None
+        )
+        if self._compiled.num_speculative_tokens or legacy_mtp:
+            self._mtp_decode_task_args = []
+            for slot in (0, 1):
+                mtp_ta = mtp_decode_task_args(self, int(hidden_size))
+                mtp_ta.allocate_host_shared(None)
+                self._mtp_decode_task_args.append(mtp_ta)
+
+            def allocate_mtp_prepend_slot(slot: int) -> dict[str, torch.Tensor]:
                 prefix = f"decode_slot{slot}"
                 return {
-                    "input_ids": self._shared_empty(
-                        (ranks, tokens), torch.long, name=f"{prefix}_input_ids"
+                    "mtp_tail_token_ids": shared_empty(
+                        (ranks, batch), torch.long, name=f"{prefix}_mtp_tail_token_ids"
                     ),
-                    "position_ids": self._shared_empty(
-                        (ranks, tokens), torch.int32, name=f"{prefix}_position_ids"
-                    ),
-                    "kv_seq_lens": self._shared_empty(
-                        (ranks, batch), torch.int32, name=f"{prefix}_kv_seq_lens"
-                    ),
-                    "block_table": self._shared_empty(
-                        (ranks, batch, layout.ori_table_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_block_table",
-                    ),
-                    "cmp_block_table": self._shared_empty(
-                        (ranks, batch, layout.cmp_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_cmp_block_table",
-                    ),
-                    "idx_block_table": self._shared_empty(
-                        (ranks, batch, layout.idx_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_idx_block_table",
-                    ),
-                    "hca_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_hca_state_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_hca_compress_state_block_table",
-                    ),
-                    "csa_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_csa_state_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_csa_compress_state_block_table",
-                    ),
-                    "csa_inner_compress_state_block_table": self._shared_empty(
-                        (ranks, batch, layout.prefill_csa_inner_state_max_blocks),
-                        torch.int32,
-                        name=f"{prefix}_csa_inner_compress_state_block_table",
-                    ),
-                    "block_counts": self._shared_empty(
-                        (ranks, batch, len(DEEPSEEK_V4_CACHE_GROUP_NAMES)),
-                        torch.int32,
-                        name=f"{prefix}_block_counts",
-                    ),
-                    "num_tokens_per_owner": self._shared_empty(
-                        (ranks,), torch.int32, name=f"{prefix}_num_tokens_per_owner"
-                    ),
-                    "logit_row_indices": self._shared_empty(
-                        (ranks, tokens),
-                        torch.int32,
-                        name=f"{prefix}_logit_row_indices",
-                    ),
-                    "mtp_tail_slot_ids": self._shared_empty(
-                        (ranks, batch),
-                        torch.int32,
-                        name=f"{prefix}_mtp_tail_slot_ids",
-                    ),
-                    "mtp_state_generations": self._shared_empty(
-                        (ranks, batch),
-                        torch.int32,
-                        name=f"{prefix}_mtp_state_generations",
-                    ),
-                    "mtp_logit_row_indices": self._shared_empty(
-                        (ranks, tokens),
-                        torch.int32,
-                        name=f"{prefix}_mtp_logit_row_indices",
-                    ),
-                    # Host-reclaimed outputs must follow the same ping-pong
-                    # lifetime as inputs.  Step N+1 may write slot 1 while the
-                    # output lane is still reading step N from slot 0.
-                    "sampled_ids": self._shared_empty(
-                        (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD),
-                        torch.int32,
-                        name=f"{prefix}_sampled_ids",
-                    ),
-                    "mtp_accepted_counts": self._shared_empty(
-                        (ranks, batch),
-                        torch.int32,
-                        name=f"{prefix}_mtp_accepted_counts",
-                    ),
-                    "mtp_sampled_ids": self._shared_empty(
-                        (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD),
-                        torch.int32,
-                        name=f"{prefix}_mtp_sampled_ids",
-                    ),
-                    "mtp_committed_input_ids": self._shared_empty(
-                        (ranks, tokens),
-                        torch.long,
-                        name=f"{prefix}_mtp_committed_input_ids",
-                    ),
-                    "mtp_committed_position_ids": self._shared_empty(
-                        (ranks, tokens),
-                        torch.int32,
-                        name=f"{prefix}_mtp_committed_position_ids",
-                    ),
-                    "mtp_tail_token_ids": self._shared_empty(
-                        (ranks, batch),
-                        torch.long,
-                        name=f"{prefix}_mtp_tail_token_ids",
-                    ),
-                    "mtp_tail_positions": self._shared_empty(
-                        (ranks, batch),
-                        torch.int32,
-                        name=f"{prefix}_mtp_tail_positions",
-                    ),
-                    # PyPTO asynchronous handles retain mutable bindings until
-                    # completion. Keep every Host Out tensor slot-local, not
-                    # only the small outputs consumed by reclaim.
-                    "hidden_out": self._shared_empty(
-                        (ranks, tokens, int(hidden_size)),
-                        torch.bfloat16,
-                        name=f"{prefix}_hidden_out",
-                    ),
-                    "logits": self._shared_empty(
-                        (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
-                        torch.float32,
-                        name=f"{prefix}_logits",
-                    ),
-                    "mtp_hidden_out": self._shared_empty(
-                        (ranks, tokens, int(hidden_size)),
-                        torch.bfloat16,
-                        name=f"{prefix}_mtp_hidden_out",
-                    ),
-                    "mtp_pre_hc_out": self._shared_empty(
-                        (ranks, tokens, layout.hc_mult, int(hidden_size)),
-                        torch.float32,
-                        name=f"{prefix}_mtp_pre_hc_out",
-                    ),
-                    "mtp_logits": self._shared_empty(
-                        (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
-                        torch.float32,
-                        name=f"{prefix}_mtp_logits",
+                    "mtp_tail_positions": shared_empty(
+                        (ranks, batch), torch.int32, name=f"{prefix}_mtp_tail_positions"
                     ),
                 }
 
-            # Two execution snapshots let the command thread prepare step N+1
-            # while the device thread consumes step N. Worker slot ownership is
-            # released only after output reclaim has finished reading the slot.
-            self._decode_input_slots = [allocate_input_slot(0), allocate_input_slot(1)]
-            self._decode_logits_buffer = self._decode_input_slots[0]["logits"]
-            buffers = _DeepSeekV4DecodeSharedBuffers(
-                pre_hc_hidden_out=self._shared_empty(
-                    (ranks, tokens, layout.hc_mult, int(hidden_size)),
-                    torch.float32,
-                    name="decode_pre_hc_hidden_out",
-                ),
-                x_out=self._decode_input_slots[0]["hidden_out"],
-                sampled_ids=self._decode_input_slots[0]["sampled_ids"],
-                tensors=self._decode_input_slots[0],
-            )
-            self._decode_buffers = buffers
-        return buffers
+            self._decode_input_slots = [allocate_mtp_prepend_slot(0), allocate_mtp_prepend_slot(1)]
+        else:
+            self._decode_input_slots = []
+
+        # Host mirror for the device-resident main decode pre-HC output.  The
+        # arbitrary-depth target-verification path reads committed pre-HC rows on
+        # the host (``copy_stacked_from`` cannot target an offset device pointer),
+        # so one ping-pong-independent shared buffer holds the D2H readback.  It is
+        # not a kernel argument and therefore lives outside the decode TaskArgs.
+        self._main_pre_hc_host_mirror = shared_empty(
+            (ranks, layout.decode_tokens, layout.hc_mult, int(hidden_size)),
+            torch.float32,
+            name="decode_main_pre_hc_host_mirror",
+        )
+
+    def _require_main_pre_hc_host_mirror(self) -> torch.Tensor:
+        """Return the host mirror used for the arbitrary-depth pre-HC readback."""
+        if self._main_pre_hc_host_mirror is None:
+            raise RuntimeError("DeepSeekV4 main decode pre-HC host mirror is not staged")
+        return self._main_pre_hc_host_mirror
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
         """Load immutable MTP weights and allocate mutable shared buffers before worker fork."""
@@ -4474,7 +3402,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._ensure_shared_host_allocation_before_worker("mtp buffers")
         layout = self._compiled.layout
         ranks = layout.ranks
-        tokens = layout.decode_tokens
         hidden = int(hidden_size)
         self._ensure_decode_buffers(hidden)
         loaded = self.load_mtp_weights()
@@ -4482,188 +3409,47 @@ class DeepSeekV4ModelRunner(ModelRunner):
         # The real MTP pool is allocated directly on each worker after runtime
         # HBM sizing. Keep only a one-page shared placeholder here so legacy
         # buffer consumers retain the unified prefill/decode object contract.
-        mtp_kv_cache = self._shared_empty(
+        mtp_kv_cache = shared_empty(
             (ranks, 1, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
             torch.bfloat16,
             name="mtp_kv_cache_placeholder",
         )
         self._mtp_buffers = _DeepSeekV4MtpSharedBuffers(
             weights=weights,
-            prefill_hidden_in=self._shared_empty(
-                (ranks, layout.prefill_seq, hidden), torch.bfloat16, name="mtp_prefill_hidden_in"
-            ),
-            prefill_prev_hidden_in=self._shared_empty(
-                (ranks, layout.prefill_seq, layout.hc_mult, hidden),
-                torch.float32,
-                name="mtp_prefill_prev_hidden_in",
-            ),
-            prefill_input_ids=self._shared_empty(
-                (ranks, layout.prefill_seq), torch.long, name="mtp_prefill_input_ids"
-            ),
-            prefill_position_ids=self._shared_empty(
-                (ranks, layout.prefill_seq), torch.int32, name="mtp_prefill_position_ids"
-            ),
-            prefill_block_table=self._shared_empty(
-                (ranks, layout.prefill_ori_max_blocks), torch.int32, name="mtp_prefill_block_table"
-            ),
-            prefill_slot_mapping=self._shared_empty(
-                (ranks, layout.prefill_seq), torch.long, name="mtp_prefill_slot_mapping"
-            ),
             prefill_kv_cache=mtp_kv_cache,
-            decode_input_ids=self._shared_empty(
-                (ranks, tokens), torch.long, name="mtp_decode_input_ids"
-            ),
-            decode_position_ids=self._shared_empty(
-                (ranks, tokens), torch.int32, name="mtp_decode_position_ids"
-            ),
-            decode_accepted_counts=self._shared_empty(
-                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_accepted_counts"
-            ),
-            decode_tail_slot_ids=self._shared_empty(
-                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_slot_ids"
-            ),
-            decode_tail_token_ids=self._shared_empty(
-                (ranks, layout.decode_batch), torch.long, name="mtp_decode_tail_token_ids"
-            ),
-            decode_tail_positions=self._shared_empty(
-                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_positions"
-            ),
-            decode_state_generations=self._shared_empty(
-                (ranks, layout.decode_batch), torch.int32, name="mtp_decode_state_generations"
-            ),
-            state_init_tokens=self._shared_empty(
+            state_init_tokens=shared_empty(
                 (ranks, layout.decode_batch, _MTP_DEVICE_STATE_TOKEN_WIDTH),
                 torch.long,
                 name="mtp_state_init_tokens",
             ),
-            state_init_meta=self._shared_empty(
+            state_init_meta=shared_empty(
                 (ranks, layout.decode_batch, _MTP_DEVICE_STATE_META_WIDTH),
                 torch.int32,
                 name="mtp_state_init_meta",
             ),
-            tail_init_hidden=self._shared_empty(
+            tail_init_hidden=shared_empty(
                 (ranks, layout.decode_batch, layout.hc_mult, hidden),
                 torch.float32,
                 name="mtp_tail_init_hidden",
             ),
-            decode_kv_cache=mtp_kv_cache,
-            prefill_hidden_out=self._shared_empty(
-                (ranks, layout.prefill_seq, hidden), torch.bfloat16, name="mtp_prefill_hidden_out"
-            ),
-            prefill_pre_hc_out=self._shared_empty(
-                (ranks, layout.prefill_seq, layout.hc_mult, hidden),
-                torch.float32,
-                name="mtp_prefill_pre_hc_out",
-            ),
-            prefill_logits=self._shared_empty(
+            prefill_logits=shared_empty(
                 (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
                 torch.float32,
                 name="mtp_prefill_logits",
             ),
-            prefill_logit_row_indices=self._shared_empty(
-                (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
-                torch.int32,
-                name="mtp_prefill_logit_row_indices",
-            ),
-            decode_hidden_out=self._shared_empty(
-                (ranks, tokens, hidden), torch.bfloat16, name="mtp_decode_hidden_out"
-            ),
-            decode_pre_hc_out=self._shared_empty(
-                (ranks, tokens, layout.hc_mult, hidden),
+            prefill_pre_hc_mirror=shared_empty(
+                (ranks, layout.prefill_seq, layout.hc_mult, hidden),
                 torch.float32,
-                name="mtp_decode_pre_hc_out",
-            ),
-            decode_logits=self._shared_empty(
-                (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
-                torch.float32,
-                name="mtp_decode_logits",
-            ),
-            decode_sampled_ids=self._shared_empty(
-                (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD),
-                torch.int32,
-                name="mtp_decode_sampled_ids",
-            ),
-            decode_logit_row_indices=self._shared_empty(
-                (ranks, tokens), torch.int32, name="mtp_decode_logit_row_indices"
+                name="mtp_prefill_pre_hc_mirror",
             ),
         )
+        # MTP prefill host inputs + device outputs live on the prefill TaskArgs.
+        from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args  # noqa: PLC0415
+
+        self._mtp_prefill_task_args = mtp_prefill_task_args(self, hidden)
+        self._mtp_prefill_task_args.allocate_host_shared(None)
         self._mtp_buffers.prefill_kv_cache.zero_()
-        self._mtp_decode_inputs_initialized = False
         return self._mtp_buffers
-
-    def _ensure_prefill_fwd_buffers(self, hidden_size: int) -> _DeepSeekV4PrefillFwdSharedBuffers:
-        """Allocate the layer-stacked shared buffers for the packed prefill dispatch."""
-        buffers = self._prefill_fwd_buffers
-        if buffers is not None:
-            return buffers
-        self._ensure_shared_host_allocation_before_worker("prefill_fwd buffers")
-        layout = self._compiled.layout
-        ranks = layout.ranks
-        seq = layout.prefill_seq
-        hidden = int(hidden_size)
-        rope_profiles = self._compiled.freqs_cos.shape[0] if self._compiled.freqs_cos is not None else 0
-        max_seq_len = self._compiled.freqs_cos.shape[1] if self._compiled.freqs_cos is not None else 0
-        rope_dim = self._compiled.freqs_cos.shape[-1] if self._compiled.freqs_cos is not None else 0
-
-        def shared(shape, dtype, name):
-            return self._shared_empty(shape, dtype, name=name)
-
-        tensors: dict[str, torch.Tensor] = {
-            "hca_compress_state_block_table": shared(
-                (ranks, layout.prefill_hca_state_max_blocks), torch.int32, "prefill_fwd_hca_state_block_table"
-            ),
-            "csa_compress_state_block_table": shared(
-                (ranks, layout.prefill_csa_state_max_blocks), torch.int32, "prefill_fwd_csa_state_block_table"
-            ),
-            "csa_inner_compress_state_block_table": shared(
-                (ranks, layout.prefill_csa_inner_state_max_blocks), torch.int32, "prefill_fwd_csa_inner_state_block_table"
-            ),
-            # Shared single per-rank metadata (the kernel passes each whole tensor
-            # to every layer).
-            "ori_block_table": shared(
-                (ranks, layout.prefill_ori_max_blocks), torch.int32, "prefill_fwd_ori_block_table"
-            ),
-            "ori_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_ori_slot_mapping"),
-            "cmp_block_table": shared((ranks, layout.prefill_cmp_max_blocks), torch.int32, "prefill_fwd_cmp_block_table"),
-            "idx_block_table": shared((ranks, layout.prefill_idx_max_blocks), torch.int32, "prefill_fwd_idx_block_table"),
-            "position_ids": shared((ranks, seq), torch.int32, "prefill_fwd_position_ids"),
-            "hca_cmp_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_hca_cmp_slot_mapping"),
-            "hca_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_hca_state_slot_mapping"),
-            "csa_cmp_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_cmp_slot_mapping"),
-            "csa_idx_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_idx_slot_mapping"),
-            "csa_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_state_slot_mapping"),
-            "csa_inner_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_inner_state_slot_mapping"),
-            "input_ids": shared((ranks, seq), torch.long, "prefill_fwd_input_ids"),
-            "num_tokens_per_owner": shared(
-                (ranks,), torch.int32, "prefill_fwd_num_tokens_per_owner"
-            ),
-            "logit_row_indices": shared(
-                (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
-                torch.int32,
-                "prefill_fwd_logit_row_indices",
-            ),
-        }
-        buffers = _DeepSeekV4PrefillFwdSharedBuffers(
-            x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.float32, "prefill_fwd_x_hc"),
-            freqs_cos=shared(
-                (ranks, rope_profiles, max_seq_len, rope_dim),
-                torch.bfloat16,
-                "prefill_fwd_freqs_cos",
-            ),
-            freqs_sin=shared(
-                (ranks, rope_profiles, max_seq_len, rope_dim),
-                torch.bfloat16,
-                "prefill_fwd_freqs_sin",
-            ),
-            tensors=tensors,
-        )
-        self._prefill_fwd_buffers = buffers
-        return buffers
-
-    def _require_prefill_fwd_buffers(self) -> _DeepSeekV4PrefillFwdSharedBuffers:
-        if self._prefill_fwd_buffers is None:
-            raise RuntimeError("DeepSeekV4 packed prefill shared buffers were not staged")
-        return self._prefill_fwd_buffers
 
     def _stage_prefill_fwd_inputs(self, inputs: DeepSeekV4PreparedPrefillInputs) -> None:
         """Copy one prefill chunk's mutable metadata into shared host buffers.
@@ -4673,53 +3459,32 @@ class DeepSeekV4ModelRunner(ModelRunner):
         are shared single per-rank copies (the kernel slices them per layer
         internally). Cache pools are worker-resident and are not staged here.
         """
-        buffers = self._require_prefill_fwd_buffers()
+        ta = self._prefill_task_args
 
-        # x_hc / output collapse weights.
-        self._copy_shared(buffers.x_hc, inputs.x_hc, name="prefill_fwd_x_hc")
-        self._copy_shared(
-            buffers.freqs_cos,
-            self._static_freqs_cos_table(),
-            name="prefill_fwd_freqs_cos",
+        # x_hc + per-rank metadata (RoPE freqs are static weights on the
+        # TaskArgs, uploaded once -- no per-step staging).
+        ta.stage(
+            {
+                "x_hc": inputs.x_hc,
+                "ori_block_table": inputs.ori_block_table,
+                "ori_slot_mapping": inputs.ori_slot_mapping,
+                "cmp_block_table": inputs.cmp_block_table,
+                "idx_block_table": inputs.idx_block_table,
+                "position_ids": inputs.position_ids,
+                "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
+                "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
+                "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
+                "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
+                "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
+                "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
+                "input_ids": inputs.input_ids,
+                "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
+                "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
+                "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
+                "num_tokens_per_owner": inputs.num_tokens_per_owner,
+                "logit_row_indices": inputs.logit_row_indices,
+            }
         )
-        self._copy_shared(
-            buffers.freqs_sin,
-            self._static_freqs_sin_table(),
-            name="prefill_fwd_freqs_sin",
-        )
-
-        # Shared single per-rank metadata (the kernel slices it per layer).
-        shared_metadata = {
-            "ori_block_table": inputs.ori_block_table,
-            "ori_slot_mapping": inputs.ori_slot_mapping,
-            "cmp_block_table": inputs.cmp_block_table,
-            "idx_block_table": inputs.idx_block_table,
-            "position_ids": inputs.position_ids,
-            "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
-            "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
-            "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
-            "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
-            "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
-            "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
-            "input_ids": inputs.input_ids,
-            "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
-            "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
-            "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
-            "num_tokens_per_owner": inputs.num_tokens_per_owner,
-            "logit_row_indices": inputs.logit_row_indices,
-        }
-        for name, tensor in shared_metadata.items():
-            self._copy_shared(buffers.tensors[name], tensor, name=f"prefill_fwd_{name}")
-
-    def _static_freqs_cos_table(self) -> torch.Tensor:
-        if self._compiled.freqs_cos is None:
-            raise RuntimeError("DeepSeekV4 packed RoPE cosine table is not initialized")
-        return self._rank_stack(self._compiled.freqs_cos)
-
-    def _static_freqs_sin_table(self) -> torch.Tensor:
-        if self._compiled.freqs_sin is None:
-            raise RuntimeError("DeepSeekV4 packed RoPE sine table is not initialized")
-        return self._rank_stack(self._compiled.freqs_sin)
 
     def _retain_stacked_host_weights(
         self,
@@ -4745,7 +3510,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             return buffers
         self._ensure_shared_host_allocation_before_worker("hc_head weights")
         global_weights = self.load_packed_global_weights()
-        ranks = self._compiled.layout.ranks
         # The kernel hc_head_fn is [HC_MULT, HC_DIM]; the checkpoint stores it as
         # [HC_MULT, hidden*HC_MULT] (== [HC_MULT, HC_DIM]). Scale/base are scalars
         # per HC_MULT row, rank-replicated.
@@ -4759,58 +3523,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         }
         self._hc_head_buffers = buffers
         return buffers
-
-    def _require_decode_buffers(self) -> _DeepSeekV4DecodeSharedBuffers:
-        if self._decode_buffers is None:
-            raise RuntimeError("DeepSeekV4 decode shared buffers were not staged")
-        return self._decode_buffers
-
-    def _require_decode_output_buffer(self, hidden_size: int) -> torch.Tensor:
-        return self._ensure_decode_buffers(int(hidden_size)).x_out
-
-    def _require_decode_logits_buffer(self, vocab_size: int) -> torch.Tensor:
-        """Return shared device LM-head logits for every decode owner rank."""
-        layout = self._compiled.layout
-        logits_shape = (layout.ranks, layout.decode_tokens, int(vocab_size))
-        if self._decode_logits_buffer is None:
-            self._ensure_shared_host_allocation_before_worker("decode_logits")
-            self._decode_logits_buffer = self._shared_empty(logits_shape, torch.float32, name="decode_logits")
-        return self._decode_logits_buffer
-
-    def _require_prefill_output_buffer(self, hidden_size: int) -> torch.Tensor:
-        """Return the shared ``[ranks, prefill_seq, hidden]`` prefill hidden output."""
-        layout = self._compiled.layout
-        output_shape = (layout.ranks, layout.prefill_seq, int(hidden_size))
-        if self._prefill_output_buffer is None:
-            self._ensure_shared_host_allocation_before_worker("prefill_output")
-            self._prefill_output_buffer = self._shared_empty(output_shape, torch.bfloat16, name="prefill_output")
-        return self._prefill_output_buffer
-
-    def _require_prefill_pre_hc_output_buffer(self, hidden_size: int) -> torch.Tensor:
-        """Return the main-model final pre-HC rows used to seed MTP prefill."""
-        layout = self._compiled.layout
-        output_shape = (layout.ranks, layout.prefill_seq, layout.hc_mult, int(hidden_size))
-        if self._prefill_pre_hc_output_buffer is None:
-            self._ensure_shared_host_allocation_before_worker("prefill_pre_hc_output")
-            self._prefill_pre_hc_output_buffer = self._shared_empty(
-                output_shape,
-                torch.float32,
-                name="prefill_pre_hc_output",
-            )
-        return self._prefill_pre_hc_output_buffer
-
-    def _require_prefill_logits_buffer(self, vocab_size: int) -> torch.Tensor:
-        """Return shared owner-major selected-row logits for packed prefill."""
-        layout = self._compiled.layout
-        logits_shape = (layout.ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, int(vocab_size))
-        if self._prefill_logits_buffer is None:
-            self._ensure_shared_host_allocation_before_worker("prefill_logits")
-            self._prefill_logits_buffer = self._shared_empty(
-                logits_shape,
-                torch.float32,
-                name="prefill_logits",
-            )
-        return self._prefill_logits_buffer
 
     def _static_final_norm_weight_tensor(self) -> torch.Tensor:
         """Return the worker-resident per-rank final RMSNorm weight ``[ranks, D]``.
@@ -4846,102 +3558,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _static_freqs_cos_tensor(self) -> torch.Tensor:
         if self._static_freqs_cos is None:
+            if self._compiled.freqs_cos is None:
+                raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
             self._ensure_shared_host_allocation_before_worker("freqs_cos")
-            self._static_freqs_cos = self._static_device_tensor(self._static_freqs_cos_table())
+            self._static_freqs_cos = self._static_device_tensor(self._rank_stack(self._compiled.freqs_cos))
         return self._static_freqs_cos
 
     def _static_freqs_sin_tensor(self) -> torch.Tensor:
         if self._static_freqs_sin is None:
+            if self._compiled.freqs_sin is None:
+                raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
             self._ensure_shared_host_allocation_before_worker("freqs_sin")
-            self._static_freqs_sin = self._static_device_tensor(self._static_freqs_sin_table())
+            self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
-
-    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> None:
-        """Dispatch one DeepSeek L3 program and emit Qwen-compatible timing traces."""
-        if self._l3_worker is None:
-            self._assert_l3_args_shared_before_worker(callable_spec, args)
-        span_args = {
-            "block_dim": callable_spec.block_dim,
-            "aicpu_thread_num": callable_spec.aicpu_thread_num,
-        }
-        with profile_span(callable_spec.name, cat="kernel", level="kernel", args=span_args):
-            worker = self._shared_l3_worker()
-            uploaded: list[DeviceTensor] = []
-            try:
-                l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
-                worker_run_args = dict(span_args)
-                with profile_span(
-                    f"{callable_spec.name}.worker_run",
-                    cat="kernel",
-                    level="kernel",
-                    args=worker_run_args,
-                ):
-                    worker.run(callable_spec.compiled, *l3_args)
-            finally:
-                for tensor in uploaded:
-                    worker.free_tensor(tensor)
-
-    def _submit_l3(
-        self,
-        callable_spec: DeepSeekV4L3Callable,
-        *args: Any,
-    ) -> _DeepSeekV4PendingL3Dispatch:
-        """Submit one L3 program and transfer argument ownership to its handle."""
-        if self._l3_worker is None:
-            self._assert_l3_args_shared_before_worker(callable_spec, args)
-        worker = self._shared_l3_worker()
-        uploaded: list[DeviceTensor] = []
-        try:
-            l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
-            with profile_span(
-                f"{callable_spec.name}.worker_submit",
-                cat="kernel",
-                level="kernel",
-                args={
-                    "block_dim": callable_spec.block_dim,
-                    "aicpu_thread_num": callable_spec.aicpu_thread_num,
-                },
-            ):
-                handle = worker.submit(callable_spec.compiled, *l3_args)
-        except BaseException:
-            for tensor in uploaded:
-                worker.free_tensor(tensor)
-            raise
-        return _DeepSeekV4PendingL3Dispatch(
-            worker=worker,
-            handle=handle,
-            uploaded=tuple(uploaded),
-            name=callable_spec.name,
-        )
-
-    @staticmethod
-    def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-        if not tensor.is_shared():
-            tensor = tensor.share_memory_()
-        return tensor
-
-    @staticmethod
-    def _shared_empty(shape: Sequence[int], dtype: torch.dtype, *, name: str) -> torch.Tensor:
-        del name
-        return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype).share_memory_()
-
-    @staticmethod
-    def _copy_shared(dst: torch.Tensor, src: torch.Tensor, *, name: str) -> None:
-        if src.device.type != "cpu":
-            src = src.cpu()
-        if not src.is_contiguous():
-            src = src.contiguous()
-        if tuple(dst.shape) != tuple(src.shape) or dst.dtype != src.dtype:
-            raise ValueError(
-                f"{name} shared buffer shape/dtype mismatch: "
-                f"buffer shape={tuple(dst.shape)} dtype={dst.dtype}, "
-                f"source shape={tuple(src.shape)} dtype={src.dtype}"
-            )
-        if dst.data_ptr() == src.data_ptr():
-            return
-        dst.copy_(src)
 
     @staticmethod
     def _int32_scalar(value: int) -> int:
@@ -4952,82 +3581,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError(
                 f"DeepSeekV4 shared host buffer '{name}' must be allocated before the L3 worker starts"
             )
-
-    def _assert_l3_args_shared_before_worker(
-        self,
-        callable_spec: DeepSeekV4L3Callable,
-        args: Sequence[Any],
-    ) -> None:
-        for index, arg in enumerate(args):
-            self._assert_l3_arg_shared(arg, name=f"{callable_spec.name}[{index}]")
-
-    def _assert_l3_arg_shared(self, arg: Any, *, name: str) -> None:
-        if isinstance(arg, (_StaticDeviceTensor, _TransientDeviceTensor)):
-            self._assert_l3_arg_shared(arg.tensor, name=f"{name}.tensor")
-            return
-        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
-            raise TypeError(
-                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
-                f"the L3 worker starts; got {name} shape={tuple(arg.shape)} dtype={arg.dtype}"
-            )
-        if isinstance(arg, Sequence) and not isinstance(arg, (str, bytes, bytearray)):
-            for index, item in enumerate(arg):
-                self._assert_l3_arg_shared(item, name=f"{name}[{index}]")
-            return
-        if isinstance(arg, dict):
-            for key, item in arg.items():
-                self._assert_l3_arg_shared(item, name=f"{name}[{key!r}]")
-
-    def _coerce_l3_arg(self, worker: Any, arg: Any, uploaded: list[DeviceTensor]) -> Any:
-        if isinstance(arg, _StaticDeviceTensor):
-            self._assert_l3_arg_shared(arg, name="static")
-            tensor = arg.tensor
-            key = (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
-            cached = self._l3_static_tensors.get(key)
-            if cached is None:
-                cached = worker.alloc_stacked_tensor(tensor)
-                self._l3_static_tensors[key] = cached
-            if arg.cache_state:
-                self._l3_cache_tensor_keys.add(key)
-            return cached
-        if isinstance(arg, _TransientDeviceTensor):
-            tensor = arg.tensor
-            self._assert_l3_arg_shared(arg, name="transient")
-            dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
-            uploaded.append(dev)
-            return dev
-        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
-            raise TypeError(
-                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
-                f"the worker starts; got non-shared tensor shape={tuple(arg.shape)} dtype={arg.dtype}"
-            )
-        return arg
-
-    @staticmethod
-    def _mark_resident_args(
-        values: dict[str, Any],
-        policy: dict[str, bool],
-    ) -> dict[str, Any]:
-        """Mark policy-selected arguments for lazy one-time Device upload."""
-        missing = [name for name in policy if name not in values]
-        if missing:
-            raise KeyError(f"DeepSeekV4 resident argument policy is missing values: {missing}")
-        for name, cache_state in policy.items():
-            tensor = values[name]
-            if isinstance(tensor, StackedDeviceTensor):
-                continue
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"DeepSeekV4 resident argument {name!r} must be a torch.Tensor or "
-                    f"StackedDeviceTensor, got {type(tensor).__name__}"
-                )
-            if tensor.device.type != "cpu" or not tensor.is_contiguous() or not tensor.is_shared():
-                raise ValueError(
-                    f"DeepSeekV4 resident argument {name!r} must be a contiguous shared-memory "
-                    "CPU tensor"
-                )
-            values[name] = _StaticDeviceTensor(tensor=tensor, cache_state=cache_state)
-        return values
 
     @staticmethod
     def _upload_weight_group(
@@ -5051,10 +3604,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._global_weights is not None:
             hidden_size = int(self.load_packed_global_weights().embed_weight.shape[1])
             self._materialize_embedding_device_weight()
-            self._materialize_main_pre_hc_device(hidden_size)
+            # Allocate the decode TaskArgs device-resident slots (the pre-HC
+            # output) once, here on the init lane.  This must NOT happen lazily
+            # on the prepare lane: prepare runs concurrently with in-flight
+            # dispatches in the depth-2 pipeline, and a worker.alloc_tensor
+            # racing worker.run corrupts the device state.
+            for task_args in self._decode_task_args:
+                task_args.allocate_device(worker, None)
             if self._compiled.num_speculative_tokens:
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
-                self._materialize_mtp_prefill_device_outputs(hidden_size)
+                self._mtp_prefill_task_args.allocate_device(worker, None)
                 self._materialize_mtp_device_state_tokens()
                 self._materialize_mtp_device_state_meta()
         if self._stacked_device_weights is None:
@@ -5088,7 +3647,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
         if worker is None:
-            self._assert_l3_shared_buffers_preallocated()
             compiled_callables = self._compiled.l3_callables()
             if not compiled_callables:
                 raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
@@ -5170,16 +3728,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return stacked
 
     def _materialize_main_pre_hc_device(self, hidden_size: int) -> StackedDeviceTensor:
-        """Allocate the main decode pre-HC output used directly by MTP."""
-        stacked = self._main_pre_hc_device
-        if stacked is None:
-            layout = self._compiled.layout
-            stacked = self._alloc_empty_stacked_tensor(
-                (layout.ranks, layout.decode_tokens, layout.hc_mult, int(hidden_size)),
-                torch.float32,
-            )
-            self._main_pre_hc_device = stacked
-        return stacked
+        """Return the main decode pre-HC output (a decode-TaskArgs device slot).
+
+        The device slot is allocated once at init in ``_materialize_resident_weights``.
+        The MTP decode TaskArgs reads it here as the strip-shared
+        ``main_pre_hc_hidden`` lazy source (its value is irrelevant on the fused
+        path -- the kernel takes it from the main decode tuple).  Must not touch
+        the worker -- this runs on the prepare lane, concurrently with dispatches.
+        """
+        return self._decode_task_args[0].tensors["pre_hc_hidden_out"]
 
     def _materialize_mtp_tail_pre_hc_pool(self, hidden_size: int) -> StackedDeviceTensor:
         """Allocate persistent request tail hidden slots on every rank."""
@@ -5193,64 +3750,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._mtp_tail_pre_hc_pool = stacked
         return stacked
 
-    def _materialize_mtp_prefill_device_outputs(
-        self,
-        hidden_size: int,
-    ) -> _DeepSeekV4MtpPrefillDeviceOutputs:
-        """Allocate uninitialized MTP prefill outputs before KV-cache sizing."""
-        outputs = self._mtp_prefill_device_outputs
-        if outputs is not None:
-            return outputs
-
-        layout = self._compiled.layout
-        allocated: list[StackedDeviceTensor] = []
-
-        def resident(shape: tuple[int, ...], dtype: torch.dtype) -> StackedDeviceTensor:
-            tensor = self._alloc_empty_stacked_tensor(shape, dtype)
-            allocated.append(tensor)
-            return tensor
-
-        try:
-            outputs = _DeepSeekV4MtpPrefillDeviceOutputs(
-                hidden_out=resident(
-                    (layout.ranks, layout.prefill_seq, int(hidden_size)),
-                    torch.bfloat16,
-                ),
-                pre_hc_hidden_out=resident(
-                    (
-                        layout.ranks,
-                        layout.prefill_seq,
-                        layout.hc_mult,
-                        int(hidden_size),
-                    ),
-                    torch.float32,
-                ),
-                logits=resident(
-                    (
-                        layout.ranks,
-                        DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
-                        DEEPSEEK_V4_VOCAB_SIZE,
-                    ),
-                    torch.float32,
-                ),
-            )
-        except Exception:
-            worker = self._shared_l3_worker()
-            for tensor in reversed(allocated):
-                worker.free_stacked_tensor(tensor)
-            raise
-        self._mtp_prefill_device_outputs = outputs
-        return outputs
-
     def _read_mtp_prefill_logits(self, owner_rank: int) -> torch.Tensor:
         """Read only the valid owner logits row needed for Host argmax."""
         buffers = self._require_mtp_buffers()
-        outputs = self._materialize_mtp_prefill_device_outputs(
-            int(buffers.prefill_hidden_in.shape[-1])
-        )
+        dev_logits = self._mtp_prefill_task_args.tensors["logits"]
         host_row = buffers.prefill_logits[owner_rank, 0]
-        shard = outputs.logits.shards[owner_rank]
-        worker_id = outputs.logits.worker_ids[owner_rank]
+        shard = dev_logits.shards[owner_rank]
+        worker_id = dev_logits.worker_ids[owner_rank]
         self._shared_l3_worker().copy_from(
             host_row.data_ptr(),
             shard.data_ptr,
@@ -5426,7 +3932,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError("worker-resident tensor must be on CPU")
         if not tensor.is_contiguous():
             raise ValueError("worker-resident tensor must be contiguous")
-        return DeepSeekV4ModelRunner._share_cpu_tensor(tensor)
+        return share_cpu_tensor(tensor)
 
     def close(self) -> None:
         worker = self._l3_worker
@@ -5439,21 +3945,31 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._stacked_host_weights = None
             self._stacked_device_weights = None
             self._embedding_device_weight = None
-            self._main_pre_hc_device = None
             self._mtp_tail_pre_hc_pool = None
             self._mtp_device_state_tokens = None
             self._mtp_device_state_meta = None
             self._l3_shared_buffers_ready = False
             self._mtp_device_weights = None
-            self._mtp_prefill_device_outputs = None
+            if self._mtp_prefill_task_args is not None:
+                self._mtp_prefill_task_args.close()
+                self._mtp_prefill_task_args = None
             self._mtp_buffers = None
-            self._mtp_decode_inputs_initialized = False
             self._global_weights = None
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
+            self._main_pre_hc_host_mirror = None
             self._mtp_request_states.clear()
             self._l3_static_tensors.clear()
-            self._l3_cache_tensor_keys.clear()
+            for task_args in self._decode_task_args:
+                task_args.close()
+            self._decode_task_args = []
+            for task_args in self._mtp_decode_task_args:
+                task_args.close()
+            self._mtp_decode_task_args = []
+            self._decode_input_slots = []
+            if self._prefill_task_args is not None:
+                self._prefill_task_args.close()
+                self._prefill_task_args = None
 
     def _require_input_builder(self) -> DeepSeekV4InputBuilder:
         if self.input_builder is None:
@@ -5637,53 +4153,3 @@ class DeepSeekV4ModelRunner(ModelRunner):
         else:
             active = token_ids[:actual_batch, :1]
         return active.expand(actual_batch, layout.decode_seq).clone()
-
-    def _mtp_decode_token_rows(
-        self,
-        token_ids: torch.Tensor,
-        prev_token_ids: torch.Tensor,
-        actual_batch: int,
-    ) -> torch.Tensor:
-        """Build explicit [committed token, draft token] verification rows."""
-        layout = self._compiled.layout
-        if layout.decode_seq != 2:
-            raise ValueError("DeepSeekV4 MTP verification requires decode_seq=2")
-        current = token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
-        previous = prev_token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
-        return torch.stack((previous, current), dim=1)
-
-    def _pad_decode_token_rows(
-        self,
-        active: torch.Tensor,
-        actual_batch: int,
-        *,
-        vocab_size: int,
-    ) -> torch.Tensor:
-        """Pad explicit token rows to the fixed local decode batch."""
-        layout = self._compiled.layout
-        if active.ndim != 2 or active.shape[1] != layout.decode_seq:
-            raise ValueError("decode token rows must have shape [requests, decode_seq]")
-        if actual_batch <= 0 or active.shape[0] < actual_batch:
-            raise ValueError("decode token rows must cover every active request")
-        if vocab_size <= 0:
-            raise ValueError("vocab_size must be positive")
-        rows = torch.empty(layout.decode_tokens, dtype=torch.long).reshape(
-            layout.decode_batch,
-            layout.decode_seq,
-        )
-        rows.copy_(active[0].expand(layout.decode_batch, layout.decode_seq))
-        rows[:actual_batch].copy_(active[:actual_batch])
-        return rows.reshape(layout.decode_tokens)
-
-    def _decode_kv_seq_lens(self, seq_lens: torch.Tensor, actual_batch: int) -> torch.Tensor:
-        layout = self._compiled.layout
-        # The last written KV position is ``seq_len-1``, so the valid KV history
-        # is exactly ``seq_len`` entries. (yangyaodong's "seq_len+1" was relative
-        # to a seq_len = prompt length, which does not count the prefill token;
-        # our seq_len already does.)
-        active = seq_lens[:actual_batch].detach().cpu().to(torch.int32)
-        return DeepSeekV4CacheMetadataBuilder.replicate_first_row(
-            active.reshape(actual_batch, 1),
-            actual_rows=actual_batch,
-            kernel_rows=layout.decode_batch,
-        ).reshape(layout.decode_batch)
