@@ -1863,8 +1863,8 @@ def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
         != runner._decode_task_args[1].tensors["sampled_ids"].data_ptr()
     )
     assert (
-        runner._mtp_decode_task_args[0].tensors["accepted_counts"].data_ptr()
-        != runner._mtp_decode_task_args[1].tensors["accepted_counts"].data_ptr()
+        runner._mtp_decode_task_args[0].tensors["sampled_ids"].data_ptr()
+        != runner._mtp_decode_task_args[1].tensors["sampled_ids"].data_ptr()
     )
     second.mtp_tail_slot_ids[0, 0] = 5
     assert first.mtp_tail_slot_ids[0, 0].item() == 3
@@ -1900,6 +1900,7 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     assert prepared.dispatch_args == ("fused",)
 
     state.device_state_initialized = True
+    state.draft_token_id = 99
     runner._require_decode_callable = lambda: SimpleNamespace(name="decode_mtp_fused")
     runner._submit_l3 = lambda _callable, *args: (
         SimpleNamespace(wait=lambda: None)
@@ -2166,9 +2167,9 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     assert dispatches == [("decode_mtp_fused", ("fused",))]
     assert prepared_rows == []
     assert result.accepted_token_ids == [[5, 9]]
-    # Steady execution consumes the kernel-owned device state.  Host mirrors
-    # remain at their initialization values unless DEBUG diagnostics are on.
-    assert state.draft_token_id == 5
+    # Only the next draft remains mirrored on Host so the next reclaim can
+    # reconstruct acceptance; committed tail metadata stays device-owned.
+    assert state.draft_token_id == 7
     assert state.tail_token_id == 3
     assert state.tail_position == 126
     assert state.proposed_tokens == 1
@@ -3064,7 +3065,7 @@ def test_deepseek_mtp_task_args_classify_kinds():
     assert decode.names[decode.names.index("state_tokens") - 1] == "state_generations"
 
 
-def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
+def test_deepseek_fused_mtp_non_inference_outputs_are_device_resident():
     class _AllocWorker:
         def __init__(self):
             self.next_ptr = 0x1000
@@ -3092,7 +3093,13 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     mtp = mtp_decode_task_args(runner, 4096)
     mtp.allocate_host_shared(None)
     mtp.allocate_device(worker, None)
-    for name in ("hidden_out", "next_pre_hc_hidden", "logits"):
+    for name in (
+        "accepted_counts",
+        "input_ids",
+        "position_ids",
+        "hidden_out",
+        "next_pre_hc_hidden",
+        "logits",
+    ):
         assert isinstance(mtp.tensors[name], StackedDeviceTensor)
-    for name in ("accepted_counts", "input_ids", "position_ids", "sampled_ids"):
-        assert isinstance(mtp.tensors[name], torch.Tensor)
+    assert isinstance(mtp.tensors["sampled_ids"], torch.Tensor)

@@ -604,10 +604,18 @@ def mtp_decode_task_args(runner: DeepSeekV4ModelRunner, hidden: int) -> TaskArgs
     for name in _FUSED_MTP_DECODE_TENSOR_ORDER:
         if name in slots:
             dtype, shape = slots[name]
+            resident_outputs = {
+                "accepted_counts",
+                "input_ids",
+                "position_ids",
+                "hidden_out",
+                "next_pre_hc_hidden",
+                "logits",
+            }
             placement = (
                 Placement.DEVICE_RESIDENT
                 if runner._compiled.num_speculative_tokens == 1
-                and name in {"hidden_out", "next_pre_hc_hidden", "logits"}
+                and name in resident_outputs
                 else Placement.HOST_SHARED
             )
             ta.add_slot(Slot(name, placement, dtype, lambda _, s=shape: s))

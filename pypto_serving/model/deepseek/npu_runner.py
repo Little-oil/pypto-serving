@@ -745,10 +745,8 @@ class _DeepSeekV4PendingMtpDecode:
     dispatch: "PendingL3Dispatch"
     inputs: DeepSeekV4PreparedDecodeInputs
     sampled_ids: torch.Tensor
-    accepted_counts: torch.Tensor
     mtp_sampled_ids: torch.Tensor
-    committed_input_ids: torch.Tensor
-    committed_position_ids: torch.Tensor
+    draft_token_ids: tuple[int, ...]
     states: tuple["_DeepSeekV4MtpRequestState", ...]
 
 
@@ -2313,6 +2311,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Submit a command-lane-complete fused MTP snapshot."""
         if inputs.dispatch_args is None:
             raise RuntimeError("DeepSeekV4 fused decode snapshot is not ready to launch")
+        if any(state.draft_token_id is None for state in states):
+            raise RuntimeError("DeepSeekV4 MTP draft snapshot is incomplete")
+        draft_token_ids = tuple(int(state.draft_token_id) for state in states)
         active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
         try:
             with profile_span(
@@ -2336,10 +2337,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             dispatch=dispatch,
             inputs=inputs,
             sampled_ids=ta.tensors["sampled_ids"],
-            accepted_counts=mtp["accepted_counts"],
             mtp_sampled_ids=mtp["sampled_ids"],
-            committed_input_ids=mtp["input_ids"],
-            committed_position_ids=mtp["position_ids"],
+            draft_token_ids=draft_token_ids,
             states=states,
         )
 
@@ -2353,10 +2352,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             accepted_counts_list = []
             accepted = []
             states = pending.states
-            for state, rank, local_row in zip(
+            if len(pending.draft_token_ids) != len(states):
+                raise RuntimeError("DeepSeekV4 MTP draft snapshot is incomplete")
+            for state, rank, local_row, draft_token_id in zip(
                 states,
                 inputs.ranks,
                 inputs.local_rows,
+                pending.draft_token_ids,
                 strict=True,
             ):
                 row_start = local_row * decode_seq
@@ -2365,8 +2367,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     row_start : row_start + decode_seq,
                     0,
                 ].tolist()
-                accepted_count = int(
-                    pending.accepted_counts[rank, local_row].item()
+                accepted_count = (
+                    decode_seq
+                    if draft_token_id == int(main_tokens[0])
+                    else 1
                 )
                 accepted_counts_list.append(accepted_count)
                 accepted.append([int(token) for token in main_tokens[:accepted_count]])
@@ -2384,24 +2388,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     self._mtp_proposed_tokens,
                     100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
                 )
-        # The fused kernel has already committed draft/tail/position to the
-        # stable device-state slot.  Host mirrors are diagnostics for the
-        # legacy split-MTP path and must not delay the next steady dispatch.
-        if logger.isEnabledFor(logging.DEBUG):
-            for state, rank, local_row in zip(
-                states,
-                inputs.ranks,
-                inputs.local_rows,
-                strict=True,
-            ):
-                row_end = (local_row + 1) * decode_seq - 1
-                state.draft_token_id = int(
-                    pending.mtp_sampled_ids[rank, local_row, 0].item()
-                )
-                state.tail_token_id = int(pending.committed_input_ids[rank, row_end].item())
-                state.tail_position = int(
-                    pending.committed_position_ids[rank, row_end].item()
-                )
+        # Keep only the next draft mirrored on Host. The following reclaim uses
+        # it to reconstruct acceptance; committed tail token/position remain
+        # authoritative in the fused kernel's stable device-state slot.
+        for state, rank, local_row in zip(
+            states,
+            inputs.ranks,
+            inputs.local_rows,
+            strict=True,
+        ):
+            state.draft_token_id = int(
+                pending.mtp_sampled_ids[rank, local_row, 0].item()
+            )
         return DecodeResult(
             hidden_states=None,
             logits=None,
