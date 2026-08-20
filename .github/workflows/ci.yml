@@ -157,6 +157,7 @@ jobs:
           run_cmd="$run_cmd PTO2_STREAM_SYNC_TIMEOUT_MS=$PTO2_STREAM_SYNC_TIMEOUT_MS"
           run_cmd="$run_cmd PTO2_SCHEDULER_TIMEOUT_MS=$PTO2_SCHEDULER_TIMEOUT_MS"
           run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
+          run_cmd="$run_cmd PYPTO_DSV4_SKIP_STANDALONE_MTP=1"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
             --timeout 2400 --max-time 3600 \
