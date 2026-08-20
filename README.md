@@ -16,11 +16,6 @@ pypto_serving/
   tools/profile/               Chrome-trace profiling support
 pypto-lib/                     submodule providing model-specific PyPTO kernels
 platform/                      C++ platform-management layer (engine lifecycle, channels, modules)
-examples/
-  model/qwen3_14b/
-    npu_generate.py            NPU generation/profiling example
-  model/deepseek_v4/
-    npu_generate.py            Eight-NPU offline generation example
 scripts/
   convert_deepseek_v4_to_w8a8.py  DeepSeek V4 checkpoint converter
 tests/                         host-side unit tests and CI NPU accuracy guards
@@ -57,36 +52,37 @@ Show CLI help:
 pypto-serving --help
 ```
 
-## NPU Generation
+## NPU Generation (offline)
 
-One-shot generation:
+Offline generation runs through the same engine as serving (scheduler, worker
+process, KV cache) from the `pypto-serving` CLI, without opening a port:
 
 ```bash
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /path/to/Qwen3-14B \
-  --prompt 'Huawei is' \
+pypto-serving \
+  --model /path/to/Qwen3-14B \
   --platform a2a3 \
-  --device-id 0 \
-  --max-seq-len 512 \
-  --max-new-tokens 5
+  --device 0 \
+  --max-model-len 512 \
+  --prompt 'Huawei is' \
+  --generate-config '{"max_new_tokens": 5}'
 ```
 
-DeepSeek V4 Flash W8A8 offline generation reuses the serving scheduler and its
-grouped KV-cache implementation, but does not start an HTTP server:
+DeepSeek V4 Flash W8A8 offline generation on eight devices:
 
 ```bash
-python examples/model/deepseek_v4/npu_generate.py \
-  --model-dir /data/models/dsv4-flash-w8a8 \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
+pypto-serving \
+  --model /data/models/dsv4-flash-w8a8 \
   --devices 0,1,2,3,4,5,6,7 \
-  --max-seq-len 512 \
-  --max-new-tokens 20
+  --dp 8 --ep 8 \
+  --max-model-len 512 \
+  --prompt 'Huawei is' \
+  --generate-config '{"max_new_tokens": 20}' \
+  --num-speculative-tokens 1
 ```
 
-Add `--enable-mtp` for speculative decoding or `--num-prompts N` for offline
-continuous batching. DeepSeek V4 requires exactly eight devices with overlapped
-attention DP=8 and MoE EP=8.
+Repeat `--prompt` for offline continuous batching. Add `--profile` to capture
+the generation window. DeepSeek V4 requires exactly eight devices with
+overlapped attention DP=8 and MoE EP=8.
 
 ## HTTP Serving (OpenAI-compatible API)
 

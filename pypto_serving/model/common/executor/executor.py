@@ -28,7 +28,7 @@ from pypto_serving.serving.memory.kv_cache import KvCacheManager
 
 
 class ModelExecutor(ABC):
-    """Backend-neutral interface used by ``LLMEngine`` to execute generation."""
+    """Backend-neutral interface used by the serving worker to execute generation."""
 
     def __init__(self, kv_cache_manager: KvCacheManager | None = None) -> None:
         """Store the KV cache manager shared with the engine (optional for serving path)."""

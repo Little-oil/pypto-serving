@@ -58,12 +58,11 @@ them:
 ```bash
 task-submit --device auto --max-time 0 --run \
   "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /data/linyifan/models/Qwen3-14B \
+  pypto-serving --model /data/linyifan/models/Qwen3-14B \
     --prompt 'Huawei is' \
     --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5"
+    --max-model-len 512 \
+    --generate-config '{\"max_new_tokens\": 5}'"
 ```
 
 Use `--profile` for timing reports.

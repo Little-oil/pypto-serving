@@ -7,10 +7,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Qwen3 output accuracy guard for CI."""
+"""Qwen3 output accuracy guard for CI.
+
+Runs offline generation through the same engine as serving
+(``AsyncLLMEngine`` -> ``Scheduler`` -> ``WorkerProcess``), so this guard also
+pins offline/online parity: greedy output must be identical whether prompts
+arrive from the CLI generate mode or the HTTP server.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -36,45 +43,47 @@ def test_qwen3_output_matches_expected_tokens():
         pytest.fail("DEVICE_ID is required")
 
     from pypto_serving.config.types import GenerateConfig, RuntimeConfig
-    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
-    from pypto_serving.serving.engine.engine import LLMEngine
-    from pypto_serving.serving.memory.kv_cache import KvCacheManager
+    from pypto_serving.model.tokenizer import load_tokenizer
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
 
-    kv_cache_manager = KvCacheManager()
-    executor = Qwen314BPyptoExecutor(
-        kv_cache_manager,
-        platform=PLATFORM,
-        device_ids=(DEVICE_ID,),
-    )
-    engine = LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
+    async def run():
+        engine = AsyncLLMEngine(
+            config=EngineConfig(
+                model_id=MODEL_ID,
+                model_dir=str(MODEL_DIR),
+                platform=PLATFORM,
+                device_id=DEVICE_ID,
+                device_ids=(DEVICE_ID,),
+                executor_cls="PyptoQwen14BExecutor",
+                runtime_config=RuntimeConfig(
+                    page_size=128,
+                    max_batch_size=16,
+                    max_seq_len=512,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    device="cpu",
+                    kv_dtype="bfloat16",
+                    weight_dtype="float32",
+                ),
+                max_num_running_reqs=16,
+                enable_prefix_cache=False,
+            ),
+            tokenizer=load_tokenizer(str(MODEL_DIR)),
+        )
+        await engine.start()
+        try:
+            return await engine.generate_result(
+                PROMPT,
+                GenerateConfig(
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=None,
+                ),
+            )
+        finally:
+            await engine.stop()
 
-    try:
-        engine.init_model(
-            model_id=MODEL_ID,
-            model_dir=str(MODEL_DIR),
-            model_format="huggingface",
-            runtime_config=RuntimeConfig(
-                page_size=128,
-                max_batch_size=16,
-                max_seq_len=512,
-                max_new_tokens=MAX_NEW_TOKENS,
-                device="cpu",
-                kv_dtype="bfloat16",
-                weight_dtype="float32",
-            ),
-        )
-        result = engine.generate_result(
-            MODEL_ID,
-            PROMPT,
-            GenerateConfig(
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=0.0,
-                top_p=1.0,
-                top_k=None,
-            ),
-        )
-    finally:
-        executor.close()
+    result = asyncio.run(run())
     assert result.token_ids == EXPECTED_TOKEN_IDS, (
         f"Qwen3 output changed for prompt {PROMPT!r}:\n"
         f"expected token_ids: {EXPECTED_TOKEN_IDS}\n"

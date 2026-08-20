@@ -41,6 +41,6 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
   -d '{"prompt":"Huawei is","max_tokens":16,"temperature":0.0}'
 ```
 
-Offline `npu_generate.py` supports `--devices` and `--tp` for one logical TP
-replica. It intentionally rejects `--dp > 1`; launch separate offline jobs if
-data-parallel offline generation is needed.
+Offline generation (`pypto-serving --prompt`) shares the serving engine, so
+`--devices`, `--tp`, and `--dp` behave exactly as in serving: prompts are
+routed across replicas with the same least-pending-tokens policy.

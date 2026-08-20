@@ -9,9 +9,9 @@
 
 """Qwen3 serving-path accuracy guards for CI.
 
-The offline ``LLMEngine`` accuracy guard (``test_qwen3_accuracy.py``) never
-routes through the scheduler, so it cannot exercise prefix caching or chunked
-prefill. Those features only run on the serving path
+The baseline accuracy guard (``test_qwen3_accuracy.py``) runs a single
+request, so it cannot exercise prefix caching or chunked prefill. Those
+features run on the scheduler path
 (``AsyncLLMEngine`` -> ``Scheduler`` -> ``WorkerProcess``). This module drives
 that real path and guards three optimizations, each of which must keep greedy
 output identical to the baseline while the scheduler is observed to actually

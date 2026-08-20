@@ -11,13 +11,13 @@ Do not hard-code a specific commit, server name, user directory, or one-off expe
 
 ## Scope
 
-Prefer the serving repository's offline entry:
+Prefer the serving repository's offline generate mode (same engine as serving, no HTTP server):
 
 ```bash
-python examples/model/qwen3_14b/npu_generate.py ...
+pypto-serving --model /path/to/Qwen3-14B --prompt "..." --generate-config '{"max_new_tokens": 128}'
 ```
 
-If this entry is renamed or does not support the requested batch/decode scenario, use the matching equivalent under `examples/model/qwen3_14b/`. Do not use HTTP/FastAPI/Uvicorn serving unless the user explicitly asks for that path.
+Repeat `--prompt` for a batch (each occurrence is one request, scheduled with continuous batching). Do not use HTTP/FastAPI/Uvicorn serving unless the user explicitly asks for that path.
 
 Keep the normal serving-core flow when possible: tokenize, prefill, KVCache, decode, sampling, and detokenize. If prefill cannot run, clearly label the result as `cached-prefill decode`, `serving-core probe`, or `decode-only`.
 
@@ -71,7 +71,7 @@ If a dependency version cannot be detected from a checkout or package version, w
 
 Use a real prompt file when possible. If the entry supports `--prompt-file`, prefer it. If it only supports `--prompt`, pass the file content as text.
 
-If the server requires a queue wrapper such as `task-submit`, collect the queue command and required environment variables first, then run the same direct Python command inside that wrapper. Keep the direct Python command and arguments visible in the log.
+If the server requires a queue wrapper such as `task-submit`, collect the queue command and required environment variables first, then run the same direct command inside that wrapper. Keep the direct command and arguments visible in the log.
 
 Single-run template:
 
@@ -89,21 +89,27 @@ sha256sum "$PROMPT_FILE" | tee "$RUN_DIR/prompt.sha256"
 wc -c "$PROMPT_FILE" | tee "$RUN_DIR/prompt.bytes"
 PROMPT_TEXT="$(cat "$PROMPT_FILE")"
 
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir "$MODEL_DIR" \
-  --prompt "$PROMPT_TEXT" \
-  --model-id "qwen3-14b-offline" \
+# One --prompt occurrence per request: BATCH_SIZE=16 gives a real batch of 16.
+PROMPT_ARGS=()
+for _ in $(seq "$BATCH_SIZE"); do PROMPT_ARGS+=(--prompt "$PROMPT_TEXT"); done
+
+pypto-serving \
+  --model "$MODEL_DIR" \
+  --served-model-name "qwen3-14b-offline" \
   --platform "${PLATFORM:-a2a3}" \
-  --device-id "$DEVICE_ID" \
-  --max-seq-len "$MAX_SEQ_LEN" \
-  --max-new-tokens "$MAX_NEW_TOKENS" \
-  --temperature 0 \
-  --top-p 1 \
+  --device "$DEVICE_ID" \
+  --max-model-len "$MAX_SEQ_LEN" \
+  --max-num-seqs "$BATCH_SIZE" \
+  --generate-config '{"max_new_tokens": '"$MAX_NEW_TOKENS"', "temperature": 0, "top_p": 1}' \
+  "${PROMPT_ARGS[@]}" \
   --profile \
   2>&1 | tee "$RUN_DIR/run.log"
 ```
 
-If the selected entry exposes a batch-size option, pass `BATCH_SIZE` through that option. If it does not expose batch size, do not invent an unsupported flag; use the repository's matching batch-capable offline entry or state that this run used the entry's actual batch behavior.
+`--max-num-seqs` sets the scheduler batch capacity; the actual batch is the
+number of `--prompt` occurrences. The entry prints an aggregate tokens/s
+summary; per-phase (prefill vs decode) and per-kernel splits come from the
+`--profile` trace or the STRACE method below.
 
 ## Runtime Evidence
 
