@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -43,9 +44,11 @@ except ImportError as e:
 class CompletionRequest(BaseModel):
     model: str = ""
     prompt: str = ""
-    max_tokens: int = 256
-    temperature: float = 0.8
-    top_p: float = 0.95
+    # Sampling fields are optional: omitted fields fall back to the server's
+    # default GenerateConfig (from --generate-config, else GenerateConfig()).
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
     top_k: int | None = None
     stop: list[str] | None = None
     stream: bool = False
@@ -59,9 +62,9 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: list[ChatMessage]
-    max_tokens: int = 256
-    temperature: float = 0.8
-    top_p: float = 0.95
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
     top_k: int | None = None
     stop: list[str] | None = None
     stream: bool = False
@@ -108,9 +111,17 @@ class ChatCompletionResponse(BaseModel):
 # --- Server ---
 
 class ServingServer:
-    def __init__(self, async_engine: AsyncLLMEngine, model_id: str) -> None:
+    def __init__(
+        self,
+        async_engine: AsyncLLMEngine,
+        model_id: str,
+        generate_config: GenerateConfig,
+    ) -> None:
         self.engine = async_engine
         self.model_id = model_id
+        # Server-wide generate defaults. Fields the HTTP request omits fall
+        # back to this config; explicit per-request fields still win.
+        self.generate_config = generate_config
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
         self._register_exception_handlers()
@@ -180,22 +191,43 @@ class ServingServer:
                 raise stop_error
         return Response(status_code=200)
 
+    def _resolve_generate_config(self, request: CompletionRequest | ChatCompletionRequest) -> GenerateConfig:
+        """Build the per-request config from the server-wide defaults.
+
+        A field the request explicitly sets always wins — including "empty"
+        values that clear a server default (``stop: []`` clears the server
+        stop strings, ``top_k: null`` disables the server top-k). Fields the
+        request omits fall back to ``self.generate_config``.
+        """
+        defaults = self.generate_config
+        provided = request.model_fields_set
+
+        if "stop" in provided:
+            stop = tuple(request.stop) if request.stop else ()
+        else:
+            stop = defaults.stop
+
+        return GenerateConfig(
+            max_new_tokens=request.max_tokens
+            if "max_tokens" in provided
+            else defaults.max_new_tokens,
+            temperature=request.temperature
+            if "temperature" in provided
+            else defaults.temperature,
+            top_p=request.top_p if "top_p" in provided else defaults.top_p,
+            top_k=request.top_k if "top_k" in provided else defaults.top_k,
+            stop=stop,
+            stream=request.stream if "stream" in provided else defaults.stream,
+        )
+
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        config = GenerateConfig(
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=tuple(request.stop) if request.stop else (),
-            stream=request.stream,
-            ignore_eos=True,
-        )
+        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
 
         with profile_span(
             "http.completions",
             cat="request",
-            args={"request_id": request_id, "max_tokens": request.max_tokens, "stream": request.stream},
+            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
         ):
             if request.stream:
                 return StreamingResponse(
@@ -229,19 +261,18 @@ class ServingServer:
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         prompt = self._apply_chat_template(request.messages, request.chat_template_kwargs)
-        config = GenerateConfig(
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=tuple(request.stop) if request.stop else (),
-            stream=request.stream,
+        # The OpenAI chat schema has no ignore_eos field, so the server-wide
+        # config decides it (the completions endpoint keeps its historic
+        # always-ignore-EOS override).
+        config = dataclasses.replace(
+            self._resolve_generate_config(request),
+            ignore_eos=self.generate_config.ignore_eos,
         )
 
         with profile_span(
             "http.chat_completions",
             cat="request",
-            args={"request_id": request_id, "max_tokens": request.max_tokens, "stream": request.stream},
+            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
         ):
             if request.stream:
                 return StreamingResponse(
@@ -393,6 +424,10 @@ class ServingServer:
         return mapping.get(reason, "stop")
 
 
-def create_serving_app(async_engine: AsyncLLMEngine, model_id: str) -> FastAPI:
-    server = ServingServer(async_engine, model_id)
+def create_serving_app(
+    async_engine: AsyncLLMEngine,
+    model_id: str,
+    generate_config: GenerateConfig,
+) -> FastAPI:
+    server = ServingServer(async_engine, model_id, generate_config)
     return server.app

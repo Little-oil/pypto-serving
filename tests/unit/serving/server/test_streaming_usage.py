@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import json
 
+from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.server.server import ServingServer
+from pypto_serving.serving.server.server import CompletionRequest, ServingServer
 
 # ---------------------------------------------------------------------------
 # Fake engine
@@ -51,7 +52,7 @@ class _FakeEngine:
 
 
 def _make_server(outputs: list[TokenOutput]) -> ServingServer:
-    return ServingServer(async_engine=_FakeEngine(outputs), model_id="test-model")
+    return ServingServer(async_engine=_FakeEngine(outputs), model_id="test-model", generate_config=GenerateConfig())
 
 
 # ---------------------------------------------------------------------------
@@ -123,3 +124,34 @@ def test_stream_completion_terminal_usage_chunk():
     delta_chunks = [c for c in parsed if c["choices"]]
     for c in delta_chunks:
         assert c.get("usage") is None, f"Intermediate chunk has usage: {c}"
+
+
+def test_explicit_request_fields_clear_server_generate_defaults():
+    server = ServingServer(
+        async_engine=_FakeEngine([]),
+        model_id="test-model",
+        generate_config=GenerateConfig(
+            max_new_tokens=11,
+            temperature=0.9,
+            top_p=0.7,
+            top_k=5,
+            stop=("END",),
+            stream=True,
+        ),
+    )
+
+    cleared = server._resolve_generate_config(
+        CompletionRequest(prompt="x", stop=[], top_k=None)
+    )
+    assert cleared.stop == ()
+    assert cleared.top_k is None
+    # Fields the request omitted keep the server defaults.
+    assert cleared.temperature == 0.9
+    assert cleared.max_new_tokens == 11
+    assert cleared.top_p == 0.7
+    assert cleared.stream is True
+
+    omitted = server._resolve_generate_config(CompletionRequest(prompt="x"))
+    assert omitted.stop == ("END",)
+    assert omitted.top_k == 5
+    assert omitted.stream is True

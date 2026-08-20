@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import sys
@@ -18,20 +19,21 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from pypto_serving.serving.engine.async_engine import EngineConfig
-
+from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig
 from pypto_serving.tools.profile import (
     ProfileConfig,
     configure_profiler,
     create_profile_config,
     get_profiler,
     merge_profile,
+    profile_span,
+    start_profile,
+    stop_profile,
 )
 
-RuntimeConfig = None
-ParallelConfig = None
-parse_device_ids = None
+if TYPE_CHECKING:
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
 
 
 _VALID_BACKENDS = {"npu"}
@@ -41,7 +43,10 @@ _LEGACY_SERVING_PROFILE_ENV = ("SA_PROFILE_OUTPUT", "SA_PROFILE_LEVEL")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pypto-serving",
-        description="Start PyPTO Serving with an OpenAI-compatible API.",
+        description=(
+            "Start PyPTO Serving with an OpenAI-compatible API, or run offline "
+            "generation with --prompt."
+        ),
     )
 
     # Model
@@ -112,9 +117,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Generation
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0).")
-    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling probability (default: 1.0).")
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling cutoff (default: disabled).")
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Offline generate mode: run the given prompt(s) to completion and "
+            "exit instead of starting the server. Repeat the flag for multiple "
+            "prompts (scheduled with continuous batching)."
+        ),
+    )
+    parser.add_argument(
+        "--generate-config",
+        type=_parse_generate_config,
+        default=None,
+        metavar="JSON",
+        help=(
+            "GenerateConfig fields as a JSON object: max_new_tokens, "
+            "temperature, top_p, top_k, stop, stream, ignore_eos. Generate "
+            "mode: the run's sampling config. Serve mode: server-wide defaults "
+            "for request fields that are omitted (default: GenerateConfig "
+            "defaults, e.g. max_new_tokens 256, temperature 0.8, top_p 0.95)."
+        ),
+    )
     parser.add_argument(
         "--enable-mtp",
         action=argparse.BooleanOptionalAction,
@@ -197,7 +223,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
-    _ensure_core_imports()
     _validate_backend(args.backend)
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
@@ -357,6 +382,70 @@ def _parse_speculative_config(value: str) -> dict[str, object]:
     return parsed
 
 
+def _parse_generate_config(value: str) -> dict[str, object]:
+    """Parse the --generate-config JSON object (GenerateConfig fields)."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--generate-config must be valid JSON: {exc.msg}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--generate-config must be a JSON object")
+    return parsed
+
+
+def _build_generate_config(data: dict[str, object] | None) -> GenerateConfig:
+    """Materialise the parsed --generate-config into a GenerateConfig."""
+    if data is None:
+        return GenerateConfig()
+    valid_fields = {field.name for field in dataclasses.fields(GenerateConfig)}
+    unknown = set(data) - valid_fields
+    if unknown:
+        raise ValueError(
+            f"--generate-config has unknown fields: {sorted(unknown)}; "
+            f"valid fields: {sorted(valid_fields)}"
+        )
+    options = dict(data)
+    _validate_generate_config_options(options)
+    if isinstance(options.get("stop"), list):
+        options["stop"] = tuple(options["stop"])
+    return GenerateConfig(**options)
+
+
+def _validate_generate_config_options(options: dict[str, object]) -> None:
+    """Check value types and ranges before the engine starts.
+
+    ``argparse`` only verifies that ``--generate-config`` is a JSON object;
+    without this gate ``{"stream": "false"}`` would be truthy and enable
+    streaming, ``{"stop": "END"}`` would later split into three one-character
+    stop strings, and ``{"max_new_tokens": 2.5}`` would only fail deep inside
+    the scheduler.
+    """
+
+    def is_number(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def is_positive_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    checks: dict[str, tuple[str, object]] = {
+        "max_new_tokens": ("a positive int", is_positive_int),
+        "temperature": ("a non-negative number", lambda v: is_number(v) and v >= 0),
+        "top_p": ("a number in (0, 1]", lambda v: is_number(v) and 0 < v <= 1),
+        "top_k": ("a positive int or null", lambda v: v is None or is_positive_int(v)),
+        "stop": ("a list of strings", lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v)),
+        "stream": ("a boolean", lambda v: isinstance(v, bool)),
+        "ignore_eos": ("a boolean", lambda v: isinstance(v, bool)),
+    }
+    for name, (expected, check) in checks.items():
+        if name in options and not check(options[name]):
+            raise ValueError(
+                f"--generate-config field {name!r} must be {expected}; "
+                f"got {options[name]!r}"
+            )
+
+
 def _build_profile_config(args: argparse.Namespace) -> ProfileConfig:
     if not args.profile and (args.profile_output is not None or args.profile_level is not None):
         raise ValueError("--profile-output and --profile-level require --profile")
@@ -466,6 +555,7 @@ def _validate_model_topology(
 
 def run_serve(
     config: EngineConfig,
+    generate_config: GenerateConfig,
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
@@ -495,7 +585,7 @@ def run_serve(
         tokenizer=tokenizer
     )
 
-    app = create_serving_app(async_engine, model_id)
+    app = create_serving_app(async_engine, model_id, generate_config)
 
     @app.on_event("startup")
     async def startup():
@@ -521,6 +611,129 @@ def run_serve(
     print(f"  Endpoints: {endpoints}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def run_generate(
+    config: EngineConfig,
+    prompts: list[str],
+    generate_config: GenerateConfig,
+) -> None:
+    """Run offline generation through the serving engine, then exit.
+
+    Offline and online generation share one engine: the prompts go through the
+    same AsyncLLMEngine, scheduler, and worker as HTTP requests.
+    """
+    import asyncio
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
+
+    from pypto_serving.model.tokenizer import load_tokenizer
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+
+    if generate_config.stream and len(prompts) > 1:
+        raise ValueError("--generate-config stream=true requires a single --prompt")
+
+    configure_profiler(
+        config.profile_config,
+        process_name="pypto-serving-generate",
+        initially_active=False,
+    )
+    tokenizer = load_tokenizer(config.model_dir)
+    async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer)
+
+    print(f"Generating {len(prompts)} prompt(s): model={config.model_id}")
+    asyncio.run(_run_generation(async_engine, config, prompts, generate_config))
+
+
+async def _run_generation(
+    engine: AsyncLLMEngine,
+    config: EngineConfig,
+    prompts: list[str],
+    generate_config: GenerateConfig,
+) -> None:
+    import time
+
+    await engine.start()
+    profile_enabled = config.profile_config.enabled
+    try:
+        if profile_enabled:
+            # Mirror the HTTP profile endpoints: start the main-process
+            # recorder as well as every worker's. The recorder was configured
+            # initially_active=False, so without this the cli.generate,
+            # scheduler, and engine spans would be missing from the trace and
+            # only the worker fragments would merge.
+            start_profile()
+            await engine.start_profile()
+        started = time.perf_counter()
+        with profile_span(
+            "cli.generate",
+            cat="request",
+            args={
+                "model_id": config.model_id,
+                "num_prompts": len(prompts),
+                "max_new_tokens": generate_config.max_new_tokens,
+                "stream": generate_config.stream,
+            },
+        ):
+            num_tokens = await _generate_prompts(engine, prompts, generate_config)
+        elapsed = time.perf_counter() - started
+        print(
+            f"[generate] {num_tokens} tokens in {elapsed:.2f}s "
+            f"({num_tokens / elapsed:.1f} tok/s)"
+        )
+    finally:
+        # Profiling cleanup must not strand the worker process and device:
+        # engine.stop() runs even when stop_profile/merge_profile raise.
+        try:
+            if profile_enabled:
+                await engine.stop_profile()
+                stop_profile()
+                merge_profile()
+        finally:
+            await engine.stop()
+
+
+async def _generate_prompts(
+    engine: AsyncLLMEngine,
+    prompts: list[str],
+    generate_config: GenerateConfig,
+) -> int:
+    """Generate all prompts; returns the total number of completion tokens."""
+    if generate_config.stream:
+        return await _generate_stream(engine, prompts[0], generate_config)
+
+    results = await engine.generate_batch(prompts, generate_config)
+    for index, result in enumerate(results):
+        print(f"-- prompt {index + 1}/{len(prompts)} --")
+        print(f"text: {result.text}")
+        token_ids = result.token_ids
+        print(f"token_ids: {token_ids[:64]}{'...' if len(token_ids) > 64 else ''}")
+        print(f"finish_reason: {result.finish_reason}")
+    return sum(len(result.token_ids) for result in results)
+
+
+async def _generate_stream(
+    engine: AsyncLLMEngine,
+    prompt: str,
+    generate_config: GenerateConfig,
+) -> int:
+    request_id = engine.generate_request_id()
+    previous_text = ""
+    token_count = 0
+    async for output in engine.add_request(request_id, prompt, generate_config):
+        delta = output.text[len(previous_text):] if output.text else ""
+        previous_text = output.text or previous_text
+        if output.token_id is not None:
+            token_count += 1
+        if delta:
+            print(delta, end="", flush=True)
+        if output.finished:
+            print()
+            print(f"finish_reason: {engine.normalize_finish_reason(output.finish_reason)}")
+            token_count = output.completion_tokens or token_count
+    return token_count
 
 
 def _format_device_groups(config: EngineConfig) -> str:
@@ -552,28 +765,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)
+        generate_config = _build_generate_config(args.generate_config)
 
-    run_serve(
-        config,
-        host=args.host,
-        port=args.port,
-    )
+    if args.prompt:
+        run_generate(config, prompts=args.prompt, generate_config=generate_config)
+    else:
+        run_serve(
+            config,
+            generate_config,
+            host=args.host,
+            port=args.port,
+        )
     return 0
-
-
-def _ensure_core_imports() -> None:
-    global ParallelConfig, RuntimeConfig, parse_device_ids
-
-    if RuntimeConfig is None:
-        from pypto_serving.config.types import RuntimeConfig as imported_runtime_config
-
-        RuntimeConfig = imported_runtime_config
-    if ParallelConfig is None or parse_device_ids is None:
-        from pypto_serving.config.parallel import ParallelConfig as imported_parallel_config
-        from pypto_serving.config.parallel import parse_device_ids as imported_parse_device_ids
-
-        ParallelConfig = imported_parallel_config
-        parse_device_ids = imported_parse_device_ids
 
 
 @contextlib.contextmanager

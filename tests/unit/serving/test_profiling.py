@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 
 import pypto_serving.cli.main as cli
+from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
 from pypto_serving.serving.server import server as server_module
 from pypto_serving.serving.server import serving_worker
@@ -184,7 +185,7 @@ def test_http_profile_endpoints_control_workers_and_merge(monkeypatch):
         lambda: calls.append("merge") or 12,
     )
 
-    server = server_module.ServingServer(_Engine(), model_id="test-model")
+    server = server_module.ServingServer(_Engine(), model_id="test-model", generate_config=GenerateConfig())
     paths = {route.path for route in server.app.routes}
     assert "/start_profile" in paths
     assert "/stop_profile" in paths
