@@ -1876,8 +1876,7 @@ def test_deepseek_early_decode_prepare_rejects_invalid_buffer_slot(buffer_slot):
 
 
 def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
-    runner, model = _runner_for_prepared_inputs()
-    runner._compiled.num_speculative_tokens = 1
+    runner, model = _runner_for_prepared_inputs(num_speculative_tokens=1)
     runner._mtp_request_states["req-a"] = SimpleNamespace(
         tail_rank=0,
         tail_slot_id=3,
@@ -1905,17 +1904,12 @@ def test_deepseek_early_decode_prepare_binds_stable_device_state_per_slot():
         runner._decode_task_args[0].tensors["sampled_ids"].data_ptr()
         != runner._decode_task_args[1].tensors["sampled_ids"].data_ptr()
     )
-    assert (
-        runner._mtp_decode_task_args[0].tensors["accepted_counts"].data_ptr()
-        != runner._mtp_decode_task_args[1].tensors["accepted_counts"].data_ptr()
-    )
     second.mtp_tail_slot_ids[0, 0] = 5
     assert first.mtp_tail_slot_ids[0, 0].item() == 3
 
 
 def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
-    runner, model = _runner_for_prepared_inputs()
-    runner._compiled.num_speculative_tokens = 1
+    runner, model = _runner_for_prepared_inputs(num_speculative_tokens=1)
     runner._l3_shared_buffers_ready = True
     runner._bind_prepared_mtp_dispatch = lambda inputs, _hidden_size, _vocab_size: replace(
         inputs,
@@ -1943,6 +1937,7 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     assert prepared.dispatch_args == ("fused",)
 
     state.device_state_initialized = True
+    state.draft_token_id = 5
     runner._require_decode_callable = lambda: SimpleNamespace(name="decode_mtp_fused")
     runner._submit_l3 = lambda _callable, *args: (
         SimpleNamespace(wait=lambda: None)
@@ -1951,6 +1946,7 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     )
     pending = runner.dispatch_prepared_decode(model, batch, prepared)
     assert pending.states == (state,)
+    assert runner._decode_metadata_predecessor is pending.dispatch
 
 
 def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
@@ -2124,7 +2120,7 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
         }
     )
     state = SimpleNamespace(
-        draft_token_id=5,
+        draft_token_id=4,
         tail_token_id=3,
         tail_slot_id=0,
         tail_position=126,
@@ -2211,9 +2207,8 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     assert dispatches == [("decode_mtp_fused", ("fused",))]
     assert prepared_rows == []
     assert result.accepted_token_ids == [[5, 9]]
-    # Steady execution consumes the kernel-owned device state.  Host mirrors
-    # remain at their initialization values unless DEBUG diagnostics are on.
-    assert state.draft_token_id == 5
+    # The verifier count wins even when the host draft mirror is stale.
+    assert state.draft_token_id == 7
     assert state.tail_token_id == 3
     assert state.tail_position == 126
     assert state.proposed_tokens == 1
@@ -2738,7 +2733,10 @@ def _runtime_model_for_embeddings():
     )
 
 
-def _runner_for_prepared_inputs() -> tuple[DeepSeekV4ModelRunner, object]:
+def _runner_for_prepared_inputs(
+    *,
+    num_speculative_tokens: int = 0,
+) -> tuple[DeepSeekV4ModelRunner, object]:
     model = _runtime_model_for_embeddings()
     compiled = DeepSeekV4CompiledKernels(
         # Exercise the production MTP tile while keeping the tiny host-side model.
@@ -2753,6 +2751,7 @@ def _runner_for_prepared_inputs() -> tuple[DeepSeekV4ModelRunner, object]:
             num_hash_layers=3,
         ),
         kernel_dir="",
+        num_speculative_tokens=num_speculative_tokens,
     )
     runner = DeepSeekV4ModelRunner(compiled=compiled)
     runner.init_kv_cache("dsv4", model.config, model.runtime)
@@ -2950,7 +2949,10 @@ class _TaskArgsStubRunner:
             _prefill_slot_specs,
         )
 
-        self._compiled = SimpleNamespace(layout=DeepSeekV4CacheLayout())
+        self._compiled = SimpleNamespace(
+            layout=DeepSeekV4CacheLayout(),
+            num_speculative_tokens=0,
+        )
         layout = self._compiled.layout
         covered = set(_PREFILL_STATIC_WEIGHTS) | set(_PREFILL_CACHE_POOLS)
         covered |= set(_prefill_slot_specs(layout, hidden, vocab))
@@ -2959,6 +2961,19 @@ class _TaskArgsStubRunner:
         self._cache = {n: object() for n in _PREFILL_CACHE_POOLS}
         self._embed_handle = object()
         self._pre_hc_handle = object()
+        self._decode_metadata = {
+            name: object()
+            for name in (
+                "block_table",
+                "hca_cmp_block_table",
+                "csa_cmp_block_table",
+                "idx_block_table",
+                "hca_compress_state_block_table",
+                "csa_compress_state_block_table",
+                "csa_inner_compress_state_block_table",
+                "block_counts",
+            )
+        }
         self._decode_task_args = [SimpleNamespace(
             tensors={"block_table": torch.empty(layout.ranks, 4, dtype=torch.int32).share_memory_()}
         )]
@@ -2974,6 +2989,9 @@ class _TaskArgsStubRunner:
 
     def _materialize_main_pre_hc_device(self, hidden):
         return self._pre_hc_handle
+
+    def _materialize_decode_device_metadata(self, _buffer_slot):
+        return self._decode_metadata
 
     def _static_freqs_cos_tensor(self):
         return torch.empty((2, 8, 4), dtype=torch.bfloat16).share_memory_()
@@ -3097,10 +3115,155 @@ def test_deepseek_mtp_task_args_classify_kinds():
     assert prefill.tensors["input_ids"].dtype == torch.int64
     assert isinstance(prefill.tensors["hidden_out"], StackedDeviceTensor)  # device-resident output
 
-    decode = mtp_decode_task_args(_mtp_runner(), 4096)
+    runner = _mtp_runner()
+    decode = mtp_decode_task_args(runner, 4096)
     decode.allocate_host_shared(None)
     assert decode.tensors["accepted_counts"].dtype == torch.int32
     assert decode.tensors["hidden_out"].dtype == torch.bfloat16
     built = decode.build()
     assert isinstance(built[decode.names.index("freqs_cos")], StaticDeviceTensor)
+    assert (
+        built[decode.names.index("ori_block_table")]
+        is runner._decode_task_args[0].tensors["block_table"]
+    )
     assert decode.names[decode.names.index("state_tokens") - 1] == "state_generations"
+
+
+def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
+    class _AllocWorker:
+        def __init__(self):
+            self.next_ptr = 0x1000
+
+        def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
+            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
+            self.next_ptr += 0x100000
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            return None
+
+    runner = _TaskArgsStubRunner()
+    runner._compiled.num_speculative_tokens = 1
+    worker = _AllocWorker()
+
+    decode = decode_task_args(runner, 4096, 129280)
+    decode.allocate_host_shared(None)
+    decode.allocate_device(worker, None)
+    for name in ("hidden_out", "logits", "pre_hc_hidden_out"):
+        assert isinstance(decode.tensors[name], StackedDeviceTensor)
+    assert isinstance(decode.tensors["sampled_ids"], torch.Tensor)
+    built = decode.build()
+    for name, tensor in runner._decode_metadata.items():
+        assert built[decode.names.index(name)] is tensor
+
+    mtp = mtp_decode_task_args(runner, 4096)
+    mtp.allocate_host_shared(None)
+    mtp.allocate_device(worker, None)
+    for name in (
+        "input_ids",
+        "position_ids",
+        "hidden_out",
+        "next_pre_hc_hidden",
+        "logits",
+    ):
+        assert isinstance(mtp.tensors[name], StackedDeviceTensor)
+    assert isinstance(mtp.tensors["accepted_counts"], torch.Tensor)
+    assert isinstance(mtp.tensors["sampled_ids"], torch.Tensor)
+
+    resident_metadata = [
+        runner._decode_metadata,
+        {**runner._decode_metadata, "block_table": object()},
+    ]
+    runner._decode_task_args = [SimpleNamespace(tensors={}), SimpleNamespace(tensors={})]
+    runner._materialize_decode_device_metadata = lambda slot: resident_metadata[slot]
+    runner._mtp_device_weights = {
+        name: object() for name in _FUSED_MTP_DECODE_TENSOR_ORDER
+    }
+    runner._materialize_mtp_device_kv_cache = lambda: object()
+    runner._materialize_mtp_tail_pre_hc_pool = lambda _hidden: object()
+    runner._materialize_mtp_device_state_tokens = lambda: object()
+    runner._materialize_mtp_device_state_meta = lambda: object()
+
+    slot_one_mtp = mtp_decode_task_args(runner, 4096, buffer_slot=1)
+    slot_one_mtp.allocate_host_shared(None)
+    slot_one_mtp.allocate_device(worker, None)
+    slot_one_args = slot_one_mtp.build()
+    assert (
+        slot_one_args[slot_one_mtp.names.index("ori_block_table")]
+        is resident_metadata[1]["block_table"]
+    )
+
+
+def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank():
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=DeepSeekV4CacheLayout(ranks=2),
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            num_speculative_tokens=1,
+        )
+    )
+    runner._decode_metadata_sources = [
+        {"block_table": torch.empty((2, 3), dtype=torch.int32).share_memory_()}
+        for _slot in (0, 1)
+    ]
+    runner._decode_metadata_device_keys = [[None, None], [None, None]]
+
+    class _Worker:
+        def __init__(self):
+            self.next_ptr = 0x1000
+            self.copies = []
+            self.events = []
+
+        def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
+            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
+            self.next_ptr += 0x100000
+            return tensor
+
+        def copy_to(self, dst, src, nbytes, *, worker_id=0):
+            self.events.append("copy")
+            self.copies.append((dst, src, nbytes, worker_id))
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            return None
+
+        @staticmethod
+        def free_stacked_tensor(_tensor):
+            return None
+
+        @staticmethod
+        def close():
+            return None
+
+    worker = _Worker()
+    runner._l3_worker = worker
+    slot0 = runner._materialize_decode_device_metadata(0)
+    slot1 = runner._materialize_decode_device_metadata(1)
+    runner._decode_metadata_predecessor = SimpleNamespace(
+        wait=lambda: worker.events.append("wait")
+    )
+
+    assert slot0["block_table"].shards[0].data_ptr != slot1["block_table"].shards[0].data_ptr
+
+    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
+    steady_predecessor = SimpleNamespace(wait=lambda: worker.events.append("wait"))
+    runner._decode_metadata_predecessor = steady_predecessor
+    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
+    assert runner._decode_metadata_predecessor is steady_predecessor
+    runner._sync_decode_device_metadata_rank(0, 1, ("first",))
+    runner._sync_decode_device_metadata_rank(1, 0, ("first",))
+
+    assert len(worker.copies) == 3
+    assert worker.events == ["wait", "copy", "wait", "copy", "copy"]
+    assert [copy[-1] for copy in worker.copies] == [0, 1, 0]
+    assert runner._decode_metadata_predecessor is None
+    assert runner._decode_metadata_device_keys == [
+        [("first",), ("first",)],
+        [("first",), None],
+    ]
