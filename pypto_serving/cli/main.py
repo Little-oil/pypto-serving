@@ -234,10 +234,12 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     )
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
+    # DeepSeek prefix caching currently covers autoregressive decoding and the
+    # one-token MTP path.  Keep the newer arbitrary-depth MTP implementation
+    # available, but do not advertise prefix-cache compatibility for it yet.
     enable_prefix_cache = args.enable_prefix_caching
-    if model_family == "deepseek_v4":
+    if model_family == "deepseek_v4" and num_speculative_tokens > 1:
         enable_prefix_cache = False
-
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
@@ -289,6 +291,8 @@ def _build_runtime_config(
             num_hidden_layers,
             compress_ratios,
             decode_batch=layout.decode_batch,
+            enable_mtp=num_speculative_tokens == 1,
+            max_seq_len=args.max_model_len,
         )
 
     return RuntimeConfig(

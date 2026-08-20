@@ -24,8 +24,12 @@ from pypto_serving.serving.server.ipc import (
 
 def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
+    discarded: list[SimpleNamespace] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-    core.scheduler = SimpleNamespace(abort_request=aborted.append)
+    core.scheduler = SimpleNamespace(
+        abort_request=aborted.append,
+        discard_scheduled_request=discarded.append,
+    )
     core._pending_free_ids = []
     core._batch_queue = deque()
     core._discard_result_step_ids = set()
@@ -45,6 +49,7 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     core._handle_step_error(7, scheduler_output, result_pending=False)
 
     assert aborted == ["req-a", "req-b"]
+    assert discarded == scheduler_output.scheduled_requests
     assert core._pending_free_ids == ["req-a", "req-b"]
     for request_id in ("req-a", "req-b"):
         token = core._request_contexts[request_id].queue.get_nowait()

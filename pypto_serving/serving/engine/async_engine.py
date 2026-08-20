@@ -175,9 +175,15 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
-        if runtime.kv_cache_groups and self.config.enable_prefix_cache:
-            raise ValueError("Prefix caching is not supported with grouped KV cache pools")
-
+        if (
+            runtime.kv_cache_groups
+            and self.config.enable_prefix_cache
+            and runtime.num_speculative_tokens > 0
+            and not any(group.is_eagle_group for group in runtime.kv_cache_groups)
+        ):
+            raise ValueError(
+                "DeepSeek grouped MTP prefix caching requires an EAGLE cache group"
+            )
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -753,6 +759,7 @@ class ReplicaEngineCore:
         seen: set[str] = set()
         for batch in failed_batches:
             for sr in batch.scheduled_requests:
+                self.scheduler.discard_scheduled_request(sr)
                 request_id = sr.request.request_id
                 if request_id in seen:
                     continue

@@ -41,6 +41,7 @@ def build_deepseek_v4_offline_engine_config(
     weight_dtype: str = "bfloat16",
     kv_dtype: str = "bfloat16",
     enable_mtp: bool = False,
+    enable_prefix_cache: bool = True,
     enable_chunked_prefill: bool = True,
     kernel_cache_dir: str | Path | None = None,
     save_kernels_dir: str | Path | None = None,
@@ -123,6 +124,8 @@ def build_deepseek_v4_offline_engine_config(
         num_hidden_layers,
         compress_ratios,
         decode_batch=layout.decode_batch,
+        enable_mtp=enable_mtp,
+        max_seq_len=max_seq_len,
     )
 
     parallel_config = ParallelConfig(
@@ -177,6 +180,6 @@ def build_deepseek_v4_offline_engine_config(
         max_num_running_reqs=max_num_seqs,
         max_num_scheduled_tokens=max_num_batched_tokens,
         long_prefill_token_threshold=long_prefill_token_threshold,
-        enable_prefix_cache=False,
+        enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=enable_chunked_prefill,
     )

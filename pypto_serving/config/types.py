@@ -54,7 +54,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class KVCacheSpec:
-    """Physical layout and logical capacity of one cache block."""
+    """Source-token and physical-storage layout of one cache block."""
 
     block_size: int
     page_size_bytes: int
@@ -67,11 +67,18 @@ class KVCacheSpec:
             raise ValueError("KV cache page_size_bytes must be positive")
         if self.compress_ratio <= 0:
             raise ValueError("KV cache compress_ratio must be positive")
+        if self.block_size % self.compress_ratio:
+            raise ValueError("KV cache block_size must be divisible by compress_ratio")
 
     @property
     def token_capacity(self) -> int:
         """Return the number of source tokens represented by one block."""
-        return self.block_size * self.compress_ratio
+        return self.block_size
+
+    @property
+    def storage_block_size(self) -> int:
+        """Return the number of physical rows stored for one source-token block."""
+        return self.block_size // self.compress_ratio
 
 
 @dataclass(frozen=True)
@@ -91,6 +98,14 @@ class KVCacheGroupSpec:
     # physical block IDs start at zero. ``num_partitions`` describes those
     # namespaces without flattening them into one conflicting block-ID space.
     num_partitions: int = 1
+    # Source-token tail needed to resume a rolling cache group. ``None``
+    # denotes a full-history group whose pages are append-only. Physical ring
+    # capacity remains bounded independently by ``max_blocks_per_seq``.
+    sliding_window: int | None = None
+    # EAGLE/MTP cache groups are shifted by one token: the last KV row in a
+    # matched page depends on the first token after that page. Its cache hash
+    # includes that boundary token, and publication waits until it is known.
+    is_eagle_group: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -101,6 +116,17 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.sliding_window is not None:
+            if self.sliding_window <= 0:
+                raise ValueError("KV cache sliding_window must be positive")
+            if self.sliding_window % self.spec.token_capacity:
+                raise ValueError(
+                    "KV cache sliding_window must be a multiple of the block token capacity"
+                )
+            if self.sliding_window // self.spec.token_capacity > self.max_blocks_per_seq:
+                raise ValueError(
+                    "KV cache sliding_window requires more blocks than max_blocks_per_seq"
+                )
 
 
 @dataclass(frozen=True)

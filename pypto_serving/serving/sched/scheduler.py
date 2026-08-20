@@ -82,7 +82,9 @@ class Request:
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
     block_hashes: list[int] = field(default_factory=list)
+    group_block_hashes: dict[str, list[int]] = field(default_factory=dict)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
+    num_group_blocks_cached: dict[str, int] = field(default_factory=dict)
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -127,6 +129,7 @@ class ScheduledRequest:
     block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
     resumed_from_preemption: bool = False
+    group_blocks_retained: bool = False
 
 
 @dataclass
@@ -155,8 +158,15 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
-        if self.kv_cache_manager.has_groups and self.config.enable_prefix_cache:
-            raise ValueError("Prefix caching is not supported with grouped KV caches")
+        if (
+            self.kv_cache_manager.has_groups
+            and self.config.enable_prefix_cache
+            and self.config.num_speculative_tokens > 0
+            and not self.kv_cache_manager.has_eagle_groups
+        ):
+            raise ValueError(
+                "Grouped speculative/MTP prefix caching requires an EAGLE cache group"
+            )
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
@@ -192,7 +202,14 @@ class Scheduler:
             )
             request.max_new_tokens = remaining
         if self.config.enable_prefix_cache:
-            request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
+            if self.kv_cache_manager.has_groups:
+                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
+                    request.prompt_token_ids
+                )
+            else:
+                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
+                    request.prompt_token_ids
+                )
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request
@@ -326,13 +343,47 @@ class Scheduler:
 
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
-                cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
-                if cached_blocks:
-                    request.cached_block_ids = [b.block_id for b in cached_blocks]
-                    request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
-                    request.num_blocks_cached = len(cached_blocks)  # Mark cached blocks as already published
+                if self.kv_cache_manager.has_groups:
+                    (
+                        request.allocated_group_block_ids,
+                        request.num_computed_tokens,
+                        request.cache_partition,
+                    ) = self.kv_cache_manager.acquire_group_prefix_blocks(
+                        request.request_id,
+                        request.group_block_hashes,
+                        max_cache_hit_tokens=max(0, request.num_prompt_tokens - 1),
+                    )
+                    request.num_group_blocks_cached = (
+                        self.kv_cache_manager.published_group_block_counts(
+                            request.num_computed_tokens
+                        )
+                        if request.num_computed_tokens
+                        else {}
+                    )
+                    if request.num_computed_tokens:
+                        logger.info(
+                            "prefix_cache_hit request_id=%s prefix_cache_hit_tokens=%d",
+                            request.request_id,
+                            request.num_computed_tokens,
+                        )
+                    cached_blocks = []
+                else:
+                    cached_blocks = self.kv_cache_manager.get_computed_blocks(
+                        request.prompt_token_ids
+                    )
+                    if cached_blocks:
+                        request.cached_block_ids = [b.block_id for b in cached_blocks]
+                        request.num_computed_tokens = (
+                            len(cached_blocks) * self.kv_cache_manager.block_size
+                        )
+                        # Mark cached blocks as already published.
+                        request.num_blocks_cached = len(cached_blocks)
             else:
                 cached_blocks = []
+
+            grouped_prefix_hit = (
+                self.kv_cache_manager.has_groups and request.num_computed_tokens > 0
+            )
 
             num_new = request.num_new_tokens_needed
             if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
@@ -350,8 +401,45 @@ class Scheduler:
                     remaining_waiting.append(request)
                     continue
 
-            if not self._try_allocate_request_blocks(request, num_new):
-                self.kv_cache_manager.release_cached_blocks(cached_blocks)
+            allocated = self._try_allocate_request_blocks(request, num_new)
+            if not allocated and grouped_prefix_hit:
+                # A grouped hit is rank-local. If its partition cannot hold the
+                # uncached suffix, release the hit and retry cold so an idle
+                # partition can admit the request instead of repeatedly
+                # selecting the same capacity-constrained cached partition.
+                hit_partition = request.cache_partition
+                self._free_request_blocks(request)
+                request.num_computed_tokens = 0
+                cold_num_new = request.num_new_tokens_needed
+                if (
+                    self.config.enable_chunk_prefill
+                    and self.config.long_prefill_token_threshold > 0
+                ):
+                    cold_num_new = min(
+                        cold_num_new,
+                        self.config.long_prefill_token_threshold,
+                    )
+                cold_num_new = min(cold_num_new, token_budget)
+                if cold_num_new > 0:
+                    allocated = self._try_allocate_request_blocks(
+                        request,
+                        cold_num_new,
+                    )
+                    if allocated:
+                        logger.info(
+                            "prefix_cache_fallback request_id=%s "
+                            "cached_partition=%s cold_partition=%s",
+                            request.request_id,
+                            hit_partition,
+                            request.cache_partition,
+                        )
+                        num_new = cold_num_new
+
+            if not allocated:
+                if self.kv_cache_manager.has_groups:
+                    self._free_request_blocks(request)
+                else:
+                    self.kv_cache_manager.release_cached_blocks(cached_blocks)
                 request.cached_block_ids = []
                 request.num_computed_tokens = 0
                 remaining_waiting.append(request)
@@ -414,6 +502,14 @@ class Scheduler:
             return
         for scheduled in scheduler_output.scheduled_requests:
             request = scheduled.request
+            if scheduled.block_ids_by_group:
+                if scheduled.cache_partition is None:
+                    raise RuntimeError("Grouped async step has no cache partition")
+                self.kv_cache_manager.retain_group_block_snapshot(
+                    scheduled.block_ids_by_group,
+                    scheduled.cache_partition,
+                )
+                scheduled.group_blocks_retained = True
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens
                 >= request.num_prompt_tokens
@@ -478,6 +574,7 @@ class Scheduler:
             # depth grows past 2, switch to a per-request scheduling epoch to
             # also catch the preempt -> re-RUNNING case.
             if request.status.is_finished or request.status is RequestStatus.PREEMPTED:
+                self._release_scheduled_group_blocks(scheduled)
                 continue
             if (
                 scheduled.is_prefill
@@ -589,8 +686,27 @@ class Scheduler:
             else 0
         )
 
-        # Publish confirmed blocks now (worker succeeded), not at dispatch.
-        self._cache_completed_blocks(request)
+        # Publish confirmed blocks through the exact physical table used by this
+        # step. A newer in-flight chunk may already have advanced the request's
+        # rolling table, so consulting current manager state here is incorrect.
+        confirmed_tokens = scheduled.num_computed_tokens + scheduled.num_new_tokens
+        try:
+            if self.kv_cache_manager.has_groups:
+                if scheduled.cache_partition is None:
+                    raise RuntimeError("Grouped async step has no cache partition")
+                request.num_group_blocks_cached = (
+                    self.kv_cache_manager.cache_group_blocks_from_snapshot(
+                        request.group_block_hashes,
+                        confirmed_tokens,
+                        request.num_group_blocks_cached,
+                        scheduled.block_ids_by_group,
+                        scheduled.cache_partition,
+                    )
+                )
+            else:
+                self._cache_completed_blocks(request, confirmed_tokens)
+        finally:
+            self._release_scheduled_group_blocks(scheduled)
 
         retained_tokens = 0
         for token_id in token_ids:
@@ -619,6 +735,21 @@ class Scheduler:
                 request.num_computed_tokens = max(
                     0, request.num_computed_tokens - unused_speculative
                 )
+
+    def _release_scheduled_group_blocks(self, scheduled: ScheduledRequest) -> None:
+        if not scheduled.group_blocks_retained:
+            return
+        if scheduled.cache_partition is None:
+            raise RuntimeError("Retained grouped async step has no cache partition")
+        self.kv_cache_manager.release_group_block_snapshot(
+            scheduled.block_ids_by_group,
+            scheduled.cache_partition,
+        )
+        scheduled.group_blocks_retained = False
+
+    def discard_scheduled_request(self, scheduled: ScheduledRequest) -> None:
+        """Drop one failed/stale async step without publishing its KV hashes."""
+        self._release_scheduled_group_blocks(scheduled)
 
     def _check_finish(self, request: Request) -> RequestStatus | None:
         if not request.output_token_ids:
@@ -713,6 +844,7 @@ class Scheduler:
         victim.allocated_group_block_ids = {}
         victim.cache_partition = None
         victim.num_blocks_cached = 0
+        victim.num_group_blocks_cached = {}
         # Async: drop any optimistic placeholder so the re-queued request restarts
         # from a clean prefill state (its in-flight step's result, if any, is
         # discarded engine-side since the request left `running`).
@@ -733,14 +865,32 @@ class Scheduler:
             self.kv_cache_manager.release_all_group_requests(request.request_id)
             request.allocated_group_block_ids = {}
         request.cache_partition = None
+        request.num_group_blocks_cached = {}
 
-    def _cache_completed_blocks(self, request: Request) -> None:
+    def _cache_completed_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int | None = None,
+    ) -> None:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
             return
+        confirmed_tokens = (
+            request.num_computed_tokens
+            if num_computed_tokens is None
+            else num_computed_tokens
+        )
+        if self.kv_cache_manager.has_groups:
+            request.num_group_blocks_cached = self.kv_cache_manager.cache_group_blocks(
+                request.request_id,
+                request.group_block_hashes,
+                confirmed_tokens,
+                request.num_group_blocks_cached,
+            )
+            return
         total_blocks_computed = min(
-            request.num_computed_tokens // self.kv_cache_manager.block_size,
-            len(request.block_hashes)
+            confirmed_tokens // self.kv_cache_manager.block_size,
+            len(request.block_hashes),
         )
         already_cached = request.num_blocks_cached
         if total_blocks_computed <= already_cached:

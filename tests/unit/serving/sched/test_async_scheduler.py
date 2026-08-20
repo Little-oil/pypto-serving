@@ -447,3 +447,89 @@ def test_grouped_cache_capacity_scales_from_device_reported_primary_pool():
 
     assert manager.group_num_blocks("primary") == 6
     assert manager.group_num_blocks("compressed") == 4
+
+
+def test_eagle_group_reuses_every_page_with_a_known_boundary_token():
+    manager = KvCacheManager(block_size=2, enable_prefix_cache=True)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="eagle",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+                max_blocks_per_seq=4,
+                num_blocks=4,
+                is_eagle_group=True,
+            ),
+        ),
+        max_batch_size=1,
+    )
+    prompt = [1, 2, 3, 4, 5]
+    hashes = manager.compute_group_block_hashes(prompt)
+    manager.ensure_group_blocks("warm", len(prompt), partition=0)
+    published = manager.cache_group_blocks("warm", hashes, len(prompt), {})
+    manager.release_all_group_requests("warm")
+
+    blocks, hit_tokens, partition = manager.acquire_group_prefix_blocks(
+        "hit",
+        hashes,
+        max_cache_hit_tokens=len(prompt) - 1,
+    )
+
+    assert published == {"eagle": 2}
+    assert hit_tokens == 4
+    assert partition == 0
+    assert len(blocks["eagle"]) == 2
+
+
+def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not_fit():
+    manager = KvCacheManager(block_size=2, enable_prefix_cache=True)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="test",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+                max_blocks_per_seq=2,
+                num_blocks=2,
+                num_partitions=2,
+            ),
+        ),
+        max_batch_size=2,
+    )
+    prompt = [1, 2, 3, 4]
+    hashes = manager.compute_group_block_hashes(prompt)
+    manager.ensure_group_blocks("warm", 2, partition=0)
+    manager.cache_group_blocks("warm", hashes, 2, {})
+    manager.release_all_group_requests("warm")
+    manager.ensure_group_blocks("partition-0-blocker", 2, partition=0)
+    _, probe_hit_tokens, probe_partition = manager.acquire_group_prefix_blocks(
+        "probe",
+        hashes,
+        max_cache_hit_tokens=len(prompt) - 1,
+    )
+    assert probe_hit_tokens == 2
+    assert probe_partition == 0
+    manager.release_all_group_requests("probe")
+
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=4,
+            max_seq_len=16,
+            enable_prefix_cache=True,
+        ),
+        manager,
+    )
+    request = Request(
+        request_id="fallback",
+        prompt_token_ids=prompt,
+        max_new_tokens=1,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_requests) == 1
+    assert output.scheduled_requests[0].num_computed_tokens == 0
+    assert output.scheduled_requests[0].num_new_tokens == len(prompt)
+    assert request.cache_partition == 1
