@@ -14,21 +14,23 @@ trace viewer such as [Perfetto](https://ui.perfetto.dev/).
 
 ## Configuration
 
-HTTP serving profiling is configured with CLI options:
+HTTP serving and offline generation profiling are configured with the same CLI
+options:
 
 | Option | Description |
 | --- | --- |
-| `--profile` | Enable the vLLM-compatible `/start_profile` and `/stop_profile` endpoints. |
+| `--profile` | Enable profiling: in serve mode the vLLM-compatible `/start_profile` and `/stop_profile` endpoints; in generate mode the profiler wraps the generation window. |
 | `--profile-output PATH` | Output directory or path ending in `.json`. Defaults to `./profile_out`. |
 | `--profile-level LEVELS` | Comma-separated event levels. Defaults to `e2e,kernel`. |
 
-Recording begins only after `POST /start_profile`. The CLI resolves
-`--profile-output` to an absolute path before spawning workers, so every process
-writes to the same location.
+In serve mode, recording begins only after `POST /start_profile`. In generate
+mode, recording begins when the run starts generating and the trace is merged
+when it finishes. The CLI resolves `--profile-output` to an absolute path
+before spawning workers, so every process writes to the same location.
 
-Offline generation continues to use `SA_PROFILE_OUTPUT` and
-`SA_PROFILE_LEVEL`; setting either variable starts offline recording
-immediately.
+The `SA_PROFILE_OUTPUT` / `SA_PROFILE_LEVEL` environment variables configure
+the recorder for library users and are read by `scripts/merge_profile.sh`; the
+CLI entries replace them with the explicit CLI configuration above.
 
 The event levels are:
 
@@ -59,31 +61,25 @@ when using the manual merge script.
 
 ## Profile Offline Generation
 
-Set the profiling environment variables before running the generation entry
-point:
+Pass the profiling options to the generate mode:
 
 ```bash
-SA_PROFILE_OUTPUT=/tmp/pypto-profile-offline \
-SA_PROFILE_LEVEL=e2e,kernel \
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /path/to/Qwen3-14B \
+pypto-serving \
+  --model /path/to/Qwen3-14B \
   --prompt 'Huawei is' \
   --platform a2a3 \
-  --device-id 0 \
-  --max-seq-len 512 \
-  --max-new-tokens 5 \
-  --profile
+  --device 0 \
+  --max-model-len 512 \
+  --generate-config '{"max_new_tokens": 5}' \
+  --profile \
+  --profile-output /tmp/pypto-profile-offline \
+  --profile-level e2e,kernel
 ```
 
-The entry point merges the fragments in its `finally` block, so the completed
-trace is normally available at `/tmp/pypto-profile-offline/trace.json` even if
-generation raises an exception.
-
-The `--profile` and `--profile-verbose` options are separate from the
-`pypto_serving.tools.profile` module configuration. They enable the timing summary printed
-by `npu_generate.py`; they do not enable trace collection by themselves.
-Conversely, setting an `SA_PROFILE_*` variable enables trace collection even
-without either CLI option.
+The CLI wraps the generation window with profile start/stop and merges the
+fragments when the run finishes, so the completed trace is normally available
+at `/tmp/pypto-profile-offline/trace.json` even if generation raises an
+exception.
 
 ## Profile HTTP Serving
 

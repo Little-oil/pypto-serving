@@ -59,7 +59,7 @@ pypto-serving \
     --no-enable-prefix-caching --long-prefill-token-threshold 2048"
 ```
 
-The `SA_PROFILE_*` environment variables remain available to the offline entry `python examples/model/qwen3_14b/npu_generate.py`, but HTTP serving uses the CLI options above. This skill is scoped to the **online HTTP server**; do not use the offline entry here.
+The offline generate mode (`pypto-serving --prompt`) uses the same `--profile*` CLI options as above; the `SA_PROFILE_*` environment variables no longer drive either CLI entry. This skill is scoped to the **online HTTP server**; for offline profiling see `qwen3-14b-offline-op-timing`.
 
 Wait for `INFO: Application startup complete.` / `Uvicorn running on http://0.0.0.0:<port>` before sending traffic. The worker prints `Worker entering busy loop` and the engine prints `Engine loop started` once the model and KV cache are ready.
 

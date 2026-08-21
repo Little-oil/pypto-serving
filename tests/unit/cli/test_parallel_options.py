@@ -63,3 +63,45 @@ def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path)
 
     with pytest.raises(ValueError, match="number of devices"):
         cli.build_serving_engine_config(args)
+
+
+def test_generate_config_rejects_wrong_value_types():
+    for invalid in (
+        {"stream": "false"},
+        {"ignore_eos": "true"},
+        {"stop": "END"},
+        {"stop": [1, 2]},
+        {"max_new_tokens": 2.5},
+        {"max_new_tokens": True},
+        {"max_new_tokens": 0},
+        {"temperature": -0.1},
+        {"temperature": "0"},
+        {"top_p": 0},
+        {"top_p": 1.5},
+        {"top_k": 0},
+        {"top_k": "5"},
+    ):
+        with pytest.raises(ValueError, match="--generate-config"):
+            cli._build_generate_config(invalid)
+
+
+def test_generate_config_accepts_valid_values():
+    config = cli._build_generate_config(
+        {
+            "max_new_tokens": 8,
+            "temperature": 0.2,
+            "top_p": 1,
+            "top_k": None,
+            "stop": ["END"],
+            "stream": True,
+            "ignore_eos": False,
+        }
+    )
+
+    assert config.max_new_tokens == 8
+    assert config.temperature == 0.2
+    assert config.top_p == 1
+    assert config.top_k is None
+    assert config.stop == ("END",)
+    assert config.stream is True
+    assert config.ignore_eos is False
